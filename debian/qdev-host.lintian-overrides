@@ -1,0 +1,2 @@
+# private copy of libvfio-user, which Debian does not package
+qdev-host: embedded-library

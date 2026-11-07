@@ -1,0 +1,39 @@
+Source: qdev-host
+Section: contrib/admin
+Priority: optional
+Maintainer: Dmitry R <rdmitry0911@gmail.com>
+Build-Depends: debhelper-compat (= 13),
+ pkgconf,
+ meson,
+ ninja-build,
+ libglib2.0-dev,
+ libglib2.0-dev-bin,
+ libdrm-dev,
+ libjson-c-dev,
+ libcmocka-dev,
+ python3
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://github.com/rdmitry0911/qdev-host
+
+Package: qdev-host
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: out-of-process PCI devices for stock QEMU (vfio-user) with Display1 export
+ qdev-host runs a device model as a separate process and attaches it to an
+ unmodified QEMU through vfio-user-pci. Device models are plugins; the first
+ one, tb-vga, is a hot-pluggable display whose output is exported over
+ QEMU's own org.qemu.Display1 D-Bus protocol (QSM Direct compatible) and can
+ be scanned out on a real monitor (DRM/KMS, zero-copy). libvfio-user is
+ bundled as a private library.
+
+Package: qdev-host-pve
+Architecture: all
+Depends: ${misc:Depends}, qdev-host (>= ${source:Version}), python3,
+ qemu-server (>= 9), pve-manager (>= 9)
+Description: Proxmox VE integration for qdev-host devices
+ qdevctl adds qdev-host devices to VMs on a stock Proxmox VE node: it keeps
+ per-VM device definitions, installs a guest hookscript that starts the
+ device processes and hot-plugs them when the VM starts, hot-adds and
+ hot-removes devices on running VMs through the node's own QEMU monitor
+ API, and reconnects a QSM Direct console to the device display.

@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""qdevctl: qdev-host devices for Proxmox VE VMs (stock PVE, no patches).
+
+  qdevctl add VMID ID --plugin tb-vga [--args 'vram=16,edid=/path'] [--bus qdev-rp0|ich9-pcie-port-N]
+                      [--kms /dev/dri/cardN:CONNECTOR] [--no-display] [--persistent] [--port-addr 0x08]
+  qdevctl remove VMID ID [--keep-process]
+  qdevctl list [VMID]
+  qdevctl status VMID
+  qdevctl start VMID [ID]      start device process(es) and hot-plug into the running VM
+  qdevctl stop VMID [ID]       hot-unplug and stop device process(es)
+  qdevctl hook VMID PHASE      called by the guest hookscript (post-start, post-stop, ...)
+
+Device definitions live in /etc/qdev-host/vms/VMID.json. `add` also sets the VM's
+hookscript (chaining an existing one) and, for --bus qdev-rp0 (default), adds a
+PCIe root port with reserved windows to the VM's `args` (needs a VM restart once).
+"""
+import argparse, json, sys
+sys.path.insert(0, "/usr/lib/qdev-host/pve")
+import qdev_pve as Q
+
+def cmd_add(a):
+    conf = Q.load_conf(a.vmid)
+    if Q.find_device(conf, a.id):
+        raise Q.QdevError(f"device {a.id} already defined for VM {a.vmid}")
+    cfg = Q.vm_config(a.vmid)
+    if cfg.get("machine", "").split(",")[0] not in ("q35", "pc-q35-9.2", "pc-q35-9.0", "pc-q35-8.2", "pc-q35-8.1") and not cfg.get("machine", "").startswith("pc-q35") and not cfg.get("machine", "").startswith("q35"):
+        raise Q.QdevError(f"VM {a.vmid} is not a q35 machine (machine: {cfg.get('machine', 'i440fx')}); PCIe hot-plug needs q35")
+    dev = {"id": a.id, "plugin": a.plugin, "args": a.args or "", "bus": a.bus, "display": not a.no_display,
+           "kms": a.kms, "persistent": a.persistent, "extra": a.extra or []}
+    conf["port_addr"] = a.port_addr or conf.get("port_addr", "0x08")
+    changed_port = False
+    if a.bus == Q.PORT_ID:
+        changed_port = Q.ensure_port_in_args(a.vmid, cfg, conf["port_addr"])
+    Q.ensure_hookscript(a.vmid, cfg, conf)
+    conf["devices"].append(dev)
+    Q.save_conf(conf)
+    Q.write_unit_env(a.vmid, dev)
+    print(f"VM {a.vmid}: device {a.id} ({a.plugin}) defined on bus {a.bus}")
+    if Q.vm_running(a.vmid):
+        print(Q.attach(a.vmid, dev))
+        if changed_port:
+            print(f"note: root port {Q.PORT_ID} was added to args; it appears at the next VM start")
+    else:
+        print("VM is stopped: the device will be started and attached by the hookscript at VM start")
+
+def cmd_remove(a):
+    conf = Q.load_conf(a.vmid)
+    dev = Q.find_device(conf, a.id)
+    if not dev:
+        raise Q.QdevError(f"no device {a.id} on VM {a.vmid}")
+    print(Q.detach(a.vmid, dev, a.keep_process))
+    conf["devices"] = [d for d in conf["devices"] if d["id"] != a.id]
+    env = Q.UNIT_DIR / f"{a.vmid}-{a.id}.env"
+    if env.exists() and not a.keep_process:
+        env.unlink()
+    if not conf["devices"] and not a.keep_process:
+        cfg = Q.vm_config(a.vmid)
+        Q.restore_hookscript(a.vmid, conf)
+        if a.purge_port:
+            Q.remove_port_from_args(a.vmid, cfg)
+        Q.conf_path(a.vmid).unlink(missing_ok=True)
+        print(f"VM {a.vmid}: no devices left, hookscript restored" + (", root port removed from args" if a.purge_port else " (root port kept in args; --purge-port removes it)"))
+    else:
+        Q.save_conf(conf)
+
+def cmd_list(a):
+    paths = [Q.conf_path(a.vmid)] if a.vmid else sorted(Q.CONF_DIR.glob("*.json"))
+    for p in paths:
+        if not p.exists():
+            continue
+        conf = json.loads(p.read_text())
+        vmid = conf["vmid"]
+        running = Q.vm_running(vmid)
+        present = {d["qdev_id"] for d in Q.pci_devices(vmid)} if running else set()
+        for d in conf["devices"]:
+            state = "attached" if d["id"] in present else ("process running" if Q.process_active(vmid, d["id"]) else "stopped")
+            print(f"VM {vmid}  {d['id']:12s} {d['plugin']:10s} bus={d['bus']:16s} {state}" + (f"  kms={d['kms']}" if d.get("kms") else ""))
+
+def cmd_status(a):
+    conf = Q.load_conf(a.vmid)
+    print(f"VM {a.vmid}: {'running' if Q.vm_running(a.vmid) else 'stopped'}, {len(conf['devices'])} device(s), port addr {conf.get('port_addr')}")
+    for d in conf["devices"]:
+        u = Q.unit_name(a.vmid, d["id"])
+        print(f"  {d['id']}: plugin={d['plugin']} bus={d['bus']} unit={u} ({'active' if Q.process_active(a.vmid, d['id']) else 'inactive'})")
+        print(f"      vfio socket {Q.device_socket(a.vmid, d['id'])}" + (f", Display1 p2p {Q.device_display(a.vmid, d['id'])}" if d.get('display', True) else ""))
+
+def cmd_start(a):
+    conf = Q.load_conf(a.vmid)
+    for d in conf["devices"]:
+        if a.id and d["id"] != a.id:
+            continue
+        if Q.vm_running(a.vmid):
+            print(Q.attach(a.vmid, d))
+        else:
+            Q.start_process(a.vmid, d); print(f"{d['id']}: process started (VM not running)")
+
+def cmd_stop(a):
+    conf = Q.load_conf(a.vmid)
+    for d in conf["devices"]:
+        if a.id and d["id"] != a.id:
+            continue
+        print(Q.detach(a.vmid, d, keep_process=False))
+
+def cmd_hook(a):
+    conf = Q.load_conf(a.vmid)
+    rc = 0
+    if a.phase == "post-start":
+        for d in conf["devices"]:
+            try:
+                print(Q.attach(a.vmid, d))
+            except Q.QdevError as e:
+                print(f"qdev-host: {d['id']}: {e}", file=sys.stderr); rc = 1
+    elif a.phase == "post-stop":
+        for d in conf["devices"]:
+            if not d.get("persistent"):
+                Q.stop_process(a.vmid, d["id"])
+    return rc
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("add"); s.add_argument("vmid", type=int); s.add_argument("id")
+    s.add_argument("--plugin", required=True); s.add_argument("--args"); s.add_argument("--bus", default=Q.PORT_ID)
+    s.add_argument("--kms"); s.add_argument("--no-display", action="store_true"); s.add_argument("--persistent", action="store_true")
+    s.add_argument("--port-addr"); s.add_argument("--extra", action="append", help="extra qdev-host option (repeatable)")
+    s.set_defaults(fn=cmd_add)
+    s = sub.add_parser("remove"); s.add_argument("vmid", type=int); s.add_argument("id")
+    s.add_argument("--keep-process", action="store_true"); s.add_argument("--purge-port", action="store_true"); s.set_defaults(fn=cmd_remove)
+    s = sub.add_parser("list"); s.add_argument("vmid", type=int, nargs="?"); s.set_defaults(fn=cmd_list)
+    s = sub.add_parser("status"); s.add_argument("vmid", type=int); s.set_defaults(fn=cmd_status)
+    s = sub.add_parser("start"); s.add_argument("vmid", type=int); s.add_argument("id", nargs="?"); s.set_defaults(fn=cmd_start)
+    s = sub.add_parser("stop"); s.add_argument("vmid", type=int); s.add_argument("id", nargs="?"); s.set_defaults(fn=cmd_stop)
+    s = sub.add_parser("hook"); s.add_argument("vmid", type=int); s.add_argument("phase"); s.set_defaults(fn=cmd_hook)
+    a = p.parse_args()
+    try:
+        rc = a.fn(a)
+    except Q.QdevError as e:
+        print(f"qdevctl: {e}", file=sys.stderr); return 1
+    return rc or 0
+
+if __name__ == "__main__":
+    sys.exit(main())

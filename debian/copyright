@@ -1,0 +1,15 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: qdev-host
+Source: https://github.com/rdmitry0911/qdev-host
+
+Files: *
+Copyright: 2026 Dmitry R <rdmitry0911@gmail.com>
+License: GPL-2.0-or-later
+
+Files: dbus/dbus-display1.xml
+Copyright: QEMU Project developers
+License: GPL-2.0-or-later
+
+Files: third_party/libvfio-user/*
+Copyright: 2020 Nutanix
+License: BSD-3-Clause

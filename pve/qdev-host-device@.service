@@ -1,0 +1,13 @@
+[Unit]
+Description=qdev-host device %i (out-of-process PCI device for a Proxmox VM)
+Documentation=https://github.com/rdmitry0911/qdev-host
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/qdev-host/units/%i.env
+RuntimeDirectory=qdev-host/%i
+RuntimeDirectoryMode=0750
+WorkingDirectory=/var/lib/qdev-host
+ExecStart=/usr/bin/qdev-host $QDEV_ARGS
+KillSignal=SIGTERM
+TimeoutStopSec=10

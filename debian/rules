@@ -1,0 +1,36 @@
+#!/usr/bin/make -f
+# SPDX-License-Identifier: GPL-2.0-or-later
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+VFU_STAGE := $(CURDIR)/debian/vfu-stage
+PRIVLIB := /usr/lib/qdev-host
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	meson setup debian/vfu-build third_party/libvfio-user --prefix=/usr --libdir=lib -Dbuildtype=release
+
+override_dh_auto_build:
+	ninja -C debian/vfu-build
+	DESTDIR=$(VFU_STAGE) ninja -C debian/vfu-build install
+	$(MAKE) VFU_PREFIX=$(VFU_STAGE)/usr PRIVLIB=$(PRIVLIB) qdev-host plugins/tb-vga/tb-vga.so tools/display1-input-bench
+
+override_dh_auto_install:
+	install -D -m 755 qdev-host debian/qdev-host/usr/bin/qdev-host
+	install -D -m 755 tools/display1-input-bench debian/qdev-host/usr/lib/qdev-host/bin/display1-input-bench
+	install -D -m 644 qdp.h debian/qdev-host/usr/include/qdev-host/qdp.h
+	install -D -m 644 plugins/tb-vga/tb-vga.so debian/qdev-host/usr/lib/qdev-host/plugins/tb-vga.so
+	install -D -m 644 plugins/tb-vga/edid-1280x800.bin debian/qdev-host/usr/share/qdev-host/edid-1280x800.bin
+	install -D -m 644 acpi/ssdt-tb.aml debian/qdev-host/usr/share/qdev-host/ssdt-tb.aml
+	install -D -m 644 $(VFU_STAGE)/usr/lib/libvfio-user.so.0 debian/qdev-host/usr/lib/qdev-host/libvfio-user.so.0
+	install -D -m 755 pve/qdevctl debian/qdev-host-pve/usr/sbin/qdevctl
+	install -D -m 644 pve/qdev_pve.py debian/qdev-host-pve/usr/lib/qdev-host/pve/qdev_pve.py
+	install -D -m 755 pve/qdev-host-hook.pl debian/qdev-host-pve/usr/share/qdev-host/pve/qdev-host-hook.pl
+	install -D -m 644 pve/qdev-host-device@.service debian/qdev-host-pve/usr/lib/systemd/system/qdev-host-device@.service
+	install -D -m 644 pve/README.md debian/qdev-host-pve/usr/share/doc/qdev-host-pve/README.md
+
+override_dh_auto_clean:
+	rm -rf debian/vfu-build debian/vfu-stage
+	$(MAKE) clean || true
+
+override_dh_auto_test:

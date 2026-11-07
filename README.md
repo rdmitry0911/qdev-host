@@ -28,6 +28,7 @@ Project sponsor: [Takt](https://taktcycles.com/).
 - [Build](#build)
 - [Run](#run)
 - [Display export (QSM Direct)](#display-export-qsm-direct)
+- [Proxmox VE](#proxmox-ve)
 - [Plugin ABI](#plugin-abi)
 - [The tb-vga plugin](#the-tb-vga-plugin)
 - [Thunderbolt hotplug layer on stock QEMU](#thunderbolt-hotplug-layer-on-stock-qemu)
@@ -281,6 +282,41 @@ attached to QEMU: clipboard calls go both ways (QEMU's callbacks reach the clien
 audio listener fds are handed to QEMU, which then talks to the client directly.
 One clipboard peer per QEMU is a QEMU rule, which the relay respects.
 
+## Proxmox VE
+
+Two Debian packages, built with `scripts/mkchroot.sh` + `scripts/build-deb-in-chroot.sh`
+(Debian 13 chroot) or any trixie box with the `Build-Depends`:
+
+- `qdev-host` (amd64): the host, plugins, a private copy of libvfio-user
+  (`/usr/lib/qdev-host/libvfio-user.so.0`), the ABI header, EDID and SSDT files.
+- `qdev-host-pve` (all): `qdevctl`, a guest hookscript and a systemd unit template.
+  Stock PVE 9 only: `qm` for config edits, the node's own
+  `PVE::QemuServer::Monitor::mon_cmd` for `device_add`/`device_del`/`query-pci`,
+  the standard `hookscript` mechanism, systemd for the device processes. No
+  Proxmox package is patched or diverted.
+
+```bash
+apt install ./qdev-host_0.1.0_amd64.deb ./qdev-host-pve_0.1.0_all.deb
+qdevctl add 109 tbvga0 --plugin tb-vga --args vram=16     # q35 VM; adds hookscript + root port (args)
+qm start 109                                               # hookscript starts the process and hot-plugs
+qdevctl list                                               # VM 109  tbvga0  tb-vga  bus=qdev-rp0  attached
+qdevctl stop 109 tbvga0; qdevctl start 109                 # hot-unplug / hot-plug on the running VM
+qdevctl remove 109 tbvga0 --purge-port                     # forget it, restore hookscript and args
+```
+
+Details in [pve/README.md](pve/README.md). Verified on a PVE 9.2.21 node
+(pve-qemu-kvm 11.0.3, qemu-server 9.2.11): the whole add → start → attached →
+unplug → replug → stop → remove cycle on an OVMF q35 VM. The device process is
+`qdev-host-device@VMID-ID.service`; its Display1 socket
+(`/run/qdev-host/VMID-ID/display.sock`) is where a QSM Direct worker attaches,
+and when QSM's per-VM bus exists the device relays input, clipboard and audio to
+it automatically.
+
+Not yet: a Hardware-panel UI (the plan is QSM Direct's structural pattern: a
+guarded `pve-manager` overlay plus a node-local service that authorizes with the
+browser's PVE ticket and runs `qdevctl`), several devices per process, a
+hookscript-free path for VMs whose firmware already reserves enough window space.
+
 ## Plugin ABI
 
 `qdp.h`, version 1. A plugin is a shared object exporting one symbol:
@@ -409,7 +445,10 @@ tools/             tbctl.py (QMP plug/unplug/connect), run-guest.sh, prep-guest.
                    display1-abs-test.py, display1-clipboard-test.py
 acpi/              SSDT with the Thunderbolt ACPI properties (.dsl + .aml)
 bench/             the vfio-user overhead microbenchmark (libvfio-user pci-testdev + kvm-unit-tests patch)
-docs/              overhead report, Thunderbolt-on-stock notes (Russian)
+docs/              overhead report, Thunderbolt-on-stock notes (Russian), live-display measurements
+pve/               qdevctl, qdev_pve.py, hookscript, systemd unit template, PVE README
+debian/, scripts/  Debian packaging; mkchroot.sh and build-deb-in-chroot.sh build the debs in a trixie chroot
+third_party/       vendored libvfio-user (BSD-3-Clause)
 ```
 
 ## License

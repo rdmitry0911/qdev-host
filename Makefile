@@ -10,7 +10,8 @@ VFU_LIBS   := $(shell pkg-config --libs libvfio-user)
 else
 VFU_LIBDIR := $(firstword $(wildcard $(VFU_PREFIX)/lib/x86_64-linux-gnu $(VFU_PREFIX)/lib))
 VFU_CFLAGS := -I$(VFU_PREFIX)/include/vfio-user
-VFU_LIBS   := -L$(VFU_LIBDIR) -lvfio-user -Wl,-rpath,$(VFU_LIBDIR)
+# PRIVLIB: directory where the package ships libvfio-user.so.0 (rpath), else the build prefix
+VFU_LIBS   := -L$(VFU_LIBDIR) -lvfio-user -Wl,-rpath,$(if $(PRIVLIB),$(PRIVLIB),$(VFU_LIBDIR))
 endif
 GLIB_CFLAGS := $(shell pkg-config --cflags gio-unix-2.0 glib-2.0)
 GLIB_LIBS   := $(shell pkg-config --libs gio-unix-2.0 glib-2.0)

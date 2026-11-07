@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+case "$1" in
+    configure)
+        install -d -m 0750 /etc/qdev-host /etc/qdev-host/vms
+        install -d -m 0755 /var/lib/qdev-host
+        if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then systemctl daemon-reload || true; fi
+        echo "qdev-host-pve: use 'qdevctl add VMID ID --plugin tb-vga' to attach a device to a VM"
+        ;;
+esac
+#DEBHELPER#
+exit 0

@@ -6,3 +6,13 @@ dbus/dbus-display1.h
 results/
 *.ppm
 *.o
+dist/
+debian/vfu-build/
+debian/vfu-stage/
+debian/qdev-host/
+debian/qdev-host-pve/
+debian/.debhelper/
+debian/*.debhelper*
+debian/*.substvars
+debian/files
+debian/debhelper-build-stamp
