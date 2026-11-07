@@ -18,6 +18,8 @@ void kms_scanout(kms_t *k, const uint8_t *pix, uint32_t w, uint32_t h, uint32_t 
 /* damage in scanout coordinates; pix is the current scanout base pointer */
 void kms_update(kms_t *k, const uint8_t *pix, uint32_t stride, int x, int y, int w, int h);
 void kms_stats(kms_t *k, FILE *out, bool reset);
+/* write the buffer currently scanned out as PPM (what the monitor shows) */
+bool kms_dump_front(kms_t *k, const char *path);
 /* "connected"/"disconnected"/"unknown" from sysfs for the chosen connector */
 const char *kms_connector_status(kms_t *k);
 #endif

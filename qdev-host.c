@@ -38,10 +38,11 @@ static struct {
     const char *plugin, *socket, *plugin_args, *display_p2p, *display_bus,
                *display_name, *vm_name, *dump_dir, *kms, *on_connect, *on_disconnect,
                *qemu_display, *qemu_display_dest;
-    int fps, qemu_console, stats_interval;
+    int fps, idle_fps, idle_after, qemu_console, stats_interval;
     bool verbose;
 } opt = { .display_name = "org.qemu", .vm_name = "qdev-host", .dump_dir = ".", .fps = 30,
-          .qemu_display_dest = "org.qemu" };
+          .idle_fps = 10, .idle_after = 2, .qemu_display_dest = "org.qemu" };
+static bool poll_idle; static double last_damage_t;
 
 static kms_t *kms;
 static struct { double cmp_sum, cmp_max; uint64_t ticks, damaged; } tstat;   /* damage detection cost */
@@ -220,10 +221,20 @@ static gboolean disp_tick(gpointer data)
     double tc = now_s() - t0;
     tstat.ticks++; tstat.cmp_sum += tc; if (tc > tstat.cmp_max) tstat.cmp_max = tc;
     if (dmg) {
-        tstat.damaged++;
+        tstat.damaged++; last_damage_t = t0;
         for (guint i = 0; i < disp.sinks->len; i++) {
             sink_t *s = g_ptr_array_index(disp.sinks, i);
             if (s->update) s->update(s, x, y, w, h);
+        }
+    }
+    /* adaptive polling: drop to --idle-fps after --idle-after seconds without damage */
+    if (opt.idle_fps > 0 && opt.idle_fps < opt.fps) {
+        bool want_idle = !dmg && (t0 - last_damage_t) > opt.idle_after;
+        if (want_idle != poll_idle) {
+            poll_idle = want_idle;
+            DBG("poll rate -> %d Hz", poll_idle ? opt.idle_fps : opt.fps);
+            g_timeout_add(1000 / (poll_idle ? opt.idle_fps : opt.fps), disp_tick, NULL);
+            return G_SOURCE_REMOVE;
         }
     }
     return G_SOURCE_CONTINUE;
@@ -232,8 +243,8 @@ static gboolean disp_tick(gpointer data)
 static void print_stats(bool reset)
 {
     struct rusage ru; getrusage(RUSAGE_SELF, &ru);
-    LOG("stats: ticks %llu (damaged %llu), compare avg %.3f ms max %.3f ms, process cpu %.2fs user %.2fs sys",
-        (unsigned long long)tstat.ticks, (unsigned long long)tstat.damaged,
+    LOG("stats: ticks %llu (damaged %llu, poll %d Hz), compare avg %.3f ms max %.3f ms, process cpu %.2fs user %.2fs sys",
+        (unsigned long long)tstat.ticks, (unsigned long long)tstat.damaged, poll_idle ? opt.idle_fps : opt.fps,
         tstat.ticks ? tstat.cmp_sum / tstat.ticks * 1e3 : 0.0, tstat.cmp_max * 1e3,
         ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6, ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6);
     if (kms) kms_stats(kms, stderr, reset);
@@ -283,7 +294,15 @@ static void dump_ppm(void)
     fclose(f);
     LOG("dump: %s (%ux%u)", name, s->width, s->height);
 }
-static gboolean on_sigusr1(gpointer data) { dump_ppm(); return G_SOURCE_CONTINUE; }
+static gboolean on_sigusr1(gpointer data)
+{
+    dump_ppm();
+    if (kms) {
+        g_autofree char *name = g_strdup_printf("%s/qdev-kms-%u.ppm", opt.dump_dir, dump_count);
+        if (kms_dump_front(kms, name)) LOG("dump: %s (scanned-out buffer)", name);
+    }
+    return G_SOURCE_CONTINUE;
+}
 
 /* ------------------------------------------------------ Display1 listener */
 typedef struct {
@@ -621,7 +640,9 @@ static void usage(void)
         "  --display-name NAME      bus name (default org.qemu, what QSM Direct expects)\n"
         "  --vm-name NAME           Display1.VM.Name\n"
         "  --dump-dir DIR           where SIGUSR1 writes qdev-fb-N.ppm (default .)\n"
-        "  --fps N                  damage poll rate (default 30)\n"
+        "  --fps N                  damage poll rate while the picture changes (default 30)\n"
+        "  --idle-fps N             poll rate after --idle-after seconds without changes (default 10; 0 = off)\n"
+        "  --idle-after S           seconds without changes before dropping to --idle-fps (default 2)\n"
         "  --kms /dev/dri/cardN[:CONNECTOR]  scan the device out on a real monitor (DRM master needed)\n"
         "  --on-connect CMD / --on-disconnect CMD  run when the KMS connector's status changes\n"
         "  --qemu-display ADDR      the VM's own Display1 (unix:path=...) to forward keyboard/mouse to\n"
@@ -640,7 +661,7 @@ int main(int argc, char **argv)
         { "vm-name", 1, 0, 'V' }, { "dump-dir", 1, 0, 'D' }, { "fps", 1, 0, 'f' }, { "verbose", 0, 0, 'v' },
         { "kms", 1, 0, 'K' }, { "on-connect", 1, 0, 1 }, { "on-disconnect", 1, 0, 2 },
         { "qemu-display", 1, 0, 'Q' }, { "qemu-display-dest", 1, 0, 3 }, { "qemu-console", 1, 0, 4 },
-        { "stats-interval", 1, 0, 'S' }, { "help", 0, 0, 'h' }, { 0 }
+        { "stats-interval", 1, 0, 'S' }, { "idle-fps", 1, 0, 5 }, { "idle-after", 1, 0, 6 }, { "help", 0, 0, 'h' }, { 0 }
     };
     int c;
     while ((c = getopt_long(argc, argv, "p:s:a:P:B:N:V:D:f:K:Q:S:vh", lopts, NULL)) != -1) {
@@ -654,6 +675,7 @@ int main(int argc, char **argv)
         case 2: opt.on_disconnect = optarg; break; case 'Q': opt.qemu_display = optarg; break;
         case 3: opt.qemu_display_dest = optarg; break; case 4: opt.qemu_console = atoi(optarg); break;
         case 'S': opt.stats_interval = atoi(optarg); break;
+        case 5: opt.idle_fps = atoi(optarg); break; case 6: opt.idle_after = atoi(optarg); break;
         default: usage();
         }
     }

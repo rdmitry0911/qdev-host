@@ -13,7 +13,7 @@ exec "$QEMU" -machine q35,accel=kvm -cpu host -m "${MEM:-2G}" -smp "${SMP:-2}" -
   -object memory-backend-memfd,id=m0,size="${MEM:-2G}",share=on -machine memory-backend=m0 \
   -drive file="${DISK:?set DISK}",if=virtio,format=qcow2 \
   -device VGA,id=bootvga,bus=pcie.0,addr=0x06,vgamem_mb=4 \
-  -device pcie-root-port,id=tbrp0,bus=pcie.0,chassis=1,slot=1,addr=0x05,pref64-reserve=64M,mem-reserve=8M \
+  -device pcie-root-port,id=tbrp0,bus=pcie.0,chassis=1,slot=1,addr=0x05,pref64-reserve=${PREF64:-256M},mem-reserve=8M \
   -device pcie-root-port,id=tbrp1,bus=pcie.0,chassis=2,slot=2,addr=0x07,pref64-reserve=64M,mem-reserve=8M \
   -device pcie-pci-bridge,id=tbbr0,bus=tbrp1 \
   -acpitable file="$HERE/acpi/ssdt-tb.aml" \

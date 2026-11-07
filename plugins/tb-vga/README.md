@@ -8,7 +8,7 @@ Plugin args (`--plugin-args`):
 | Key | Default | Meaning |
 |---|---|---|
 | `edid=FILE` | none | EDID blob served at BAR2 offset 0 (e.g. `qemu-edid -x 1280 -y 800 -o edid.bin`) |
-| `vram=MiB` | 16 | VRAM size, power of two, 4–256 |
+| `vram=MiB` | 16 | VRAM size, power of two, 4–256. The Linux VRAM helper wants 2 × frame size: 16 for 1280x800, 128 for 3840x2400 |
 
 Guest view: PCI `1234:1111` rev 2 (subsystem `1af4:1100`), class VGA, PCIe
 endpoint; BAR0 = VRAM (64-bit prefetchable, mmap-ed by QEMU, no exits),

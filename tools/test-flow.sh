@@ -14,12 +14,12 @@ step() { echo; echo "##### $*"; }
 
 step "0. qdev-host + tb-vga (cleanup first)"
 python3 -I "$HERE/tools/tbctl.py" "$QMP" pci | grep -q 'id=tbvga0' && T unplug tbvga0
-for p in $(pgrep -x qdev-host); do kill $p; done; sleep 0.5
+[ -f "$RUN/qdev-host.pid" ] && kill "$(cat "$RUN/qdev-host.pid")" 2>/dev/null; sleep 0.5
 rm -f "$SOCK" "$DISP"
 "$HERE/qdev-host" -v --plugin "$HERE/plugins/tb-vga/tb-vga.so" --socket "$SOCK" \
   --plugin-args "edid=$HERE/plugins/tb-vga/edid-1280x800.bin" --display-p2p "$DISP" \
   --dump-dir "$OUT" > "$OUT/qdev-host.log" 2>&1 &
-HOST=$!; for i in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.1; done; echo "qdev-host pid $HOST"
+HOST=$!; echo $HOST > "$RUN/qdev-host.pid"; for i in $(seq 1 50); do [ -S "$SOCK" ] && break; sleep 0.1; done; echo "qdev-host pid $HOST"
 
 step "1. plug behind tbrp0"
 T plug tbvga0 "$SOCK" tbrp0; sleep 4

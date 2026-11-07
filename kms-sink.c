@@ -37,7 +37,7 @@ struct kms {
     uint8_t *edid; uint32_t edid_len;
     dumb_t buf[2];
     int front;
-    bool mode_set, flip_pending, enabled;
+    bool mode_set, flip_pending, enabled, damage_while_pending;
     /* current guest scanout geometry and placement in the mode */
     uint32_t sw, sh, sstride; int ox, oy;
     const uint8_t *spix;
@@ -210,7 +210,8 @@ static void page_flip_handler(int fd, unsigned seq, unsigned sec, unsigned usec,
         k->st.lat_sum += lat; if (lat > k->st.lat_max) k->st.lat_max = lat;
         k->st.t_first_damage = 0;
     }
-    if (k->buf[1 - k->front].dirty.any) {
+    if (k->damage_while_pending) {
+        k->damage_while_pending = false;
         k->st.t_first_damage = now_s();
         do_flip(k);
     }
@@ -270,7 +271,7 @@ void kms_update(kms_t *k, const uint8_t *pix, uint32_t stride, int x, int y, int
     rect_add(&k->buf[0].dirty, x, y, w, h);
     rect_add(&k->buf[1].dirty, x, y, w, h);
     if (k->st.t_first_damage == 0) k->st.t_first_damage = now_s();
-    if (!k->flip_pending) do_flip(k);
+    if (!k->flip_pending) do_flip(k); else k->damage_while_pending = true;
 }
 
 void kms_stats(kms_t *k, FILE *out, bool reset)
@@ -282,6 +283,21 @@ void kms_stats(kms_t *k, FILE *out, bool reset)
             k->st.flips ? k->st.copy_sum / k->st.flips * 1e3 : 0.0, k->st.copy_max * 1e3, k->st.bytes / 1e6);
     if (reset) { memset(&k->st, 0, sizeof(k->st)); }
     k->st.t_last_print = now;
+}
+
+bool kms_dump_front(kms_t *k, const char *path)
+{
+    if (!k->mode_set) return false;
+    dumb_t *b = &k->buf[k->front];
+    FILE *f = fopen(path, "wb");
+    if (!f) return false;
+    fprintf(f, "P6\n%u %u\n255\n", k->mode.hdisplay, k->mode.vdisplay);
+    for (uint32_t y = 0; y < k->mode.vdisplay; y++) {
+        const uint8_t *row = b->map + (size_t)y * b->pitch;
+        for (uint32_t x = 0; x < k->mode.hdisplay; x++) { fputc(row[x*4+2], f); fputc(row[x*4+1], f); fputc(row[x*4], f); }
+    }
+    fclose(f);
+    return true;
 }
 
 void kms_close(kms_t *k)

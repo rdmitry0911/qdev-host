@@ -86,9 +86,17 @@ libvfio-user master, a Debian 13 guest (kernel 6.12) under KVM:
 | `disconnect` / `connect` of the whole port | works (`tools/tbctl.py`) |
 | ACPI `_DSD` of the fork (`PCI-Thunderbolt`, `pci-supports-link-change`, `IOPCITunnelled`) | delivered by an SSDT through `-acpitable`, visible in the guest |
 
-Not done yet: keyboard/mouse forwarding to the VM's own QEMU (the Display1
-`Keyboard`/`Mouse` interfaces exist and accept events, but drop them), clipboard
-and audio interfaces, a DRM/KMS sink for a real monitor, macOS validation.
+Live display and input, verified on a laptop with an Intel Iris Xe and a 3840x2400
+panel ([measurements](docs/live-display-results.md)):
+
+| Step | Result |
+|---|---|
+| `--kms /dev/dri/card0:eDP-1` | `qdev-host` is DRM master; the panel's EDID goes to the guest, which picks 3840x2400 |
+| Guest frames on the panel | every guest frame reaches the screen up to the poll rate (60 fps → 55 flips/s), detection→vblank ≈ 15 ms, ≈ 50 % of one core at 4K under load, ≈ 7 % idle with adaptive polling |
+| Input | QSM-style keyboard/mouse events relayed to the VM's own QEMU and seen on the guest's USB devices; one extra D-Bus hop (~0.2 ms) |
+
+Not done yet: clipboard and audio interfaces, per-head input for multi-head
+guests, zero-copy KMS scan-out, macOS validation.
 
 ## Requirements
 
@@ -136,6 +144,7 @@ qdev-host --plugin plugins/tb-vga/tb-vga.so --socket /run/qdev/tbvga0.sock \
 | `--vm-name NAME` | `org.qemu.Display1.VM.Name` |
 | `--dump-dir DIR` | `SIGUSR1` writes `qdev-fb-N.ppm` there |
 | `--fps N` | how often the framebuffer is compared with its shadow to find damage (default 30) |
+| `--idle-fps N`, `--idle-after S` | drop to N Hz after S seconds without changes (default 10 Hz after 2 s; 0 = off) |
 | `--kms /dev/dri/cardN[:CONNECTOR]` | scan the device out on a real monitor (see below) |
 | `--on-connect CMD`, `--on-disconnect CMD` | run when that connector's status changes (e.g. `tbctl.py … plug/unplug`) |
 | `--qemu-display ADDR`, `--qemu-display-dest NAME`, `--qemu-console N` | forward keyboard/mouse to the VM's own Display1 console (see below) |
@@ -349,6 +358,9 @@ Measured on this scheme with a microbenchmark (kvm-unit-tests `vmexit` against
 For a display device none of this matters (a few register writes per mode set, the
 framebuffer is shared memory). For a throughput device the rules in
 [Plugin ABI](#plugin-abi) keep the overhead at about +1.7 µs per doorbell.
+
+The display path itself (damage polling, KMS copy and flip, input hop) is measured
+in [docs/live-display-results.md](docs/live-display-results.md).
 
 ## Roadmap
 
