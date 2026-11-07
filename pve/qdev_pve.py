@@ -174,7 +174,8 @@ def pci_devices(vmid: int) -> list[dict]:
                         "vendor": d["id"]["vendor"], "device": d["id"]["device"]})
             br = d.get("pci_bridge")
             if br and br.get("devices"):
-                walk(br["devices"], br["bus"]["number"], d.get("qdev_id", ""))
+                # PciBusInfo.number is the bridge's primary bus; children live on `secondary`
+                walk(br["devices"], br["bus"].get("secondary", br["bus"]["number"]), d.get("qdev_id", ""))
     for root in mon_cmd(vmid, "query-pci"):
         walk(root["devices"], root["bus"], "")
     return out
