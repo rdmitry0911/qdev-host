@@ -3,10 +3,8 @@ set -e
 case "$1" in
     remove|deconfigure)
         if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-            systemctl disable --now qdev-host-ui-reconcile.path >/dev/null 2>&1 || true
             systemctl disable --now qdev-host-api.service >/dev/null 2>&1 || true
         fi
-        /usr/sbin/qdev-host-ui remove || true
         ;;
 esac
 #DEBHELPER#

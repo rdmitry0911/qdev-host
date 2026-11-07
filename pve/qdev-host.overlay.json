@@ -1,0 +1,10 @@
+{
+  "id": "qdev-host",
+  "order": 50,
+  "description": "qdev-host devices in the VM Hardware panel (Add > qdev-host Device, Remove)",
+  "scripts": ["/pve2/js/qdev-host-hardware.js"],
+  "globals": {
+    "QDEV_HOST_ENDPOINT": {"file": "/etc/qdev-host/ui.json", "keys": ["port"], "default": {"port": 8017}}
+  },
+  "requires": ["/usr/lib/qdev-host/pve/qdev_host_api.py"]
+}

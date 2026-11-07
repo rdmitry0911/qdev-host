@@ -6,7 +6,7 @@ monitor API (`PVE::QemuServer::Monitor::mon_cmd`), the standard guest hookscript
 and systemd.
 
 ```bash
-apt install ./qdev-host_0.2.0_amd64.deb ./qdev-host-pve_0.2.0_all.deb
+apt install ./pve-ui-overlays_0.1.0_all.deb ./qdev-host_0.3.0_amd64.deb ./qdev-host-pve_0.3.0_all.deb
 qdevctl add 128 tbvga0 --plugin tb-vga --args vram=16      # define + hookscript + root port in args
 qm stop 128 && qm start 128                                  # the root port appears at the next start
 qdevctl list 128                                             # tbvga0 ... attached
@@ -46,18 +46,15 @@ the stock PVE 9 web UI: one row per device with its live state, *Add > qdev-host
 Device* and *Remove*. Two parts, modelled on QSM Direct's PVE integration:
 
 1. **Overlay**: `/usr/share/pve-manager/js/qdev-host-hardware.js`, an ExtJS
-   override of `PVE.qemu.HardwareView`. `qdev-host-ui` (`install | reconcile |
-   remove | status`) adds its script tag to `/usr/share/pve-manager/index.html.tpl`
-   through a package-owned `dpkg-divert`, but only when the installed
-   `pve-manager` version *and* the template's SHA-256 are listed in
-   `/usr/share/qdev-host/pve/pve-manager-index-template.sha256`. After a
-   pve-manager upgrade a dpkg trigger and `qdev-host-ui-reconcile.path` re-run
-   `reconcile`: a reviewed version is re-patched, an unknown one gets the stock
-   template back and the panel entry disappears until a new row is shipped.
-   When `qsm-pve-direct` already diverts the template, the block is inserted into
-   its rendered copy instead (and re-inserted by the path unit whenever qsm
-   re-renders); when qsm is installed later, `qdev-host-ui` lets it take the
-   diversion first. Either package can be removed independently.
+   override of `PVE.qemu.HardwareView`, described by
+   `/usr/share/pve-ui-overlays/overlays.d/qdev-host.json`. The shared package
+   [pve-ui-overlays](https://github.com/rdmitry0911/pve-ui-overlays) (a
+   dependency) owns the single `dpkg-divert` of `index.html.tpl` and renders
+   this overlay together with any other (QSM Direct's console entry, ...),
+   only for pve-manager versions in its reviewed allow-list; after an unknown
+   PVE upgrade the stock page comes back until a row is added
+   (`pve-ui-overlays template-hash` prints it). Install order does not
+   matter. `pve-ui-overlays status|list|disable qdev-host|enable qdev-host`.
 2. **Node service**: `qdev-host-api.service` (`/usr/lib/qdev-host/pve/qdev_host_api.py`),
    HTTPS on port 8017 with the node's own PVE certificate. The overlay sends the
    browser's PVE ticket (`Authorization: Bearer`) and user name (`X-QDev-User`);
@@ -81,8 +78,8 @@ Configuration, optional: `/etc/qdev-host/ui.json`
 `users` defaults to `root@pam` on purpose: adding a device appends a root port to
 the VM's `args` and starts a root process with plugin arguments, both things PVE
 itself allows only root to do. `"users": ["*"]` leaves only the privilege check.
-Change the port here and run `qdev-host-ui reconcile` (the port is written into
-the page as `window.QDEV_HOST_ENDPOINT`).
+Change the port here and run `pve-ui-overlays reconcile` (the port is published
+to the page as `window.QDEV_HOST_ENDPOINT` through the descriptor's `globals`).
 
 Plugins describe their arguments for the dialog in a sidecar next to the `.so`
 (`/usr/lib/qdev-host/plugins/tb-vga.json`: `args: [{name, label, type:
@@ -94,9 +91,12 @@ Troubleshooting:
 - The row says *node service unreachable*: the browser has not accepted the
   node certificate on port 8017 yet; the row links to `https://NODE:8017/`,
   open it once, then reload the UI. Also check `systemctl status qdev-host-api`.
-- No qdev-host entries at all: `qdev-host-ui status`; `inactive` after a PVE
-  upgrade means the new `pve-manager` is not in the allow-list yet (check the
-  anchor line, add `VERSION<TAB>SHA256` to the manifest, `qdev-host-ui reconcile`).
+- No qdev-host entries at all: `pve-ui-overlays status`;
+  `disabled-unsupported-pve` after a PVE upgrade means the new `pve-manager`
+  is not in the allow-list yet (review the template, add the row printed by
+  `pve-ui-overlays template-hash` to `/etc/pve-ui-overlays/manifest.d/local.sha256`,
+  `pve-ui-overlays reconcile`). `skipped qdev-host: missing ...` means the
+  node service files are absent.
 - *not allowed to manage qdev-host devices*: the user is not in `ui.json`.
 - The VM lives on another node: open the web UI of that node (the service only
   manages local VMs; a cluster-wide relay is on the list).

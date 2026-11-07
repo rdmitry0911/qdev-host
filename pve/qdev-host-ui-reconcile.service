@@ -1,9 +1,0 @@
-[Unit]
-Description=Re-apply the qdev-host Hardware panel overlay
-Documentation=https://github.com/rdmitry0911/qdev-host
-
-[Service]
-Type=oneshot
-# qsm-pve-direct re-renders the shared template without our block; this puts it back.
-# The write is skipped when the template is already up to date, so no loop.
-ExecStart=/usr/sbin/qdev-host-ui reconcile

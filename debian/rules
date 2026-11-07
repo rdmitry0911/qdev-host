@@ -29,13 +29,9 @@ override_dh_auto_install:
 	install -D -m 755 pve/qdev-host-hook.pl debian/qdev-host-pve/usr/share/qdev-host/pve/qdev-host-hook.pl
 	install -D -m 644 pve/qdev-host-device@.service debian/qdev-host-pve/usr/lib/systemd/system/qdev-host-device@.service
 	install -D -m 644 pve/qdev-host-api.service debian/qdev-host-pve/usr/lib/systemd/system/qdev-host-api.service
-	install -D -m 644 pve/qdev-host-ui-reconcile.path debian/qdev-host-pve/usr/lib/systemd/system/qdev-host-ui-reconcile.path
-	install -D -m 644 pve/qdev-host-ui-reconcile.service debian/qdev-host-pve/usr/lib/systemd/system/qdev-host-ui-reconcile.service
 	install -D -m 644 pve/qdev_host_api.py debian/qdev-host-pve/usr/lib/qdev-host/pve/qdev_host_api.py
-	install -D -m 644 pve/qdev_pve_ui.py debian/qdev-host-pve/usr/lib/qdev-host/pve/qdev_pve_ui.py
-	install -D -m 755 pve/qdev-host-ui debian/qdev-host-pve/usr/sbin/qdev-host-ui
 	install -D -m 644 pve/qdev-host-hardware.js debian/qdev-host-pve/usr/share/pve-manager/js/qdev-host-hardware.js
-	install -D -m 644 pve/pve-manager-index-template.sha256 debian/qdev-host-pve/usr/share/qdev-host/pve/pve-manager-index-template.sha256
+	install -D -m 644 pve/qdev-host.overlay.json debian/qdev-host-pve/usr/share/pve-ui-overlays/overlays.d/qdev-host.json
 	install -D -m 644 pve/README.md debian/qdev-host-pve/usr/share/doc/qdev-host-pve/README.md
 
 override_dh_auto_clean:

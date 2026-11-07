@@ -8,13 +8,10 @@ case "$1" in
             systemctl daemon-reload || true
             systemctl enable --now qdev-host-api.service || true
             systemctl try-restart qdev-host-api.service || true
-            systemctl enable --now qdev-host-ui-reconcile.path || true
         fi
-        /usr/sbin/qdev-host-ui reconcile || echo "qdev-host-pve: PVE Hardware panel UI was not changed" >&2
+        # the overlay descriptor is picked up by pve-ui-overlays' dpkg trigger; this only makes it immediate
+        if command -v pve-ui-overlays >/dev/null 2>&1; then pve-ui-overlays reconcile || true; fi
         echo "qdev-host-pve: qdev-host devices can now be added in the VM Hardware panel (Add > qdev-host Device) or with qdevctl"
-        ;;
-    triggered)
-        /usr/sbin/qdev-host-ui reconcile || echo "qdev-host-pve: PVE Hardware panel UI was not changed" >&2
         ;;
 esac
 #DEBHELPER#

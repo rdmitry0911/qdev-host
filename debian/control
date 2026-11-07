@@ -30,10 +30,13 @@ Description: out-of-process PCI devices for stock QEMU (vfio-user) with Display1
 Package: qdev-host-pve
 Architecture: all
 Depends: ${misc:Depends}, qdev-host (>= ${source:Version}), python3,
- qemu-server (>= 9), pve-manager (>= 9)
+ qemu-server (>= 9), pve-manager (>= 9), pve-ui-overlays (>= 0.1.0)
 Description: Proxmox VE integration for qdev-host devices
  qdevctl adds qdev-host devices to VMs on a stock Proxmox VE node: it keeps
  per-VM device definitions, installs a guest hookscript that starts the
  device processes and hot-plugs them when the VM starts, hot-adds and
  hot-removes devices on running VMs through the node's own QEMU monitor
- API, and reconnects a QSM Direct console to the device display.
+ API, and reconnects a QSM Direct console to the device display. The VM
+ Hardware panel of the web UI lists, adds and removes the devices (an overlay
+ rendered by pve-ui-overlays, backed by the ticket-authorised node service
+ qdev-host-api).

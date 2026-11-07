@@ -1,3 +1,12 @@
+qdev-host (0.3.0) unstable; urgency=medium
+
+  * Proxmox VE web UI: the Hardware-panel overlay is now a pve-ui-overlays
+    descriptor (/usr/share/pve-ui-overlays/overlays.d/qdev-host.json); the
+    package no longer diverts index.html.tpl itself. Depends: pve-ui-overlays.
+  * query-pci: report the secondary bus of hot-plugged devices (01:00.0).
+
+ -- Dmitry R <rdmitry0911@gmail.com>  Sat, 07 Nov 2026 23:40:00 +0200
+
 qdev-host (0.2.0) unstable; urgency=medium
 
   * Proxmox VE web UI: qdev-host devices in the VM Hardware panel (Add > qdev-host
