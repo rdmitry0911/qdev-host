@@ -37,9 +37,9 @@
 static struct {
     const char *plugin, *socket, *plugin_args, *display_p2p, *display_bus,
                *display_name, *vm_name, *dump_dir, *kms, *on_connect, *on_disconnect,
-               *qemu_display, *qemu_display_dest;
+               *qemu_display, *qemu_display_dest, *head_origin, *desktop;
     int fps, idle_fps, idle_after, qemu_console, stats_interval;
-    bool verbose;
+    bool verbose, kms_copy;
 } opt = { .display_name = "org.qemu", .vm_name = "qdev-host", .dump_dir = ".", .fps = 30,
           .idle_fps = 10, .idle_after = 2, .qemu_display_dest = "org.qemu" };
 static bool poll_idle; static double last_damage_t;
@@ -130,12 +130,14 @@ struct sink {
     void *priv;
 };
 
+static GPtrArray *listeners;   /* listener_t*, Display1 listeners (defined below) */
 static struct {
     qdp_scanout cur;        /* current mode (enabled == false: blank) */
     uint8_t *map;           /* mapping of the framebuffer (page aligned base) */
     size_t   map_len;
     uint8_t *pix;           /* first pixel of the scanout */
     uint8_t *shadow;        /* last pixels sent (width*4*height, packed) */
+    bool shadow_stale;
     GPtrArray *sinks;
 } disp;
 
@@ -215,6 +217,9 @@ static gboolean disp_tick(gpointer data)
         memset(disp.shadow, 0xff, (size_t)now.width * 4 * now.height);
     }
     if (!disp.cur.enabled) return G_SOURCE_CONTINUE;
+    /* nobody needs damage rectangles: zero-copy KMS reads the memfd itself and no Display1 listener is attached */
+    if (listeners->len == 0 && (!kms || kms_zero_copy(kms))) { disp.shadow_stale = true; return G_SOURCE_CONTINUE; }
+    if (disp.shadow_stale) { memset(disp.shadow, 0xff, (size_t)disp.cur.width * 4 * disp.cur.height); disp.shadow_stale = false; }
     int x, y, w, h;
     double t0 = now_s();
     bool dmg = disp_damage(&x, &y, &w, &h);
@@ -256,7 +261,8 @@ static gboolean on_stats_timer(gpointer data) { print_stats(true); return G_SOUR
 /* ---------------------------------------------------------------- KMS sink */
 static void kms_sink_scanout(sink_t *s)
 {
-    kms_scanout(kms, disp.pix, disp.cur.width, disp.cur.height, disp.cur.stride, disp.cur.enabled);
+    kms_scanout(kms, disp.pix, disp.cur.width, disp.cur.height, disp.cur.stride, disp.cur.enabled,
+                disp.cur.fd, disp.cur.offset);
 }
 static void kms_sink_update(sink_t *s, int x, int y, int w, int h)
 {
@@ -313,8 +319,6 @@ typedef struct {
     bool mapped;      /* ScanoutMap of the current scanout succeeded */
     bool scanout_sent;
 } listener_t;
-
-static GPtrArray *listeners;   /* listener_t* */
 
 static void listener_free(listener_t *l)
 {
@@ -466,11 +470,143 @@ static gboolean handle_set_uiinfo(QemuDBusDisplay1Console *o, GDBusMethodInvocat
  * size to that console's size. Without --qemu-display events are dropped. */
 static struct {
     GDBusConnection *conn;
+    QemuDBusDisplay1VM *vm;
     QemuDBusDisplay1Console *console;
     QemuDBusDisplay1Keyboard *kbd;
     QemuDBusDisplay1Mouse *mouse;
+    QemuDBusDisplay1Audio *audio;             /* VM's Audio (NULL if absent) */
+    QemuDBusDisplay1Clipboard *clip_to_qemu;  /* VM's Clipboard (NULL if absent) */
+    QemuDBusDisplay1Clipboard *clip_from_qemu;/* our Clipboard object on the VM connection: QEMU calls us here */
     uint64_t forwarded;
 } fwd;
+/* the one Display1 client (QSM worker) that registered for clipboard events */
+static struct { GDBusConnection *conn; char *name; QemuDBusDisplay1Clipboard *proxy; bool registered; } clip_client;
+
+/* QEMU does not list Audio/Clipboard in VM.Interfaces; ask the object itself */
+static bool vm_has(const char *iface)
+{
+    const char *dest = (opt.qemu_display_dest && *opt.qemu_display_dest) ? opt.qemu_display_dest : NULL;
+    g_autofree char *path = g_strdup_printf(DISPLAY1_ROOT "/%s", strrchr(iface, '.') + 1);
+    g_autoptr(GVariant) r = g_dbus_connection_call_sync(fwd.conn, dest, path, "org.freedesktop.DBus.Introspectable",
+        "Introspect", NULL, G_VARIANT_TYPE("(s)"), G_DBUS_CALL_FLAGS_NONE, DBUS_TIMEOUT, NULL, NULL);
+    if (!r) return false;
+    const char *xml; g_variant_get(r, "(&s)", &xml);
+    return strstr(xml, iface) != NULL;
+}
+
+/* All relays are asynchronous: QEMU answers a Register with a GetAll on our
+ * object, and a Request may bounce back to us, so our main loop must never
+ * block on a call to QEMU (or to the client). */
+typedef struct { GDBusMethodInvocation *inv; gpointer obj; } relay_t;
+static relay_t *relay_new(gpointer obj, GDBusMethodInvocation *inv) { relay_t *r = g_new0(relay_t, 1); r->obj = obj; r->inv = inv; return r; }
+
+static void relay_done_void(GObject *src, GAsyncResult *res, gpointer data)
+{
+    relay_t *r = data; g_autoptr(GError) err = NULL;
+    g_autoptr(GVariant) v = g_dbus_proxy_call_finish(G_DBUS_PROXY(src), res, &err);
+    if (!v) { LOG("relay %s: %s", g_dbus_method_invocation_get_method_name(r->inv), err->message);
+              g_dbus_method_invocation_return_dbus_error(r->inv, "org.qemu.Display1.Error.Failed", err->message); }
+    else g_dbus_method_invocation_return_value(r->inv, NULL);
+    g_free(r);
+}
+static void relay_done_request(GObject *src, GAsyncResult *res, gpointer data)
+{
+    relay_t *r = data; g_autoptr(GError) err = NULL; g_autofree char *mime = NULL; GVariant *d = NULL;
+    if (!qemu_dbus_display1_clipboard_call_request_finish(QEMU_DBUS_DISPLAY1_CLIPBOARD(src), &mime, &d, res, &err)) {
+        LOG("relay Request: %s", err->message);
+        g_dbus_method_invocation_return_dbus_error(r->inv, "org.qemu.Display1.Error.Failed", err->message);
+    } else qemu_dbus_display1_clipboard_complete_request(r->obj, r->inv, mime, d);
+    g_free(r);
+}
+#define RELAY_FAIL(inv, msg) do { g_dbus_method_invocation_return_dbus_error(inv, "org.qemu.Display1.Error.Failed", msg); return TRUE; } while (0)
+
+/* ---- clipboard: QEMU -> client (callbacks QEMU makes on our object on the VM bus) */
+static gboolean qclip_grab(QemuDBusDisplay1Clipboard *o, GDBusMethodInvocation *inv, guint sel, guint serial, const gchar *const *mimes, gpointer d)
+{
+    if (!clip_client.proxy) RELAY_FAIL(inv, "no clipboard client");
+    qemu_dbus_display1_clipboard_call_grab(clip_client.proxy, sel, serial, mimes, G_DBUS_CALL_FLAGS_NONE, DBUS_TIMEOUT, NULL, relay_done_void, relay_new(o, inv));
+    return TRUE;
+}
+static gboolean qclip_release(QemuDBusDisplay1Clipboard *o, GDBusMethodInvocation *inv, guint sel, gpointer d)
+{
+    if (!clip_client.proxy) RELAY_FAIL(inv, "no clipboard client");
+    qemu_dbus_display1_clipboard_call_release(clip_client.proxy, sel, G_DBUS_CALL_FLAGS_NONE, DBUS_TIMEOUT, NULL, relay_done_void, relay_new(o, inv));
+    return TRUE;
+}
+static gboolean qclip_request(QemuDBusDisplay1Clipboard *o, GDBusMethodInvocation *inv, guint sel, const gchar *const *mimes, gpointer d)
+{
+    if (!clip_client.proxy) RELAY_FAIL(inv, "no clipboard client");
+    qemu_dbus_display1_clipboard_call_request(clip_client.proxy, sel, mimes, G_DBUS_CALL_FLAGS_NONE, DBUS_TIMEOUT, NULL, relay_done_request, relay_new(o, inv));
+    return TRUE;
+}
+/* QEMU also calls Register/Unregister on its peer's object: acknowledge */
+static gboolean qclip_noop(QemuDBusDisplay1Clipboard *o, GDBusMethodInvocation *inv, gpointer d)
+{ g_dbus_method_invocation_return_value(inv, NULL); return TRUE; }
+
+/* ---- clipboard: client -> QEMU (our exported Clipboard object) */
+static void clip_client_set(GDBusMethodInvocation *inv)
+{
+    GDBusConnection *c = g_dbus_method_invocation_get_connection(inv);
+    const char *sender = g_dbus_method_invocation_get_sender(inv);
+    if (clip_client.conn == c && !g_strcmp0(clip_client.name, sender)) return;
+    g_clear_object(&clip_client.proxy); g_clear_object(&clip_client.conn); g_clear_pointer(&clip_client.name, g_free);
+    clip_client.conn = g_object_ref(c); clip_client.name = g_strdup(sender);
+    clip_client.proxy = qemu_dbus_display1_clipboard_proxy_new_sync(c, G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES, sender, DISPLAY1_ROOT "/Clipboard", NULL, NULL);
+}
+static void relay_done_register(GObject *src, GAsyncResult *res, gpointer data)
+{
+    relay_t *r = data; g_autoptr(GError) err = NULL;
+    g_autoptr(GVariant) v = g_dbus_proxy_call_finish(G_DBUS_PROXY(src), res, &err);
+    if (!v) { LOG("clipboard Register at the VM: %s", err->message); g_dbus_method_invocation_return_dbus_error(r->inv, "org.qemu.Display1.Error.Failed", err->message); }
+    else { clip_client.registered = true; LOG("clipboard client registered, relayed to the VM"); g_dbus_method_invocation_return_value(r->inv, NULL); }
+    g_free(r);
+}
+static gboolean cclip_register(QemuDBusDisplay1Clipboard *o, GDBusMethodInvocation *inv, gpointer d)
+{
+    clip_client_set(inv);
+    if (clip_client.registered) { qemu_dbus_display1_clipboard_complete_register(o, inv); return TRUE; }
+    qemu_dbus_display1_clipboard_call_register(fwd.clip_to_qemu, G_DBUS_CALL_FLAGS_NONE, DBUS_TIMEOUT, NULL, relay_done_register, relay_new(o, inv));
+    return TRUE;
+}
+static gboolean cclip_unregister(QemuDBusDisplay1Clipboard *o, GDBusMethodInvocation *inv, gpointer d)
+{
+    if (clip_client.registered) { qemu_dbus_display1_clipboard_call_unregister(fwd.clip_to_qemu, G_DBUS_CALL_FLAGS_NONE, DBUS_TIMEOUT, NULL, NULL, NULL); clip_client.registered = false; }
+    g_clear_object(&clip_client.proxy); g_clear_object(&clip_client.conn); g_clear_pointer(&clip_client.name, g_free);
+    qemu_dbus_display1_clipboard_complete_unregister(o, inv); return TRUE;
+}
+static gboolean cclip_grab(QemuDBusDisplay1Clipboard *o, GDBusMethodInvocation *inv, guint sel, guint serial, const gchar *const *mimes, gpointer d)
+{
+    qemu_dbus_display1_clipboard_call_grab(fwd.clip_to_qemu, sel, serial, mimes, G_DBUS_CALL_FLAGS_NONE, DBUS_TIMEOUT, NULL, relay_done_void, relay_new(o, inv));
+    return TRUE;
+}
+static gboolean cclip_release(QemuDBusDisplay1Clipboard *o, GDBusMethodInvocation *inv, guint sel, gpointer d)
+{
+    qemu_dbus_display1_clipboard_call_release(fwd.clip_to_qemu, sel, G_DBUS_CALL_FLAGS_NONE, DBUS_TIMEOUT, NULL, relay_done_void, relay_new(o, inv));
+    return TRUE;
+}
+static gboolean cclip_request(QemuDBusDisplay1Clipboard *o, GDBusMethodInvocation *inv, guint sel, const gchar *const *mimes, gpointer d)
+{
+    qemu_dbus_display1_clipboard_call_request(fwd.clip_to_qemu, sel, mimes, G_DBUS_CALL_FLAGS_NONE, DBUS_TIMEOUT, NULL, relay_done_request, relay_new(o, inv));
+    return TRUE;
+}
+
+/* ---- audio: the listener fd is handed straight to the VM's QEMU, which then talks to the client directly */
+static void relay_done_audio(GObject *src, GAsyncResult *res, gpointer data)
+{
+    relay_t *r = data; g_autoptr(GError) err = NULL;
+    g_autoptr(GVariant) v = g_dbus_proxy_call_with_unix_fd_list_finish(G_DBUS_PROXY(src), NULL, res, &err);
+    if (!v) { LOG("audio listener relay: %s", err->message); g_dbus_method_invocation_return_dbus_error(r->inv, "org.qemu.Display1.Error.Failed", err->message); }
+    else { LOG("audio listener relayed to the VM"); g_dbus_method_invocation_return_value_with_unix_fd_list(r->inv, NULL, NULL); }
+    g_free(r);
+}
+static gboolean audio_reg(QemuDBusDisplay1Audio *o, GDBusMethodInvocation *inv, GUnixFDList *fds, GVariant *h, bool out)
+{
+    if (out) qemu_dbus_display1_audio_call_register_out_listener(fwd.audio, h, G_DBUS_CALL_FLAGS_NONE, DBUS_TIMEOUT, fds, NULL, relay_done_audio, relay_new(o, inv));
+    else qemu_dbus_display1_audio_call_register_in_listener(fwd.audio, h, G_DBUS_CALL_FLAGS_NONE, DBUS_TIMEOUT, fds, NULL, relay_done_audio, relay_new(o, inv));
+    return TRUE;
+}
+static gboolean audio_reg_out(QemuDBusDisplay1Audio *o, GDBusMethodInvocation *inv, GUnixFDList *fds, GVariant *h, gpointer d) { return audio_reg(o, inv, fds, h, true); }
+static gboolean audio_reg_in(QemuDBusDisplay1Audio *o, GDBusMethodInvocation *inv, GUnixFDList *fds, GVariant *h, gpointer d) { return audio_reg(o, inv, fds, h, false); }
 
 static void setup_input_forwarding(void)
 {
@@ -487,6 +623,27 @@ static void setup_input_forwarding(void)
     if (!fwd.kbd) { LOG("qemu keyboard proxy: %s", err->message); exit(1); }
     fwd.mouse = qemu_dbus_display1_mouse_proxy_new_sync(fwd.conn, G_DBUS_PROXY_FLAGS_NONE, dest, path, NULL, &err);
     if (!fwd.mouse) { LOG("qemu mouse proxy: %s", err->message); exit(1); }
+    fwd.vm = qemu_dbus_display1_vm_proxy_new_sync(fwd.conn, G_DBUS_PROXY_FLAGS_NONE, dest, DISPLAY1_ROOT "/VM", NULL, &err);
+    if (!fwd.vm) { LOG("qemu VM proxy: %s", err->message); g_clear_error(&err); }
+    if (vm_has("org.qemu.Display1.Audio")) {
+        fwd.audio = qemu_dbus_display1_audio_proxy_new_sync(fwd.conn, G_DBUS_PROXY_FLAGS_NONE, dest, DISPLAY1_ROOT "/Audio", NULL, &err);
+        if (!fwd.audio) { LOG("qemu audio proxy: %s", err->message); g_clear_error(&err); }
+    }
+    if (vm_has("org.qemu.Display1.Clipboard")) {
+        fwd.clip_to_qemu = qemu_dbus_display1_clipboard_proxy_new_sync(fwd.conn, G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES, dest, DISPLAY1_ROOT "/Clipboard", NULL, &err);
+        if (!fwd.clip_to_qemu) { LOG("qemu clipboard proxy: %s", err->message); g_clear_error(&err); }
+        /* QEMU calls back the sender's /org/qemu/Display1/Clipboard: export ours on this connection */
+        fwd.clip_from_qemu = qemu_dbus_display1_clipboard_skeleton_new();
+        g_signal_connect(fwd.clip_from_qemu, "handle-grab", G_CALLBACK(qclip_grab), NULL);
+        g_signal_connect(fwd.clip_from_qemu, "handle-release", G_CALLBACK(qclip_release), NULL);
+        g_signal_connect(fwd.clip_from_qemu, "handle-request", G_CALLBACK(qclip_request), NULL);
+        g_signal_connect(fwd.clip_from_qemu, "handle-register", G_CALLBACK(qclip_noop), NULL);
+        g_signal_connect(fwd.clip_from_qemu, "handle-unregister", G_CALLBACK(qclip_noop), NULL);
+        if (!g_dbus_interface_skeleton_export(G_DBUS_INTERFACE_SKELETON(fwd.clip_from_qemu), fwd.conn, DISPLAY1_ROOT "/Clipboard", &err)) {
+            LOG("export clipboard on the VM bus: %s", err->message); g_clear_error(&err);
+        }
+    }
+    LOG("VM interfaces: audio %s, clipboard %s", fwd.audio ? "proxied" : "none", fwd.clip_to_qemu ? "proxied" : "none");
     LOG("input forwarded to %s %s%s (console %ux%u, %s pointer)", opt.qemu_display, dest ? dest : "p2p", path,
         qemu_dbus_display1_console_get_width(fwd.console), qemu_dbus_display1_console_get_height(fwd.console),
         qemu_dbus_display1_mouse_get_is_absolute(fwd.mouse) ? "absolute" : "relative");
@@ -512,12 +669,27 @@ static gboolean mouse_release(QemuDBusDisplay1Mouse *o, GDBusMethodInvocation *i
     if (fwd.mouse) { qemu_dbus_display1_mouse_call_release(fwd.mouse, b, G_DBUS_CALL_FLAGS_NONE, DBUS_TIMEOUT, NULL, NULL, NULL); fwd.forwarded++; }
     qemu_dbus_display1_mouse_complete_release(o, inv); return TRUE;
 }
+/* Absolute pointer on a second head. The VM's tablet spans the whole guest
+ * desktop, and QEMU scales Console_N coordinates by that console's size. So a
+ * point (x, y) on this display maps to desktop (ox + x, oy + y), which is sent as
+ * (ox + x) * vmW / desktopW. Layout from --head-origin/--desktop, default: this
+ * display to the right of the VM console. */
+static void head_layout(guint vw, guint vh, int *ox, int *oy, guint *dw, guint *dh)
+{
+    *ox = vw; *oy = 0; *dw = vw + disp.cur.width; *dh = MAX(vh, disp.cur.height);
+    if (opt.head_origin && strcmp(opt.head_origin, "auto")) sscanf(opt.head_origin, "%d,%d", ox, oy);
+    if (opt.desktop && strcmp(opt.desktop, "auto")) sscanf(opt.desktop, "%ux%u", dw, dh);
+}
 static gboolean mouse_abs(QemuDBusDisplay1Mouse *o, GDBusMethodInvocation *inv, guint x, guint y, gpointer d)
 {
     if (fwd.mouse) {
         guint vw = qemu_dbus_display1_console_get_width(fwd.console), vh = qemu_dbus_display1_console_get_height(fwd.console);
         if (disp.cur.enabled && disp.cur.width && disp.cur.height && vw && vh) {
-            x = (guint)((uint64_t)x * vw / disp.cur.width); y = (guint)((uint64_t)y * vh / disp.cur.height);
+            int ox, oy; guint dw, dh;
+            head_layout(vw, vh, &ox, &oy, &dw, &dh);
+            int64_t X = (int64_t)ox + x, Y = (int64_t)oy + y;
+            X = X < 0 ? 0 : X; Y = Y < 0 ? 0 : Y;
+            x = (guint)MIN((uint64_t)X * vw / (dw ? dw : 1), vw - 1); y = (guint)MIN((uint64_t)Y * vh / (dh ? dh : 1), vh - 1);
         }
         qemu_dbus_display1_mouse_call_set_abs_position(fwd.mouse, x, y, G_DBUS_CALL_FLAGS_NONE, DBUS_TIMEOUT, NULL, NULL, NULL);
         fwd.forwarded++;
@@ -543,7 +715,9 @@ static void export_closed(GDBusConnection *c, gboolean remote, GError *err, gpoi
 
 static void export_display1(GDBusConnection *conn)
 {
-    static const char *vm_ifaces[] = { NULL };
+    const char *vm_ifaces[3] = { NULL }; int nvi = 0;
+    if (fwd.clip_to_qemu) vm_ifaces[nvi++] = "org.qemu.Display1.Clipboard";
+    if (fwd.audio) vm_ifaces[nvi++] = "org.qemu.Display1.Audio";
     static const char *con_ifaces[] = { "org.qemu.Display1.Keyboard", "org.qemu.Display1.Mouse", NULL };
     export_t *e = g_new0(export_t, 1);
     e->conn = g_object_ref(conn);
@@ -582,6 +756,33 @@ static void export_display1(GDBusConnection *conn)
     g_dbus_object_skeleton_add_interface(co, G_DBUS_INTERFACE_SKELETON(mouse));
     g_dbus_object_manager_server_export(e->mgr, co);
     g_object_unref(kbd); g_object_unref(mouse); g_object_unref(co);
+
+    if (fwd.clip_to_qemu) {
+        QemuDBusDisplay1Clipboard *cl = qemu_dbus_display1_clipboard_skeleton_new();
+        static const char *none[] = { NULL };
+        qemu_dbus_display1_clipboard_set_interfaces(cl, none);
+        g_signal_connect(cl, "handle-register", G_CALLBACK(cclip_register), NULL);
+        g_signal_connect(cl, "handle-unregister", G_CALLBACK(cclip_unregister), NULL);
+        g_signal_connect(cl, "handle-grab", G_CALLBACK(cclip_grab), NULL);
+        g_signal_connect(cl, "handle-release", G_CALLBACK(cclip_release), NULL);
+        g_signal_connect(cl, "handle-request", G_CALLBACK(cclip_request), NULL);
+        GDBusObjectSkeleton *clo = g_dbus_object_skeleton_new(DISPLAY1_ROOT "/Clipboard");
+        g_dbus_object_skeleton_add_interface(clo, G_DBUS_INTERFACE_SKELETON(cl));
+        g_dbus_object_manager_server_export(e->mgr, clo);
+        g_object_unref(cl); g_object_unref(clo);
+    }
+    if (fwd.audio) {
+        QemuDBusDisplay1Audio *au = qemu_dbus_display1_audio_skeleton_new();
+        static const char *none[] = { NULL };
+        qemu_dbus_display1_audio_set_interfaces(au, none);
+        qemu_dbus_display1_audio_set_nsamples(au, qemu_dbus_display1_audio_get_nsamples(fwd.audio));
+        g_signal_connect(au, "handle-register-out-listener", G_CALLBACK(audio_reg_out), NULL);
+        g_signal_connect(au, "handle-register-in-listener", G_CALLBACK(audio_reg_in), NULL);
+        GDBusObjectSkeleton *auo = g_dbus_object_skeleton_new(DISPLAY1_ROOT "/Audio");
+        g_dbus_object_skeleton_add_interface(auo, G_DBUS_INTERFACE_SKELETON(au));
+        g_dbus_object_manager_server_export(e->mgr, auo);
+        g_object_unref(au); g_object_unref(auo);
+    }
 
     g_dbus_object_manager_server_set_connection(e->mgr, conn);
     g_signal_connect(conn, "closed", G_CALLBACK(export_closed), e);
@@ -648,6 +849,9 @@ static void usage(void)
         "  --qemu-display ADDR      the VM's own Display1 (unix:path=...) to forward keyboard/mouse to\n"
         "  --qemu-display-dest NAME bus name there (default org.qemu; empty for p2p)\n"
         "  --qemu-console N         console index there (default 0)\n"
+        "  --head-origin X,Y|auto   where this display sits on the guest desktop (default: right of the VM console)\n"
+        "  --desktop WxH|auto       guest desktop size for pointer mapping (default: VM console + this display)\n"
+        "  --kms-copy               force the copy path (no udmabuf zero-copy)\n"
         "  --stats-interval S       print stats every S seconds (SIGUSR2 prints them once)\n"
         "  -v                       verbose\n");
     exit(2);
@@ -661,7 +865,8 @@ int main(int argc, char **argv)
         { "vm-name", 1, 0, 'V' }, { "dump-dir", 1, 0, 'D' }, { "fps", 1, 0, 'f' }, { "verbose", 0, 0, 'v' },
         { "kms", 1, 0, 'K' }, { "on-connect", 1, 0, 1 }, { "on-disconnect", 1, 0, 2 },
         { "qemu-display", 1, 0, 'Q' }, { "qemu-display-dest", 1, 0, 3 }, { "qemu-console", 1, 0, 4 },
-        { "stats-interval", 1, 0, 'S' }, { "idle-fps", 1, 0, 5 }, { "idle-after", 1, 0, 6 }, { "help", 0, 0, 'h' }, { 0 }
+        { "stats-interval", 1, 0, 'S' }, { "idle-fps", 1, 0, 5 }, { "idle-after", 1, 0, 6 },
+        { "head-origin", 1, 0, 7 }, { "desktop", 1, 0, 8 }, { "kms-copy", 0, 0, 9 }, { "help", 0, 0, 'h' }, { 0 }
     };
     int c;
     while ((c = getopt_long(argc, argv, "p:s:a:P:B:N:V:D:f:K:Q:S:vh", lopts, NULL)) != -1) {
@@ -676,6 +881,8 @@ int main(int argc, char **argv)
         case 3: opt.qemu_display_dest = optarg; break; case 4: opt.qemu_console = atoi(optarg); break;
         case 'S': opt.stats_interval = atoi(optarg); break;
         case 5: opt.idle_fps = atoi(optarg); break; case 6: opt.idle_after = atoi(optarg); break;
+        case 7: opt.head_origin = optarg; break;   case 8: opt.desktop = optarg; break;
+        case 9: opt.kms_copy = true; break;
         default: usage();
         }
     }
@@ -693,6 +900,7 @@ int main(int argc, char **argv)
     if (opt.kms) {
         kms = kms_open(opt.kms, opt.verbose);
         if (!kms) exit(1);
+        kms_set_allow_zero_copy(kms, !opt.kms_copy);
         g_ptr_array_add(disp.sinks, &kms_sink);
         g_timeout_add(1000, kms_hotplug_poll, NULL);
     }

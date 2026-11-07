@@ -93,10 +93,12 @@ panel ([measurements](docs/live-display-results.md)):
 |---|---|
 | `--kms /dev/dri/card0:eDP-1` | `qdev-host` is DRM master; the panel's EDID goes to the guest, which picks 3840x2400 |
 | Guest frames on the panel | every guest frame reaches the screen up to the poll rate (60 fps → 55 flips/s), detection→vblank ≈ 15 ms, ≈ 50 % of one core at 4K under load, ≈ 7 % idle with adaptive polling |
-| Input | QSM-style keyboard/mouse events relayed to the VM's own QEMU and seen on the guest's USB devices; one extra D-Bus hop (~0.2 ms) |
+| Input | QSM-style keyboard/mouse events relayed to the VM's own QEMU and seen on the guest's USB devices; one extra D-Bus hop (~0.2 ms); second-head pointer mapping verified numerically |
+| Zero-copy KMS | the panel scans the device memfd out directly (udmabuf); 60 fps at 4K with no copies and no polling |
+| Clipboard / audio | relayed to the VM's QEMU; clipboard verified with `dbus-monitor`, audio relay accepted by QEMU (end-to-end audio needs the real QSM worker) |
 
-Not done yet: clipboard and audio interfaces, per-head input for multi-head
-guests, zero-copy KMS scan-out, macOS validation.
+Not done yet: guest-agent clipboard traffic and end-to-end audio with the real QSM
+worker, macOS validation, several devices per host process.
 
 ## Requirements
 
@@ -149,6 +151,8 @@ qdev-host --plugin plugins/tb-vga/tb-vga.so --socket /run/qdev/tbvga0.sock \
 | `--on-connect CMD`, `--on-disconnect CMD` | run when that connector's status changes (e.g. `tbctl.py … plug/unplug`) |
 | `--qemu-display ADDR`, `--qemu-display-dest NAME`, `--qemu-console N` | forward keyboard/mouse to the VM's own Display1 console (see below) |
 | `--stats-interval S` | print damage-detection and KMS statistics every S seconds (`SIGUSR2` prints once) |
+| `--kms-copy` | force the dumb-buffer copy path instead of zero-copy |
+| `--head-origin X,Y`, `--desktop WxH` | guest desktop layout for the pointer on this head (see below) |
 
 ### 2. Start the VM on a stock QEMU
 
@@ -227,6 +231,12 @@ drives the connector directly (`kms-sink.c`):
 - When the guest sets a mode, the sink picks the connector mode of the same
   size (highest refresh, preferred first), else keeps the preferred mode and
   centers the guest frame in it.
+- **Zero-copy by default**: the plugin's memfd is wrapped into a dma-buf with
+  `/dev/udmabuf`, imported into DRM and set on the CRTC, so the monitor reads the
+  guest's pixels directly; no polling, no copies, latency = the next scan-out.
+  Needs a sealed memfd (`F_SEAL_SHRINK`, `tb-vga` does this), a mode of exactly
+  the guest size, `/dev/udmabuf` access (group `kvm`) and a KMS driver that scans
+  out imported system memory (i915 verified). Otherwise, or with `--kms-copy`:
 - Two dumb buffers of mode size; each damage rectangle found by the host is
   copied into the back buffer, which is **page-flipped at vblank**
   (`DRM_MODE_PAGE_FLIP_EVENT`); damage arriving during a flip is accumulated per
@@ -242,8 +252,8 @@ drives the connector directly (`kms-sink.c`):
 
 Requirements: no other DRM master on the card (stop the display manager, or use
 a card without a desktop on it); `/dev/dri/cardN` writable (group `video`).
-Zero-copy scan-out of the plugin's memfd (udmabuf → `drmPrimeFDToHandle`) is a
-possible later step; the copy costs ~0.2 ms per 1280x800 frame on a laptop CPU.
+udmabuf limits one buffer to `size_limit_mb` (64 MB by default), so only the
+scanout region is wrapped, not the whole VRAM.
 
 ## Input forwarding
 
@@ -257,9 +267,19 @@ size to the VM console's size, `Mouse.IsAbsolute` mirrors the VM's. Calls are
 forwarded asynchronously; the extra hop costs one D-Bus method call
 (`tools/display1-input-bench` measures it: direct vs. through `qdev-host`).
 
-Limitation: on a multi-head guest desktop the pointer lands on the VM console's
-screen, not on the external one; mapping to the external head needs an input
-device bound to it (planned).
+Second head: the VM's tablet spans the whole guest desktop, so a point on this
+display is mapped to desktop coordinates first (`--head-origin X,Y`, default: right
+of the VM console; `--desktop WxH`, default: VM console + this display) and then
+scaled to the VM console's size. Verified against the guest's tablet values
+([measurements](docs/live-display-results.md)). The guest's own screen layout
+must match these options (or the other way round).
+
+Clipboard and audio: when the VM's QEMU exposes `org.qemu.Display1.Clipboard` and
+`.Audio`, `qdev-host` exports the same objects and relays them, so a QSM worker
+attached to the external display gets the VM's clipboard and audio as if it were
+attached to QEMU: clipboard calls go both ways (QEMU's callbacks reach the client),
+audio listener fds are handed to QEMU, which then talks to the client directly.
+One clipboard peer per QEMU is a QEMU rule, which the relay respects.
 
 ## Plugin ABI
 
@@ -364,17 +384,15 @@ in [docs/live-display-results.md](docs/live-display-results.md).
 
 ## Roadmap
 
-1. **Zero-copy KMS**: scan the plugin memfd out directly (udmabuf) where the
-   driver allows; per-head input device for multi-head guests.
-2. **GPU plugins**: dma-buf scanouts (`ScanoutDMABUF`) instead of memfd, damage
+1. **GPU plugins**: dma-buf scanouts (`ScanoutDMABUF`) instead of memfd, damage
    from the plugin instead of shadow comparison.
-3. **Several devices per host process** and **plugin replacement**: load v2 next
+2. **Several devices per host process** and **plugin replacement**: load v2 next
    to v1, move the guest over, retire v1 (the ABI already keeps state in the
    plugin process).
-4. **Orchestration**: `qdevctl` over QMP, Proxmox hookscript (`post-start`) so
+3. **Orchestration**: `qdevctl` over QMP, Proxmox hookscript (`post-start`) so
    external devices reappear after a VM restart; QSM terminal service: one
    Display1 endpoint per external console.
-5. macOS validation of the Thunderbolt layer (`_DSD` vs `_DSM` properties).
+4. macOS validation of the Thunderbolt layer (`_DSD` vs `_DSM` properties).
 
 ## Repository layout
 
@@ -385,9 +403,10 @@ dbus/              org.qemu.Display1 interface XML (from QEMU, Linux variant); G
 plugins/tb-vga/    the display plugin + sample EDID
 kms-sink.c/.h      DRM/KMS sink (real monitor), EDID export, page flips, hot-plug hooks
 tools/             tbctl.py (QMP plug/unplug/connect), run-guest.sh, prep-guest.sh, test-flow.sh,
-                   remote-kms-test.sh (live-display test on a GPU host), guest_cmd.py (serial console
-                   driver), guest-draw.py, guest-animate.py (fps load), ppm2png.py,
-                   display1-input-bench.c (input round-trip latency)
+                   remote-kms-test.sh / remote-features-test.sh (live-display tests on a GPU host),
+                   guest_cmd.py (serial console driver), guest-draw.py, guest-animate.py (fps load, raw BAR
+                   writes), guest-abs-read.py, ppm2png.py, display1-input-bench.c (input round trip),
+                   display1-abs-test.py, display1-clipboard-test.py
 acpi/              SSDT with the Thunderbolt ACPI properties (.dsl + .aml)
 bench/             the vfio-user overhead microbenchmark (libvfio-user pci-testdev + kvm-unit-tests patch)
 docs/              overhead report, Thunderbolt-on-stock notes (Russian)

@@ -17,3 +17,6 @@ Linux binds `bochs-drm`; the preferred EDID mode becomes the fbdev mode.
 
 The scanout exported to the host is the DISPI mode (32 bpp): width/height from
 XRES/YRES, stride from VIRT_WIDTH, offset from X/Y_OFFSET, pixman `x8r8g8b8`.
+
+The VRAM memfd is created with `MFD_ALLOW_SEALING` and sealed with `F_SEAL_SHRINK`
+so the host can wrap it into a dma-buf (udmabuf) for zero-copy KMS scan-out.

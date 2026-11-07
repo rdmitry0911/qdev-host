@@ -123,3 +123,80 @@ after the client sent it. Verified in the guest with `od` on the USB input devic
    driver can scan out system memory; removes the 2 GB/s copy.
 3. Multiple damage rectangles per tick instead of one bounding box.
 4. Per-head input device for multi-head guests (pointer lands on the external head).
+
+## Round 2 (same evening): zero-copy KMS, second-head pointer, Clipboard/Audio relays
+
+Same host, same guest, `tools/remote-features-test.sh`.
+
+### Zero-copy scan-out through udmabuf
+
+The plugin's VRAM memfd (sealed with `F_SEAL_SHRINK`) is wrapped into a dma-buf by
+`/dev/udmabuf`, imported with `drmPrimeFDToHandle`, turned into a framebuffer with
+`drmModeAddFB2` and set on the CRTC. The panel then reads the guest's pixels directly:
+
+```text
+kms: zero-copy: eDP-1 scans out the device memfd directly: CRTC fb 245 (ours 245), 3840x2400 pitch 15360 offset 0
+```
+
+| Guest load at 3840x2400 (raw VRAM writes) | Copy path (round 1) | Zero-copy |
+|---|---:|---:|
+| 600 frames, moving bar, 60 fps | 55 flips/s, 7.8 GB copied, ~47 % of a core | 0 copies, 0 polls, process CPU 0.05 s over the run (≈ 0 %) |
+| 600 frames, full frame, 60 fps | 55 flips/s, 21.9 GB copied, ~57 % | 0 copies, 0 polls, ≈ 0 % |
+| latency guest write → panel | poll + compare + copy + vblank ≈ 25–30 ms | next scan-out of the panel (≤ 1 frame, 16.7 ms at 60 Hz) |
+
+With zero-copy and no Display1 listener attached, the host does not poll for damage
+at all; when a listener (QSM) connects, polling resumes for it only. Tearing is
+possible by construction (single buffer, like a real dumb framebuffer); a guest
+driver that double-buffers (DRM clients) avoids it.
+
+Pitfalls: udmabuf refuses buffers above `size_limit_mb` (64 MB by default,
+`/sys/module/udmabuf/parameters/size_limit_mb`), so the dma-buf covers only the
+scanout region (page aligned), not the whole VRAM; `/dev/udmabuf` must be
+accessible (group `kvm` on Ubuntu); the mode must match the guest frame exactly
+(otherwise the copy path with centering is used); i915 accepted the imported
+system-memory buffer for scan-out, other drivers may not (fallback is automatic).
+
+### Pointer on the second head
+
+`--head-origin`/`--desktop` (default: this display to the right of the VM console).
+Sent `SetAbsPosition(1920, 1200)` for the 3840x2400 head with the VM console at
+640x480: expected guest tablet values `x' = (640+1920)·640/4480 = 365 →
+ABS_X = 365·32767/640 = 18687`, `y' = 1200·480/2400 = 240 → ABS_Y = 16383`;
+the guest's USB tablet reported `ABS_X=18687 ABS_Y=16383`. (QEMU scales by the
+console size, not size−1.) Whether the guest desktop really places the external
+head there is the guest's configuration; the options exist for other layouts.
+
+### Clipboard relay
+
+The exported `/org/qemu/Display1/Clipboard` relays `Register/Unregister/Grab/
+Release/Request` to the VM's QEMU, and QEMU's callbacks (`Grab/Release/Request`,
+and the `Register/Release` QEMU itself issues to its peer) to the registered
+client. All relays are asynchronous: QEMU answers a `Register` with a property
+fetch on the caller's object, so a synchronous relay deadlocks (observed, 5 s
+timeout, fixed). `dbus-monitor` on the VM bus during the test client's run:
+
+```text
+:1.5 (qdev-host) -> :1.0 (QEMU)  Register
+:1.0 -> :1.5                     Register        (QEMU registering with its peer)
+:1.5 -> :1.0                     Grab
+:1.5 -> :1.0                     Release
+:1.0 -> :1.5                     Release         (relayed to the client)
+:1.5 -> :1.0                     Unregister
+```
+
+After our client unregistered, a second peer registering directly at QEMU was
+accepted; while ours is registered QEMU refuses others (one clipboard peer per
+QEMU), which is why one QSM worker per VM must go through the relay, not beside it.
+Guest-side clipboard traffic (`Request` from the guest agent) was not exercised
+(no agent in the test guest).
+
+### Audio relay
+
+`Audio.RegisterOutListener/RegisterInListener` pass the client's listener fd to the
+VM's QEMU (`audio listener relayed to the VM`), and `VM.Interfaces` advertises
+`org.qemu.Display1.Audio`. The end-to-end check with `qemu-display-probe
+--require-audio` failed with the same error with and without `qdev-host`, directly
+against this QEMU: `Failed to setup peer connection: Unexpected lack of content
+trying to read a byte` on QEMU's side, i.e. the probe did not serve its listener
+socket for QEMU's handshake. So the relay is transparent, but audio was not
+verified end to end here; it needs the real QSM worker (or a fixed probe).

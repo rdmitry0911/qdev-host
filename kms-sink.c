@@ -18,8 +18,12 @@
 #include <sys/mman.h>
 #include <glib.h>
 #include <glib-unix.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <linux/udmabuf.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+#include <drm_fourcc.h>
 #include "kms-sink.h"
 
 #define LOG(...) do { fprintf(stderr, "kms: " __VA_ARGS__); fputc('\n', stderr); } while (0)
@@ -38,6 +42,9 @@ struct kms {
     dumb_t buf[2];
     int front;
     bool mode_set, flip_pending, enabled, damage_while_pending;
+    /* zero-copy: the plugin memfd imported as a dma-buf and scanned out directly */
+    bool allow_zc, zero_copy;
+    int zc_memfd, zc_dmabuf; uint32_t zc_handle, zc_fb; uint64_t zc_off, zc_len;
     /* current guest scanout geometry and placement in the mode */
     uint32_t sw, sh, sstride; int ox, oy;
     const uint8_t *spix;
@@ -45,6 +52,62 @@ struct kms {
     /* stats */
     struct { uint64_t flips, bytes; double lat_sum, lat_max, copy_sum, copy_max; double t_first_damage; double t_last_print; } st;
 };
+
+static void zc_release(kms_t *k)
+{
+    if (k->zc_fb) { drmModeRmFB(k->fd, k->zc_fb); k->zc_fb = 0; }
+    if (k->zc_handle) { struct drm_gem_close c = { .handle = k->zc_handle }; drmIoctl(k->fd, DRM_IOCTL_GEM_CLOSE, &c); k->zc_handle = 0; }
+    if (k->zc_dmabuf >= 0) { close(k->zc_dmabuf); k->zc_dmabuf = -1; }
+    k->zc_memfd = -1; k->zero_copy = false;
+}
+
+/* wrap the memfd into a dma-buf (udmabuf) and import it as a GEM handle */
+static bool zc_import(kms_t *k, int memfd, uint64_t off, uint64_t len)
+{
+    long page = sysconf(_SC_PAGESIZE);
+    uint64_t aoff = off & ~(uint64_t)(page - 1), alen = ((off + len + page - 1) & ~(uint64_t)(page - 1)) - aoff;
+    if (k->zc_memfd == memfd && k->zc_handle && k->zc_off == aoff && k->zc_len == alen) return true;
+    zc_release(k);
+    struct stat st;
+    if (fstat(memfd, &st) < 0) return false;
+    if (aoff + alen > (uint64_t)st.st_size) { LOG("zero-copy: scanout beyond the memfd"); return false; }
+    int seals = fcntl(memfd, F_GET_SEALS);
+    if (seals < 0 || !(seals & F_SEAL_SHRINK)) {
+        if (fcntl(memfd, F_ADD_SEALS, F_SEAL_SHRINK) < 0) { LOG("zero-copy: memfd cannot be sealed (F_SEAL_SHRINK): %s", strerror(errno)); return false; }
+    }
+    int ufd = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+    if (ufd < 0) { LOG("zero-copy: /dev/udmabuf: %s", strerror(errno)); return false; }
+    /* only the scanout region: udmabuf refuses buffers above its size_limit_mb (64 MB by default) */
+    struct udmabuf_create c = { .memfd = memfd, .flags = UDMABUF_FLAGS_CLOEXEC, .offset = aoff, .size = alen };
+    int dmabuf = ioctl(ufd, UDMABUF_CREATE, &c);
+    close(ufd);
+    if (dmabuf < 0) { LOG("zero-copy: UDMABUF_CREATE (offset %llu, %llu bytes): %s", (unsigned long long)aoff, (unsigned long long)alen, strerror(errno)); return false; }
+    uint32_t handle;
+    if (drmPrimeFDToHandle(k->fd, dmabuf, &handle) < 0) { LOG("zero-copy: drmPrimeFDToHandle: %s", strerror(errno)); close(dmabuf); return false; }
+    k->zc_memfd = memfd; k->zc_dmabuf = dmabuf; k->zc_handle = handle; k->zc_off = aoff; k->zc_len = alen;
+    return true;
+}
+
+static bool zc_setup_fb(kms_t *k, uint32_t w, uint32_t h, uint32_t stride, uint32_t offset)
+{
+    uint32_t handles[4] = { k->zc_handle }, pitches[4] = { stride }, offsets[4] = { offset }, fb;
+    if (drmModeAddFB2(k->fd, w, h, DRM_FORMAT_XRGB8888, handles, pitches, offsets, &fb, 0) < 0) {
+        LOG("zero-copy: drmModeAddFB2 %ux%u pitch %u offset %u: %s", w, h, stride, offset, strerror(errno)); return false;
+    }
+    if (drmModeSetCrtc(k->fd, k->crtc_id, fb, 0, 0, &k->conn_id, 1, &k->mode) < 0) {
+        LOG("zero-copy: drmModeSetCrtc: %s", strerror(errno)); drmModeRmFB(k->fd, fb); return false;
+    }
+    if (k->zc_fb) drmModeRmFB(k->fd, k->zc_fb);
+    k->zc_fb = fb; k->zero_copy = true; k->mode_set = true;
+    drmModeCrtc *c = drmModeGetCrtc(k->fd, k->crtc_id);
+    LOG("zero-copy: %s scans out the device memfd directly: CRTC fb %u (ours %u), %ux%u pitch %u offset %u",
+        k->conn_name, c ? c->buffer_id : 0, fb, w, h, stride, offset);
+    if (c) drmModeFreeCrtc(c);
+    return true;
+}
+
+bool kms_zero_copy(kms_t *k) { return k && k->zero_copy; }
+void kms_set_allow_zero_copy(kms_t *k, bool allow) { k->allow_zc = allow; }
 
 static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 static void rect_add(rect_t *r, int x, int y, int w, int h)
@@ -101,7 +164,7 @@ kms_t *kms_open(const char *spec, bool verbose)
     char *want = strchr(path, ':');
     if (want) *want++ = 0;
     kms_t *k = g_new0(kms_t, 1);
-    k->verbose = verbose;
+    k->verbose = verbose; k->allow_zc = true; k->zc_memfd = -1; k->zc_dmabuf = -1;
     k->fd = open(path, O_RDWR | O_CLOEXEC);
     if (k->fd < 0) { LOG("open %s: %s", path, strerror(errno)); goto fail; }
     snprintf(k->card, sizeof(k->card), "%s", strrchr(path, '/') ? strrchr(path, '/') + 1 : path);
@@ -224,11 +287,13 @@ static gboolean drm_event_cb(gint fd, GIOCondition cond, gpointer data)
     return G_SOURCE_CONTINUE;
 }
 
-void kms_scanout(kms_t *k, const uint8_t *pix, uint32_t w, uint32_t h, uint32_t stride, bool enabled)
+void kms_scanout(kms_t *k, const uint8_t *pix, uint32_t w, uint32_t h, uint32_t stride, bool enabled,
+                 int memfd, uint32_t offset)
 {
     k->spix = pix; k->sw = w; k->sh = h; k->sstride = stride; k->enabled = enabled;
     if (!enabled) {
-        if (k->mode_set) { memset(k->buf[k->front].map, 0, k->buf[k->front].size); k->buf[1 - k->front].dirty.any = false; }
+        if (k->zero_copy) { drmModeSetCrtc(k->fd, k->crtc_id, 0, 0, 0, NULL, 0, NULL); k->zero_copy = false; k->mode_set = false; }
+        else if (k->mode_set) { memset(k->buf[k->front].map, 0, k->buf[k->front].size); k->buf[1 - k->front].dirty.any = false; }
         LOG("scanout off, screen blanked");
         return;
     }
@@ -245,6 +310,15 @@ void kms_scanout(kms_t *k, const uint8_t *pix, uint32_t w, uint32_t h, uint32_t 
     bool remode = !k->mode_set || memcmp(&best, &k->mode, sizeof(best)) != 0;
     k->mode = best;
     k->ox = ((int)k->mode.hdisplay - (int)w) / 2; k->oy = ((int)k->mode.vdisplay - (int)h) / 2;
+    /* zero-copy needs a mode of exactly the guest size and a sealable memfd */
+    if (k->allow_zc && exact && memfd >= 0 && zc_import(k, memfd, offset, (uint64_t)stride * h) &&
+        zc_setup_fb(k, w, h, stride, (uint32_t)(offset - k->zc_off))) {
+        if (k->ev_watch) { g_source_remove(k->ev_watch); k->ev_watch = 0; }
+        for (int i = 0; i < 2; i++) dumb_destroy(k, &k->buf[i]);
+        k->flip_pending = false;
+        return;
+    }
+    if (k->zero_copy) { zc_release(k); k->mode_set = false; remode = true; }
     if (remode) {
         if (k->ev_watch) { g_source_remove(k->ev_watch); k->ev_watch = 0; }
         for (int i = 0; i < 2; i++) dumb_destroy(k, &k->buf[i]);
@@ -266,7 +340,7 @@ void kms_scanout(kms_t *k, const uint8_t *pix, uint32_t w, uint32_t h, uint32_t 
 
 void kms_update(kms_t *k, const uint8_t *pix, uint32_t stride, int x, int y, int w, int h)
 {
-    if (!k->mode_set || !k->enabled) return;
+    if (!k->mode_set || !k->enabled || k->zero_copy) return;   /* zero-copy: the panel reads the memfd itself */
     k->spix = pix; k->sstride = stride;
     rect_add(&k->buf[0].dirty, x, y, w, h);
     rect_add(&k->buf[1].dirty, x, y, w, h);
@@ -277,8 +351,8 @@ void kms_update(kms_t *k, const uint8_t *pix, uint32_t stride, int x, int y, int
 void kms_stats(kms_t *k, FILE *out, bool reset)
 {
     double now = now_s(), dt = k->st.t_last_print ? now - k->st.t_last_print : 0;
-    fprintf(out, "kms: %s %ux%u@%u: flips %llu (%.1f/s), damage->vblank avg %.2f ms max %.2f ms, copy avg %.3f ms max %.3f ms, %.1f MB copied\n",
-            k->conn_name, k->mode.hdisplay, k->mode.vdisplay, k->mode.vrefresh, (unsigned long long)k->st.flips,
+    fprintf(out, "kms: %s %ux%u@%u%s: flips %llu (%.1f/s), damage->vblank avg %.2f ms max %.2f ms, copy avg %.3f ms max %.3f ms, %.1f MB copied\n",
+            k->conn_name, k->mode.hdisplay, k->mode.vdisplay, k->mode.vrefresh, k->zero_copy ? " zero-copy" : "", (unsigned long long)k->st.flips,
             dt > 0 ? k->st.flips / dt : 0.0, k->st.flips ? k->st.lat_sum / k->st.flips * 1e3 : 0.0, k->st.lat_max * 1e3,
             k->st.flips ? k->st.copy_sum / k->st.flips * 1e3 : 0.0, k->st.copy_max * 1e3, k->st.bytes / 1e6);
     if (reset) { memset(&k->st, 0, sizeof(k->st)); }
@@ -287,7 +361,7 @@ void kms_stats(kms_t *k, FILE *out, bool reset)
 
 bool kms_dump_front(kms_t *k, const char *path)
 {
-    if (!k->mode_set) return false;
+    if (!k->mode_set || k->zero_copy) return false;   /* zero-copy: the VRAM dump is the screen */
     dumb_t *b = &k->buf[k->front];
     FILE *f = fopen(path, "wb");
     if (!f) return false;
@@ -309,6 +383,7 @@ void kms_close(kms_t *k)
     else if (k->mode_set)
         drmModeSetCrtc(k->fd, k->crtc_id, 0, 0, 0, NULL, 0, NULL);
     if (k->saved) drmModeFreeCrtc(k->saved);
+    zc_release(k);
     for (int i = 0; i < 2; i++) dumb_destroy(k, &k->buf[i]);
     drmDropMaster(k->fd);
     close(k->fd);

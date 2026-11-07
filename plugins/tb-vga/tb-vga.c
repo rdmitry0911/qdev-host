@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/mman.h>
+#include <fcntl.h>
 #include "qdp.h"
 #include "pci_caps/px.h"
 
@@ -160,8 +161,9 @@ static int tbvga_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env
         memcpy(d->edid, env->edid, d->edid_len);
         fprintf(stderr, "tb-vga: using the host display's EDID (%u bytes)\n", env->edid_len);
     }
-    d->vram_fd = memfd_create("tb-vga-vram", 0);
+    d->vram_fd = memfd_create("tb-vga-vram", MFD_ALLOW_SEALING);
     if (d->vram_fd < 0 || ftruncate(d->vram_fd, d->vram_size) < 0) { free(d); return -errno; }
+    fcntl(d->vram_fd, F_ADD_SEALS, F_SEAL_SHRINK);   /* lets the host wrap it into a dma-buf (udmabuf) */
     d->vram = mmap(NULL, d->vram_size, PROT_READ | PROT_WRITE, MAP_SHARED, d->vram_fd, 0);
     if (d->vram == MAP_FAILED) { close(d->vram_fd); free(d); return -errno; }
     dispi_reset(d);
