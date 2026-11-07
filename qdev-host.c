@@ -20,12 +20,15 @@
 #include <unistd.h>
 #include <getopt.h>
 #include <sys/mman.h>
+#include <time.h>
+#include <sys/resource.h>
 #include <glib.h>
 #include <glib-unix.h>
 #include <gio/gio.h>
 #include <gio/gunixfdlist.h>
 #include "qdp.h"
 #include "dbus/dbus-display1.h"
+#include "kms-sink.h"
 
 #define DISPLAY1_ROOT "/org/qemu/Display1"
 #define DBUS_TIMEOUT  5000
@@ -33,10 +36,16 @@
 /* ------------------------------------------------------------------ options */
 static struct {
     const char *plugin, *socket, *plugin_args, *display_p2p, *display_bus,
-               *display_name, *vm_name, *dump_dir;
-    int fps;
+               *display_name, *vm_name, *dump_dir, *kms, *on_connect, *on_disconnect,
+               *qemu_display, *qemu_display_dest;
+    int fps, qemu_console, stats_interval;
     bool verbose;
-} opt = { .display_name = "org.qemu", .vm_name = "qdev-host", .dump_dir = ".", .fps = 30 };
+} opt = { .display_name = "org.qemu", .vm_name = "qdev-host", .dump_dir = ".", .fps = 30,
+          .qemu_display_dest = "org.qemu" };
+
+static kms_t *kms;
+static struct { double cmp_sum, cmp_max; uint64_t ticks, damaged; } tstat;   /* damage detection cost */
+static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 
 #define LOG(...) do { fprintf(stderr, "qdev-host: " __VA_ARGS__); fputc('\n', stderr); } while (0)
 #define DBG(...) do { if (opt.verbose) LOG(__VA_ARGS__); } while (0)
@@ -98,7 +107,9 @@ static void setup_vfu(void)
     unlink(opt.socket);
     vfu = vfu_create_ctx(VFU_TRANS_SOCK, opt.socket, LIBVFIO_USER_FLAG_ATTACH_NB, NULL, VFU_DEV_TYPE_PCI);
     if (!vfu) { LOG("vfu_create_ctx %s: %s", opt.socket, strerror(errno)); exit(1); }
-    int r = ops->setup(vfu, opt.plugin_args, &priv);
+    qdp_host_env env = { .size = sizeof(env) };
+    if (kms) env.edid = kms_edid(kms, &env.edid_len);
+    int r = ops->setup(vfu, opt.plugin_args, &env, &priv);
     if (r < 0) { LOG("plugin setup failed: %s", strerror(-r)); exit(1); }
     if (vfu_setup_device_reset_cb(vfu, reset_cb) < 0) { LOG("reset cb: %s", strerror(errno)); exit(1); }
     if (vfu_setup_device_dma(vfu, LIBVFIO_USER_MAX_DMA_REGIONS, dma_register, dma_unregister) < 0) {
@@ -204,7 +215,12 @@ static gboolean disp_tick(gpointer data)
     }
     if (!disp.cur.enabled) return G_SOURCE_CONTINUE;
     int x, y, w, h;
-    if (disp_damage(&x, &y, &w, &h)) {
+    double t0 = now_s();
+    bool dmg = disp_damage(&x, &y, &w, &h);
+    double tc = now_s() - t0;
+    tstat.ticks++; tstat.cmp_sum += tc; if (tc > tstat.cmp_max) tstat.cmp_max = tc;
+    if (dmg) {
+        tstat.damaged++;
         for (guint i = 0; i < disp.sinks->len; i++) {
             sink_t *s = g_ptr_array_index(disp.sinks, i);
             if (s->update) s->update(s, x, y, w, h);
@@ -212,6 +228,43 @@ static gboolean disp_tick(gpointer data)
     }
     return G_SOURCE_CONTINUE;
 }
+
+static void print_stats(bool reset)
+{
+    struct rusage ru; getrusage(RUSAGE_SELF, &ru);
+    LOG("stats: ticks %llu (damaged %llu), compare avg %.3f ms max %.3f ms, process cpu %.2fs user %.2fs sys",
+        (unsigned long long)tstat.ticks, (unsigned long long)tstat.damaged,
+        tstat.ticks ? tstat.cmp_sum / tstat.ticks * 1e3 : 0.0, tstat.cmp_max * 1e3,
+        ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6, ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6);
+    if (kms) kms_stats(kms, stderr, reset);
+    if (reset) memset(&tstat, 0, sizeof(tstat));
+}
+static gboolean on_sigusr2(gpointer data) { print_stats(true); return G_SOURCE_CONTINUE; }
+static gboolean on_stats_timer(gpointer data) { print_stats(true); return G_SOURCE_CONTINUE; }
+
+/* ---------------------------------------------------------------- KMS sink */
+static void kms_sink_scanout(sink_t *s)
+{
+    kms_scanout(kms, disp.pix, disp.cur.width, disp.cur.height, disp.cur.stride, disp.cur.enabled);
+}
+static void kms_sink_update(sink_t *s, int x, int y, int w, int h)
+{
+    kms_update(kms, disp.pix, disp.cur.stride, x, y, w, h);
+}
+/* physical connector hot-plug -> run the hooks (e.g. tbctl.py plug/unplug) */
+static gboolean kms_hotplug_poll(gpointer data)
+{
+    static char last[32];
+    const char *st = kms_connector_status(kms);
+    if (last[0] && strcmp(last, st) != 0) {
+        LOG("%s: %s -> %s", kms_connector_name(kms), last, st);
+        const char *cmd = !strcmp(st, "connected") ? opt.on_connect : (!strcmp(st, "disconnected") ? opt.on_disconnect : NULL);
+        if (cmd) { g_autoptr(GError) err = NULL; if (!g_spawn_command_line_async(cmd, &err)) LOG("hook: %s", err->message); }
+    }
+    g_strlcpy(last, st, sizeof(last));
+    return G_SOURCE_CONTINUE;
+}
+static gboolean on_term(gpointer data) { LOG("terminating"); if (kms) kms_close(kms); kms = NULL; exit(0); }
 
 /* --------------------------------------------------------------- PPM sink */
 static unsigned dump_count;
@@ -388,20 +441,75 @@ static gboolean handle_set_uiinfo(QemuDBusDisplay1Console *o, GDBusMethodInvocat
     qemu_dbus_display1_console_complete_set_uiinfo(o, inv);
     return TRUE;
 }
-/* Input: accepted and dropped for now. Next step: forward to the VM's own
- * QEMU Display1 (Keyboard/Mouse of its console) so QSM input keeps working. */
+/* Input forwarding: Keyboard/Mouse of the exported console are relayed to the
+ * VM's own QEMU Display1 console (--qemu-display), where the real input
+ * devices live. Absolute pointer positions are rescaled from this display's
+ * size to that console's size. Without --qemu-display events are dropped. */
+static struct {
+    GDBusConnection *conn;
+    QemuDBusDisplay1Console *console;
+    QemuDBusDisplay1Keyboard *kbd;
+    QemuDBusDisplay1Mouse *mouse;
+    uint64_t forwarded;
+} fwd;
+
+static void setup_input_forwarding(void)
+{
+    if (!opt.qemu_display) return;
+    g_autoptr(GError) err = NULL;
+    const char *dest = (opt.qemu_display_dest && *opt.qemu_display_dest) ? opt.qemu_display_dest : NULL;
+    GDBusConnectionFlags fl = G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT | (dest ? G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION : 0);
+    fwd.conn = g_dbus_connection_new_for_address_sync(opt.qemu_display, fl, NULL, NULL, &err);
+    if (!fwd.conn) { LOG("qemu display %s: %s", opt.qemu_display, err->message); exit(1); }
+    g_autofree char *path = g_strdup_printf(DISPLAY1_ROOT "/Console_%d", opt.qemu_console);
+    fwd.console = qemu_dbus_display1_console_proxy_new_sync(fwd.conn, G_DBUS_PROXY_FLAGS_NONE, dest, path, NULL, &err);
+    if (!fwd.console) { LOG("qemu console proxy: %s", err->message); exit(1); }
+    fwd.kbd = qemu_dbus_display1_keyboard_proxy_new_sync(fwd.conn, G_DBUS_PROXY_FLAGS_NONE, dest, path, NULL, &err);
+    if (!fwd.kbd) { LOG("qemu keyboard proxy: %s", err->message); exit(1); }
+    fwd.mouse = qemu_dbus_display1_mouse_proxy_new_sync(fwd.conn, G_DBUS_PROXY_FLAGS_NONE, dest, path, NULL, &err);
+    if (!fwd.mouse) { LOG("qemu mouse proxy: %s", err->message); exit(1); }
+    LOG("input forwarded to %s %s%s (console %ux%u, %s pointer)", opt.qemu_display, dest ? dest : "p2p", path,
+        qemu_dbus_display1_console_get_width(fwd.console), qemu_dbus_display1_console_get_height(fwd.console),
+        qemu_dbus_display1_mouse_get_is_absolute(fwd.mouse) ? "absolute" : "relative");
+}
+
 static gboolean kbd_press(QemuDBusDisplay1Keyboard *o, GDBusMethodInvocation *inv, guint k, gpointer d)
-{ qemu_dbus_display1_keyboard_complete_press(o, inv); return TRUE; }
+{
+    if (fwd.kbd) { qemu_dbus_display1_keyboard_call_press(fwd.kbd, k, G_DBUS_CALL_FLAGS_NONE, DBUS_TIMEOUT, NULL, NULL, NULL); fwd.forwarded++; }
+    qemu_dbus_display1_keyboard_complete_press(o, inv); return TRUE;
+}
 static gboolean kbd_release(QemuDBusDisplay1Keyboard *o, GDBusMethodInvocation *inv, guint k, gpointer d)
-{ qemu_dbus_display1_keyboard_complete_release(o, inv); return TRUE; }
+{
+    if (fwd.kbd) { qemu_dbus_display1_keyboard_call_release(fwd.kbd, k, G_DBUS_CALL_FLAGS_NONE, DBUS_TIMEOUT, NULL, NULL, NULL); fwd.forwarded++; }
+    qemu_dbus_display1_keyboard_complete_release(o, inv); return TRUE;
+}
 static gboolean mouse_press(QemuDBusDisplay1Mouse *o, GDBusMethodInvocation *inv, guint b, gpointer d)
-{ qemu_dbus_display1_mouse_complete_press(o, inv); return TRUE; }
+{
+    if (fwd.mouse) { qemu_dbus_display1_mouse_call_press(fwd.mouse, b, G_DBUS_CALL_FLAGS_NONE, DBUS_TIMEOUT, NULL, NULL, NULL); fwd.forwarded++; }
+    qemu_dbus_display1_mouse_complete_press(o, inv); return TRUE;
+}
 static gboolean mouse_release(QemuDBusDisplay1Mouse *o, GDBusMethodInvocation *inv, guint b, gpointer d)
-{ qemu_dbus_display1_mouse_complete_release(o, inv); return TRUE; }
+{
+    if (fwd.mouse) { qemu_dbus_display1_mouse_call_release(fwd.mouse, b, G_DBUS_CALL_FLAGS_NONE, DBUS_TIMEOUT, NULL, NULL, NULL); fwd.forwarded++; }
+    qemu_dbus_display1_mouse_complete_release(o, inv); return TRUE;
+}
 static gboolean mouse_abs(QemuDBusDisplay1Mouse *o, GDBusMethodInvocation *inv, guint x, guint y, gpointer d)
-{ qemu_dbus_display1_mouse_complete_set_abs_position(o, inv); return TRUE; }
+{
+    if (fwd.mouse) {
+        guint vw = qemu_dbus_display1_console_get_width(fwd.console), vh = qemu_dbus_display1_console_get_height(fwd.console);
+        if (disp.cur.enabled && disp.cur.width && disp.cur.height && vw && vh) {
+            x = (guint)((uint64_t)x * vw / disp.cur.width); y = (guint)((uint64_t)y * vh / disp.cur.height);
+        }
+        qemu_dbus_display1_mouse_call_set_abs_position(fwd.mouse, x, y, G_DBUS_CALL_FLAGS_NONE, DBUS_TIMEOUT, NULL, NULL, NULL);
+        fwd.forwarded++;
+    }
+    qemu_dbus_display1_mouse_complete_set_abs_position(o, inv); return TRUE;
+}
 static gboolean mouse_rel(QemuDBusDisplay1Mouse *o, GDBusMethodInvocation *inv, gint dx, gint dy, gpointer d)
-{ qemu_dbus_display1_mouse_complete_rel_motion(o, inv); return TRUE; }
+{
+    if (fwd.mouse) { qemu_dbus_display1_mouse_call_rel_motion(fwd.mouse, dx, dy, G_DBUS_CALL_FLAGS_NONE, DBUS_TIMEOUT, NULL, NULL, NULL); fwd.forwarded++; }
+    qemu_dbus_display1_mouse_complete_rel_motion(o, inv); return TRUE;
+}
 
 static void export_closed(GDBusConnection *c, gboolean remote, GError *err, gpointer data)
 {
@@ -444,7 +552,7 @@ static void export_display1(GDBusConnection *conn)
     g_signal_connect(kbd, "handle-press", G_CALLBACK(kbd_press), NULL);
     g_signal_connect(kbd, "handle-release", G_CALLBACK(kbd_release), NULL);
     QemuDBusDisplay1Mouse *mouse = qemu_dbus_display1_mouse_skeleton_new();
-    qemu_dbus_display1_mouse_set_is_absolute(mouse, TRUE);
+    qemu_dbus_display1_mouse_set_is_absolute(mouse, fwd.mouse ? qemu_dbus_display1_mouse_get_is_absolute(fwd.mouse) : TRUE);
     g_signal_connect(mouse, "handle-press", G_CALLBACK(mouse_press), NULL);
     g_signal_connect(mouse, "handle-release", G_CALLBACK(mouse_release), NULL);
     g_signal_connect(mouse, "handle-set-abs-position", G_CALLBACK(mouse_abs), NULL);
@@ -514,6 +622,12 @@ static void usage(void)
         "  --vm-name NAME           Display1.VM.Name\n"
         "  --dump-dir DIR           where SIGUSR1 writes qdev-fb-N.ppm (default .)\n"
         "  --fps N                  damage poll rate (default 30)\n"
+        "  --kms /dev/dri/cardN[:CONNECTOR]  scan the device out on a real monitor (DRM master needed)\n"
+        "  --on-connect CMD / --on-disconnect CMD  run when the KMS connector's status changes\n"
+        "  --qemu-display ADDR      the VM's own Display1 (unix:path=...) to forward keyboard/mouse to\n"
+        "  --qemu-display-dest NAME bus name there (default org.qemu; empty for p2p)\n"
+        "  --qemu-console N         console index there (default 0)\n"
+        "  --stats-interval S       print stats every S seconds (SIGUSR2 prints them once)\n"
         "  -v                       verbose\n");
     exit(2);
 }
@@ -524,16 +638,22 @@ int main(int argc, char **argv)
         { "plugin", 1, 0, 'p' }, { "socket", 1, 0, 's' }, { "plugin-args", 1, 0, 'a' },
         { "display-p2p", 1, 0, 'P' }, { "display-bus", 1, 0, 'B' }, { "display-name", 1, 0, 'N' },
         { "vm-name", 1, 0, 'V' }, { "dump-dir", 1, 0, 'D' }, { "fps", 1, 0, 'f' }, { "verbose", 0, 0, 'v' },
-        { "help", 0, 0, 'h' }, { 0 }
+        { "kms", 1, 0, 'K' }, { "on-connect", 1, 0, 1 }, { "on-disconnect", 1, 0, 2 },
+        { "qemu-display", 1, 0, 'Q' }, { "qemu-display-dest", 1, 0, 3 }, { "qemu-console", 1, 0, 4 },
+        { "stats-interval", 1, 0, 'S' }, { "help", 0, 0, 'h' }, { 0 }
     };
     int c;
-    while ((c = getopt_long(argc, argv, "p:s:a:P:B:N:V:D:f:vh", lopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "p:s:a:P:B:N:V:D:f:K:Q:S:vh", lopts, NULL)) != -1) {
         switch (c) {
         case 'p': opt.plugin = optarg; break;      case 's': opt.socket = optarg; break;
         case 'a': opt.plugin_args = optarg; break; case 'P': opt.display_p2p = optarg; break;
         case 'B': opt.display_bus = optarg; break; case 'N': opt.display_name = optarg; break;
         case 'V': opt.vm_name = optarg; break;     case 'D': opt.dump_dir = optarg; break;
         case 'f': opt.fps = atoi(optarg); break;   case 'v': opt.verbose = true; break;
+        case 'K': opt.kms = optarg; break;         case 1: opt.on_connect = optarg; break;
+        case 2: opt.on_disconnect = optarg; break; case 'Q': opt.qemu_display = optarg; break;
+        case 3: opt.qemu_display_dest = optarg; break; case 4: opt.qemu_console = atoi(optarg); break;
+        case 'S': opt.stats_interval = atoi(optarg); break;
         default: usage();
         }
     }
@@ -547,11 +667,23 @@ int main(int argc, char **argv)
     g_ptr_array_add(disp.sinks, &console_props_sink);
     g_ptr_array_add(disp.sinks, &display1_sink);
 
+    static sink_t kms_sink = { "kms", kms_sink_scanout, kms_sink_update };
+    if (opt.kms) {
+        kms = kms_open(opt.kms, opt.verbose);
+        if (!kms) exit(1);
+        g_ptr_array_add(disp.sinks, &kms_sink);
+        g_timeout_add(1000, kms_hotplug_poll, NULL);
+    }
     load_plugin();
     setup_vfu();
+    setup_input_forwarding();
     setup_display1();
     g_timeout_add(1000 / opt.fps, disp_tick, NULL);
     g_unix_signal_add(SIGUSR1, on_sigusr1, NULL);
+    g_unix_signal_add(SIGUSR2, on_sigusr2, NULL);
+    g_unix_signal_add(SIGTERM, on_term, NULL);
+    g_unix_signal_add(SIGINT, on_term, NULL);
+    if (opt.stats_interval > 0) g_timeout_add_seconds(opt.stats_interval, on_stats_timer, NULL);
 
     GMainLoop *loop = g_main_loop_new(NULL, FALSE);
     g_main_loop_run(loop);

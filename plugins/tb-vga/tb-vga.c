@@ -7,7 +7,8 @@
  *   BAR0  VRAM (default 16 MiB), 64-bit prefetchable, mmap-able memfd
  *   BAR2  4 KiB MMIO: 0x000 EDID, 0x400 VGA ports, 0x500 DISPI, 0x600 QEXT
  *
- * Plugin args: "edid=<file>,vram=<MiB>"
+ * Plugin args: "edid=<file>,vram=<MiB>"; without edid= the EDID of the host
+ * display (KMS sink) is used when the host provides one.
  * Display: get_scanout() exposes the VRAM memfd + current DISPI mode to the
  * host, which forwards it to Display1 listeners (QSM Direct), KMS or files.
  *
@@ -141,7 +142,7 @@ static int parse_args(const char *args, char *edid_path, size_t edid_sz, size_t 
     return 0;
 }
 
-static int tbvga_setup(vfu_ctx_t *ctx, const char *args, void **priv)
+static int tbvga_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env, void **priv)
 {
     char edid_path[512]; size_t vram_mib;
     int r = parse_args(args, edid_path, sizeof(edid_path), &vram_mib);
@@ -154,6 +155,10 @@ static int tbvga_setup(vfu_ctx_t *ctx, const char *args, void **priv)
         if (!f) { fprintf(stderr, "tb-vga: cannot open %s\n", edid_path); free(d); return -errno; }
         d->edid_len = fread(d->edid, 1, sizeof(d->edid), f);
         fclose(f);
+    } else if (env && env->edid && env->edid_len) {
+        d->edid_len = env->edid_len > sizeof(d->edid) ? sizeof(d->edid) : env->edid_len;
+        memcpy(d->edid, env->edid, d->edid_len);
+        fprintf(stderr, "tb-vga: using the host display's EDID (%u bytes)\n", env->edid_len);
     }
     d->vram_fd = memfd_create("tb-vga-vram", 0);
     if (d->vram_fd < 0 || ftruncate(d->vram_fd, d->vram_size) < 0) { free(d); return -errno; }

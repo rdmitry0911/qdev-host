@@ -136,6 +136,10 @@ qdev-host --plugin plugins/tb-vga/tb-vga.so --socket /run/qdev/tbvga0.sock \
 | `--vm-name NAME` | `org.qemu.Display1.VM.Name` |
 | `--dump-dir DIR` | `SIGUSR1` writes `qdev-fb-N.ppm` there |
 | `--fps N` | how often the framebuffer is compared with its shadow to find damage (default 30) |
+| `--kms /dev/dri/cardN[:CONNECTOR]` | scan the device out on a real monitor (see below) |
+| `--on-connect CMD`, `--on-disconnect CMD` | run when that connector's status changes (e.g. `tbctl.py … plug/unplug`) |
+| `--qemu-display ADDR`, `--qemu-display-dest NAME`, `--qemu-console N` | forward keyboard/mouse to the VM's own Display1 console (see below) |
+| `--stats-interval S` | print damage-detection and KMS statistics every S seconds (`SIGUSR2` prints once) |
 
 ### 2. Start the VM on a stock QEMU
 
@@ -203,6 +207,51 @@ Verified with QSM Direct's `qemu-display-probe` in both transports:
 `scanout inline/map: 0/1`, `updates inline/map: 0/N`, `session errors: 0`, and the
 PPM snapshot equals the frame drawn by the guest.
 
+## Real monitor as the output of the guest device (DRM/KMS sink)
+
+`--kms /dev/dri/card0:eDP-1` makes `qdev-host` the DRM master of that card and
+drives the connector directly (`kms-sink.c`):
+
+- The connector's **EDID is handed to the plugin** (`qdp_host_env.edid`), so the
+  guest sees the real monitor and picks a mode it really has; `tb-vga` serves it
+  unless an `edid=` file overrides it.
+- When the guest sets a mode, the sink picks the connector mode of the same
+  size (highest refresh, preferred first), else keeps the preferred mode and
+  centers the guest frame in it.
+- Two dumb buffers of mode size; each damage rectangle found by the host is
+  copied into the back buffer, which is **page-flipped at vblank**
+  (`DRM_MODE_PAGE_FLIP_EVENT`); damage arriving during a flip is accumulated per
+  buffer and flipped next.
+- `SIGUSR2` / `--stats-interval` print flips per second, damage→vblank latency,
+  copy cost and process CPU time. On exit the previous CRTC configuration is
+  restored and the master dropped.
+- `--on-connect` / `--on-disconnect` watch the connector's sysfs status once a
+  second and run a command, so plugging a monitor can `device_add` the device
+  into the VM and unplugging can `device_del` it: the Thunderbolt story end to
+  end. (Hooks are implemented, not yet exercised with a physically hot-plugged
+  monitor.)
+
+Requirements: no other DRM master on the card (stop the display manager, or use
+a card without a desktop on it); `/dev/dri/cardN` writable (group `video`).
+Zero-copy scan-out of the plugin's memfd (udmabuf → `drmPrimeFDToHandle`) is a
+possible later step; the copy costs ~0.2 ms per 1280x800 frame on a laptop CPU.
+
+## Input forwarding
+
+QSM Direct sends keyboard and pointer events to the console it captures. For an
+external device the input devices still live in the VM's own QEMU, so
+`qdev-host` relays `Keyboard.Press/Release` and `Mouse.Press/Release/RelMotion/
+SetAbsPosition` of its exported console to the VM's Display1 console
+(`--qemu-display unix:path=… --qemu-display-dest org.qemu --qemu-console 0`;
+empty destination = p2p). Absolute positions are rescaled from this display's
+size to the VM console's size, `Mouse.IsAbsolute` mirrors the VM's. Calls are
+forwarded asynchronously; the extra hop costs one D-Bus method call
+(`tools/display1-input-bench` measures it: direct vs. through `qdev-host`).
+
+Limitation: on a multi-head guest desktop the pointer lands on the VM console's
+screen, not on the external one; mapping to the external head needs an input
+device bound to it (planned).
+
 ## Plugin ABI
 
 `qdp.h`, version 1. A plugin is a shared object exporting one symbol:
@@ -213,7 +262,8 @@ const qdp_device_ops *qdp_plugin_v1(void);
 typedef struct qdp_device_ops {
     uint32_t    abi_version;              /* QDP_ABI_VERSION */
     const char *name, *version;
-    int  (*setup)(vfu_ctx_t *ctx, const char *args, void **priv);  /* configure the device on ctx */
+    int  (*setup)(vfu_ctx_t *ctx, const char *args,
+                  const qdp_host_env *env, void **priv);            /* configure the device on ctx */
     void (*teardown)(void *priv);
     int  (*reset)(void *priv, vfu_reset_type_t type);               /* client reset or lost connection */
     uint32_t tick_ms; void (*tick)(void *priv);                     /* optional periodic work */
@@ -221,6 +271,8 @@ typedef struct qdp_device_ops {
 } qdp_device_ops;
 ```
 
+- `qdp_host_env` carries what the host knows: today the EDID of the physical
+  display behind the KMS sink (`edid`, `edid_len`), or `NULL`.
 - `setup()` runs before `vfu_realize_ctx()`. It sets PCI identity and
   capabilities (`vfu_pci_init`, `vfu_pci_set_id`, `vfu_pci_add_capability`), BARs
   (`vfu_setup_region`, with a memfd and mmap areas for regions the guest should
@@ -300,23 +352,17 @@ framebuffer is shared memory). For a throughput device the rules in
 
 ## Roadmap
 
-1. **Real monitor as the output of the guest device.** A DRM/KMS sink: the
-   framebuffer is scanned out on a physical connector of the host; the guest gets
-   that monitor's EDID through the plugin, so modes match; plugging the monitor
-   hot-plugs the device into the VM (the Thunderbolt story end to end). Tested
-   on a host with a GPU and a monitor, not in a container.
-2. **Input forwarding**: `Keyboard`/`Mouse` of the exported console relayed to the
-   VM's own QEMU Display1 console, so QSM Direct's input keeps working on the
-   external display.
-3. **GPU plugins**: dma-buf scanouts (`ScanoutDMABUF`) instead of memfd, damage
+1. **Zero-copy KMS**: scan the plugin memfd out directly (udmabuf) where the
+   driver allows; per-head input device for multi-head guests.
+2. **GPU plugins**: dma-buf scanouts (`ScanoutDMABUF`) instead of memfd, damage
    from the plugin instead of shadow comparison.
-4. **Several devices per host process** and **plugin replacement**: load v2 next
+3. **Several devices per host process** and **plugin replacement**: load v2 next
    to v1, move the guest over, retire v1 (the ABI already keeps state in the
    plugin process).
-5. **Orchestration**: `qdevctl` over QMP, Proxmox hookscript (`post-start`) so
+4. **Orchestration**: `qdevctl` over QMP, Proxmox hookscript (`post-start`) so
    external devices reappear after a VM restart; QSM terminal service: one
    Display1 endpoint per external console.
-6. macOS validation of the Thunderbolt layer (`_DSD` vs `_DSM` properties).
+5. macOS validation of the Thunderbolt layer (`_DSD` vs `_DSM` properties).
 
 ## Repository layout
 
@@ -325,8 +371,11 @@ qdev-host.c        host: plugin loader, vfio-user main loop, damage detection, D
 qdp.h              plugin ABI
 dbus/              org.qemu.Display1 interface XML (from QEMU, Linux variant); GDBus code generated at build time
 plugins/tb-vga/    the display plugin + sample EDID
+kms-sink.c/.h      DRM/KMS sink (real monitor), EDID export, page flips, hot-plug hooks
 tools/             tbctl.py (QMP plug/unplug/connect), run-guest.sh, prep-guest.sh, test-flow.sh,
-                   guest_cmd.py (serial console driver), guest-draw.py, ppm2png.py
+                   remote-kms-test.sh (live-display test on a GPU host), guest_cmd.py (serial console
+                   driver), guest-draw.py, guest-animate.py (fps load), ppm2png.py,
+                   display1-input-bench.c (input round-trip latency)
 acpi/              SSDT with the Thunderbolt ACPI properties (.dsl + .aml)
 bench/             the vfio-user overhead microbenchmark (libvfio-user pci-testdev + kvm-unit-tests patch)
 docs/              overhead report, Thunderbolt-on-stock notes (Russian)

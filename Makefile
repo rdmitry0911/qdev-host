@@ -14,17 +14,22 @@ VFU_LIBS   := -L$(VFU_LIBDIR) -lvfio-user -Wl,-rpath,$(VFU_LIBDIR)
 endif
 GLIB_CFLAGS := $(shell pkg-config --cflags gio-unix-2.0 glib-2.0)
 GLIB_LIBS   := $(shell pkg-config --libs gio-unix-2.0 glib-2.0)
+DRM_CFLAGS  := $(shell pkg-config --cflags libdrm)
+DRM_LIBS    := $(shell pkg-config --libs libdrm)
 CFLAGS ?= -O2 -g -Wall -Wno-unused-parameter
 PLUGINS := plugins/tb-vga/tb-vga.so
 
-all: qdev-host $(PLUGINS)
+all: qdev-host $(PLUGINS) tools/display1-input-bench
 
 dbus/dbus-display1.c dbus/dbus-display1.h: dbus/dbus-display1.xml
 	cd dbus && gdbus-codegen dbus-display1.xml --glib-min-required 2.64 --output-directory . \
 	    --interface-prefix org.qemu. --c-namespace QemuDBus --generate-c-code dbus-display1
 
-qdev-host: qdev-host.c dbus/dbus-display1.c dbus/dbus-display1.h qdp.h
-	$(CC) $(CFLAGS) -I. $(VFU_CFLAGS) $(GLIB_CFLAGS) -o $@ qdev-host.c dbus/dbus-display1.c $(VFU_LIBS) $(GLIB_LIBS) -ldl
+qdev-host: qdev-host.c kms-sink.c kms-sink.h dbus/dbus-display1.c dbus/dbus-display1.h qdp.h
+	$(CC) $(CFLAGS) -I. $(VFU_CFLAGS) $(GLIB_CFLAGS) $(DRM_CFLAGS) -o $@ qdev-host.c kms-sink.c dbus/dbus-display1.c $(VFU_LIBS) $(GLIB_LIBS) $(DRM_LIBS) -ldl
+
+tools/display1-input-bench: tools/display1-input-bench.c
+	$(CC) $(CFLAGS) $(GLIB_CFLAGS) -o $@ $< $(GLIB_LIBS)
 
 plugins/%.so: plugins/%.c qdp.h
 	$(CC) $(CFLAGS) -fPIC -shared -I. $(VFU_CFLAGS) -o $@ $< $(VFU_LIBS)
@@ -36,7 +41,7 @@ install: all
 	install -D -m 644 plugins/tb-vga/edid-1280x800.bin $(DESTDIR)$(PREFIX)/share/qdev-host/edid-1280x800.bin
 
 clean:
-	rm -f qdev-host plugins/*/*.so dbus/dbus-display1.c dbus/dbus-display1.h
+	rm -f qdev-host plugins/*/*.so tools/display1-input-bench dbus/dbus-display1.c dbus/dbus-display1.h
 
 PREFIX ?= /usr/local
 .PHONY: all clean install

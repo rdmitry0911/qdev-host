@@ -34,6 +34,14 @@ typedef struct qdp_scanout {
     uint32_t pixman_format;      /* e.g. 0x20020888 = PIXMAN_x8r8g8b8 */
 } qdp_scanout;
 
+/* What the host knows that a plugin may want: the EDID of the physical
+ * display attached through the KMS sink (NULL without one). */
+typedef struct qdp_host_env {
+    uint32_t        size;          /* sizeof(qdp_host_env) */
+    const uint8_t  *edid;
+    uint32_t        edid_len;
+} qdp_host_env;
+
 typedef struct qdp_device_ops {
     uint32_t    abi_version;     /* QDP_ABI_VERSION */
     const char *name;            /* "tb-vga" */
@@ -41,8 +49,9 @@ typedef struct qdp_device_ops {
 
     /* Configure PCI identity, capabilities, regions, IRQs, DMA on ctx.
      * Called before vfu_realize_ctx(). args: plugin-specific option string
-     * (may be NULL). Returns 0 or -errno. *priv is handed back to all ops. */
-    int  (*setup)(vfu_ctx_t *ctx, const char *args, void **priv);
+     * (may be NULL), env: host environment (never NULL). Returns 0 or -errno.
+     * *priv is handed back to all ops. */
+    int  (*setup)(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env, void **priv);
     void (*teardown)(void *priv);
 
     /* Device reset requested by the client (or connection lost). */
