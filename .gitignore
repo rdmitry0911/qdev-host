@@ -1,0 +1,8 @@
+qdev-host
+plugins/*.so
+plugins/*/*.so
+dbus/dbus-display1.c
+dbus/dbus-display1.h
+results/
+*.ppm
+*.o

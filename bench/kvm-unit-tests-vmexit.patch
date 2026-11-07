@@ -1,0 +1,89 @@
+diff --git a/x86/vmexit.c b/x86/vmexit.c
+index 1b675c0..742bfe6 100644
+--- a/x86/vmexit.c
++++ b/x86/vmexit.c
+@@ -3,6 +3,8 @@
+ #include "smp.h"
+ #include "vmalloc.h"
+ #include "pci.h"
++#include "asm/pci.h"
++#include "linux/pci_regs.h"
+ #include "x86/vm.h"
+ #include "x86/desc.h"
+ #include "x86/apic.h"
+@@ -293,6 +295,7 @@ static struct pci_test {
+ 	int test_idx;
+ 	uint32_t data;
+ 	uint32_t offset;
++	volatile void *bar2;
+ } pci_test = {
+ 	.test_idx = -1
+ };
+@@ -327,6 +330,36 @@ static void pci_io_testl(void)
+ 	outl(pci_test.data, pci_test.ioport);
+ }
+ 
++static int has_pci_test(void) { return pci_test.memaddr != NULL; }
++static int has_pci_bar2(void) { return pci_test.bar2 != NULL; }
++static void pci_mem_read(void)
++{
++	(void)*(volatile uint8_t *)((char *)pci_test.memaddr + 1);
++}
++static void pci_io_read(void)
++{
++	(void)inb(pci_test.iobar + 1);
++}
++static void pci_dma_kick(void)
++{
++	unsigned long long t0 = rdtsc();
++	*(volatile uint8_t *)((char *)pci_test.memaddr + 0x800) = 1;
++	/* give the server a quiet socket for ~50 ms */
++	while (rdtsc() - t0 < 180000000ULL) barrier();
++}
++static void pci_dma_sync(void)
++{
++	(void)*(volatile uint8_t *)((char *)pci_test.memaddr + 0x801);
++}
++static void pci_bar2_write(void)
++{
++	*(volatile uint32_t *)pci_test.bar2 = 1;
++}
++static void pci_bar2_read(void)
++{
++	(void)*(volatile uint32_t *)pci_test.bar2;
++}
++
+ static uint8_t ioreadb(unsigned long addr, bool io)
+ {
+ 	if (io) {
+@@ -528,6 +561,12 @@ static struct test tests[] = {
+ 	{ rd_tsc_adjust_msr, "rd_tsc_adjust_msr", .parallel = 1 },
+ 	{ toggle_cr0_wp, "toggle_cr0_wp" , .parallel = 1, },
+ 	{ toggle_cr4_pge, "toggle_cr4_pge" , .parallel = 1, },
++	{ pci_dma_kick, "pci-dma-kick", has_pci_test, .parallel = 0 },
++	{ pci_dma_sync, "pci-dma-sync", has_pci_test, .parallel = 0 },
++	{ pci_mem_read, "pci-mem-read", has_pci_test, .parallel = 0 },
++	{ pci_io_read, "pci-io-read", has_pci_test, .parallel = 0 },
++	{ pci_bar2_write, "pci-bar2-write", has_pci_bar2, .parallel = 0 },
++	{ pci_bar2_read, "pci-bar2-read", has_pci_bar2, .parallel = 0 },
+ 	{ NULL, "pci-mem", .parallel = 0, .next = pci_mem_next },
+ 	{ NULL, "pci-io", .parallel = 0, .next = pci_io_next },
+ };
+@@ -625,12 +664,17 @@ int main(int ac, char **av)
+ 
+ 	ret = pci_find_dev(PCI_VENDOR_ID_REDHAT, PCI_DEVICE_ID_REDHAT_TEST);
+ 	if (ret != PCIDEVADDR_INVALID) {
++		/* disable decoding while BAR sizes are probed (as Linux does) */
++		pci_config_writew(ret, PCI_COMMAND, 0);
+ 		pci_dev_init(&pcidev, ret);
++		pci_cmd_set_clr(&pcidev, PCI_COMMAND_MEMORY | PCI_COMMAND_IO | PCI_COMMAND_MASTER, 0);
+ 		assert(pci_bar_is_memory(&pcidev, PCI_TESTDEV_BAR_MEM));
+ 		assert(!pci_bar_is_memory(&pcidev, PCI_TESTDEV_BAR_IO));
+ 		membar = pcidev.resource[PCI_TESTDEV_BAR_MEM];
+ 		pci_test.memaddr = ioremap(membar, PAGE_SIZE);
+ 		pci_test.iobar = pcidev.resource[PCI_TESTDEV_BAR_IO];
++		if (pci_bar_is_valid(&pcidev, 2) && pci_bar_is_memory(&pcidev, 2))
++			pci_test.bar2 = ioremap(pcidev.resource[2], PAGE_SIZE);
+ 		printf("pci-testdev at %#x membar %lx iobar %x\n",
+ 		       pcidev.bdf, membar, pci_test.iobar);
+ 	}

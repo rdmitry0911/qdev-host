@@ -1,0 +1,7 @@
+This project is licensed under the GNU General Public License, version 2 or
+(at your option) any later version (SPDX-License-Identifier: GPL-2.0-or-later).
+
+dbus/dbus-display1.xml is the org.qemu.Display1 interface definition from the
+QEMU project (ui/dbus-display1.xml), GPL-2.0-or-later.
+
+See https://www.gnu.org/licenses/old-licenses/gpl-2.0.html for the license text.
