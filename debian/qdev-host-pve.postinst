@@ -4,8 +4,17 @@ case "$1" in
     configure)
         install -d -m 0750 /etc/qdev-host /etc/qdev-host/vms
         install -d -m 0755 /var/lib/qdev-host
-        if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then systemctl daemon-reload || true; fi
-        echo "qdev-host-pve: use 'qdevctl add VMID ID --plugin tb-vga' to attach a device to a VM"
+        if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+            systemctl daemon-reload || true
+            systemctl enable --now qdev-host-api.service || true
+            systemctl try-restart qdev-host-api.service || true
+            systemctl enable --now qdev-host-ui-reconcile.path || true
+        fi
+        /usr/sbin/qdev-host-ui reconcile || echo "qdev-host-pve: PVE Hardware panel UI was not changed" >&2
+        echo "qdev-host-pve: qdev-host devices can now be added in the VM Hardware panel (Add > qdev-host Device) or with qdevctl"
+        ;;
+    triggered)
+        /usr/sbin/qdev-host-ui reconcile || echo "qdev-host-pve: PVE Hardware panel UI was not changed" >&2
         ;;
 esac
 #DEBHELPER#

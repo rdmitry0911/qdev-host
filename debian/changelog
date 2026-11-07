@@ -1,3 +1,14 @@
+qdev-host (0.2.0) unstable; urgency=medium
+
+  * Proxmox VE web UI: qdev-host devices in the VM Hardware panel (Add > qdev-host
+    Device, Remove), backed by qdev-host-api.service (ticket-authorised node
+    service) and a guarded index.html.tpl overlay (qdev-host-ui) that coexists
+    with qsm-pve-direct.
+  * qdevctl: shared library operations, status with live state; plugin
+    sidecar metadata (tb-vga.json).
+
+ -- Dmitry R <rdmitry0911@gmail.com>  Sat, 07 Nov 2026 22:30:00 +0200
+
 qdev-host (0.1.0) unstable; urgency=medium
 
   * First packaged release: qdev-host, tb-vga plugin, Proxmox VE integration (qdevctl).

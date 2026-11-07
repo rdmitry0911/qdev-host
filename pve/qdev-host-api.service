@@ -1,0 +1,28 @@
+[Unit]
+Description=qdev-host node service for the Proxmox VE Hardware panel
+Documentation=https://github.com/rdmitry0911/qdev-host
+# authorises browser tickets through the local pveproxy and reads /etc/pve
+After=pve-cluster.service pveproxy.service
+Wants=pve-cluster.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/lib/qdev-host/pve/qdev_host_api.py
+Restart=on-failure
+RestartSec=2s
+UMask=0077
+# runs as root: it reads the node TLS key, edits VM configs with qm,
+# talks to the VMs' QEMU monitors and starts qdev-host-device@ units
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+TasksMax=128
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

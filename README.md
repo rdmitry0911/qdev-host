@@ -289,32 +289,55 @@ Two Debian packages, built with `scripts/mkchroot.sh` + `scripts/build-deb-in-ch
 
 - `qdev-host` (amd64): the host, plugins, a private copy of libvfio-user
   (`/usr/lib/qdev-host/libvfio-user.so.0`), the ABI header, EDID and SSDT files.
-- `qdev-host-pve` (all): `qdevctl`, a guest hookscript and a systemd unit template.
-  Stock PVE 9 only: `qm` for config edits, the node's own
-  `PVE::QemuServer::Monitor::mon_cmd` for `device_add`/`device_del`/`query-pci`,
-  the standard `hookscript` mechanism, systemd for the device processes. No
-  Proxmox package is patched or diverted.
+- `qdev-host-pve` (all): `qdevctl`, a guest hookscript, systemd units, the
+  Hardware-panel web UI overlay and its node service. Stock PVE 9 only: `qm` for
+  config edits, the node's own `PVE::QemuServer::Monitor::mon_cmd` for
+  `device_add`/`device_del`/`query-pci`, the standard `hookscript` mechanism,
+  systemd for the device processes. No Proxmox code is patched; the only file
+  touched is `index.html.tpl` (one script tag, through a guarded `dpkg-divert`).
 
 ```bash
-apt install ./qdev-host_0.1.0_amd64.deb ./qdev-host-pve_0.1.0_all.deb
+apt install ./qdev-host_0.2.0_amd64.deb ./qdev-host-pve_0.2.0_all.deb
 qdevctl add 109 tbvga0 --plugin tb-vga --args vram=16     # q35 VM; adds hookscript + root port (args)
 qm start 109                                               # hookscript starts the process and hot-plugs
-qdevctl list                                               # VM 109  tbvga0  tb-vga  bus=qdev-rp0  attached
+qdevctl list                                               # VM 109  tbvga0  tb-vga  bus=qdev-rp0  attached (01:00.0)
 qdevctl stop 109 tbvga0; qdevctl start 109                 # hot-unplug / hot-plug on the running VM
 qdevctl remove 109 tbvga0 --purge-port                     # forget it, restore hookscript and args
 ```
 
-Details in [pve/README.md](pve/README.md). Verified on a PVE 9.2.21 node
-(pve-qemu-kvm 11.0.3, qemu-server 9.2.11): the whole add → start → attached →
-unplug → replug → stop → remove cycle on an OVMF q35 VM. The device process is
-`qdev-host-device@VMID-ID.service`; its Display1 socket
-(`/run/qdev-host/VMID-ID/display.sock`) is where a QSM Direct worker attaches,
-and when QSM's per-VM bus exists the device relays input, clipboard and audio to
-it automatically.
+**Web UI.** After the install the VM's *Hardware* panel lists qdev-host devices
+as rows (`qdev-host (tbvga0)`: plugin, args, KMS output, live state such as
+`attached (01:00.0)` or `defined, attaches after the next VM start`), *Add* has a
+*qdev-host Device* entry (plugin, device ID, the plugin's arguments as form
+fields, KMS output picked from the node's connectors, Display1 export,
+persistent process) and *Remove* hot-unplugs the selected row. It follows QSM
+Direct's structural pattern:
 
-Not yet: a Hardware-panel UI (the plan is QSM Direct's structural pattern: a
-guarded `pve-manager` overlay plus a node-local service that authorizes with the
-browser's PVE ticket and runs `qdevctl`), several devices per process, a
+- `qdev-host-hardware.js` is an ExtJS override of `PVE.qemu.HardwareView`
+  served from `/pve2/js/`; `qdev-host-ui` injects its script tag into
+  `index.html.tpl` only when the installed `pve-manager` version and template
+  hash are in the reviewed allow-list (`pve/pve-manager-index-template.sha256`),
+  and restores the stock template on an unknown upgrade. It coexists with
+  `qsm-pve-direct`'s diversion of the same file in either install order.
+- `qdev-host-api.service` (HTTPS on port 8017, the node's own certificate)
+  executes the operations. Every request carries the browser's PVE ticket in an
+  `Authorization` header; the service relays it to the node's `/access/ticket`
+  with `path=/vms/VMID` and `privs=VM.Config.HWType`, and additionally requires
+  the confirmed user to be in `/etc/qdev-host/ui.json` (`root@pam` by default,
+  because the operations edit the VM's `args`, which PVE reserves to root).
+  The browser must trust the certificate on port 8017 once (the panel shows a
+  link when the service is unreachable).
+
+Details in [pve/README.md](pve/README.md). Verified on a PVE 9.2.21 node
+(pve-qemu-kvm 11.0.3, qemu-server 9.2.11, qsm-pve-direct installed): CLI and
+web UI add → attached → remove cycles, headless browser test in
+`tools/pve-ui-test.mjs`. The device process is `qdev-host-device@VMID-ID.service`;
+its Display1 socket (`/run/qdev-host/VMID-ID/display.sock`) is where a QSM Direct
+worker attaches, and when QSM's per-VM bus exists the device relays input,
+clipboard and audio to it automatically.
+
+Not yet: editing a device in place (remove and add again), VMs on another
+cluster node than the one serving the browser, several devices per process, a
 hookscript-free path for VMs whose firmware already reserves enough window space.
 
 ## Plugin ABI
@@ -442,11 +465,12 @@ tools/             tbctl.py (QMP plug/unplug/connect), run-guest.sh, prep-guest.
                    remote-kms-test.sh / remote-features-test.sh (live-display tests on a GPU host),
                    guest_cmd.py (serial console driver), guest-draw.py, guest-animate.py (fps load, raw BAR
                    writes), guest-abs-read.py, ppm2png.py, display1-input-bench.c (input round trip),
-                   display1-abs-test.py, display1-clipboard-test.py
+                   display1-abs-test.py, display1-clipboard-test.py, pve-ui-test.mjs (headless PVE UI test)
 acpi/              SSDT with the Thunderbolt ACPI properties (.dsl + .aml)
 bench/             the vfio-user overhead microbenchmark (libvfio-user pci-testdev + kvm-unit-tests patch)
 docs/              overhead report, Thunderbolt-on-stock notes (Russian), live-display measurements
-pve/               qdevctl, qdev_pve.py, hookscript, systemd unit template, PVE README
+pve/               qdevctl + qdev_pve.py (operations), qdev_host_api.py (node service), qdev_pve_ui.py +
+                   qdev-host-hardware.js (Hardware panel overlay), hookscript, systemd units, PVE README
 debian/, scripts/  Debian packaging; mkchroot.sh and build-deb-in-chroot.sh build the debs in a trixie chroot
 third_party/       vendored libvfio-user (BSD-3-Clause)
 ```

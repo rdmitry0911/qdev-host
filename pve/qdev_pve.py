@@ -7,7 +7,7 @@ node's own PVE::QemuServer::Monitor (mon_cmd) for QMP, systemd for the device
 processes, and the standard guest hookscript mechanism for VM start/stop.
 """
 from __future__ import annotations
-import json, os, re, shlex, shutil, subprocess, sys, time
+import json, os, re, shlex, shutil, socket, subprocess, sys, time
 from pathlib import Path
 
 CONF_DIR = Path("/etc/qdev-host/vms")
@@ -30,7 +30,10 @@ def log(msg: str) -> None:
 def run(cmd: list[str], check: bool = True, quiet: bool = False) -> subprocess.CompletedProcess:
     r = subprocess.run(cmd, capture_output=True, text=True)
     if check and r.returncode != 0:
-        raise QdevError(f"{' '.join(shlex.quote(c) for c in cmd)} failed: {r.stderr.strip() or r.stdout.strip()}")
+        # drop PVE's storage-plugin deprecation chatter, keep the real reason
+        err = "\n".join(l for l in (r.stderr.strip() or r.stdout.strip()).splitlines()
+                         if "older storage API" not in l)
+        raise QdevError(f"{' '.join(shlex.quote(c) for c in cmd)} failed: {err}")
     return r
 
 # ------------------------------------------------------------------ config
@@ -271,3 +274,166 @@ def detach(vmid: int, dev: dict, keep_process: bool) -> str:
     if not keep_process:
         stop_process(vmid, dev["id"])
     return f"{dev['id']}: {'detached' if gone else 'device_del sent, guest has not released it yet'}" + ("" if keep_process else ", process stopped")
+
+# ------------------------------------------------------------ validation
+ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
+# plugin args are a comma separated k=v list; keep them free of shell/quote characters
+ARGS_RE = re.compile(r"^[A-Za-z0-9_=,./:+@-]*$")
+KMS_RE = re.compile(r"^/dev/dri/card[0-9]+:[A-Za-z0-9-]+$")
+BUS_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
+ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{1,2}$")
+
+def validate_device(dev_id: str, plugin: str, args: str, bus: str, kms: str | None) -> None:
+    if not ID_RE.match(dev_id or ""):
+        raise QdevError("device id must be 1-32 characters: letters, digits, '-' or '_' (starting with a letter)")
+    if not (PLUGIN_DIR / f"{plugin}.so").exists():
+        raise QdevError(f"plugin not installed: {plugin} (looked for {PLUGIN_DIR / (plugin + '.so')})")
+    if args and (not ARGS_RE.match(args) or any("=" not in kv or not kv.split("=", 1)[0] for kv in args.split(","))):
+        raise QdevError("plugin args must be a comma separated list of key=value pairs")
+    if not BUS_RE.match(bus or ""):
+        raise QdevError("invalid bus id")
+    if kms:
+        if not KMS_RE.match(kms):
+            raise QdevError("KMS output must look like /dev/dri/cardN:CONNECTOR")
+        card, conn = kms.split(":", 1)
+        if not Path(card).exists() or not Path(f"/sys/class/drm/{Path(card).name}-{conn}").exists():
+            raise QdevError(f"KMS output {kms} does not exist on this node")
+
+def is_q35(cfg: dict[str, str]) -> bool:
+    first = cfg.get("machine", "").split(",")[0]
+    return first == "q35" or first.startswith("pc-q35")
+
+# -------------------------------------------------------------- cluster
+def local_node() -> str:
+    return socket.gethostname().split(".")[0]
+
+def vm_node(vmid: int) -> str | None:
+    """Node that owns VMID according to pmxcfs (None if unknown)."""
+    try:
+        ids = json.loads(Path("/etc/pve/.vmlist").read_text()).get("ids", {})
+    except (OSError, ValueError):
+        return None
+    ent = ids.get(str(vmid))
+    return ent.get("node") if ent else None
+
+# ---------------------------------------------------------- inventories
+def list_plugins() -> list[dict]:
+    """Installed plugins with their optional sidecar metadata (NAME.json next to NAME.so)."""
+    out = []
+    for so in sorted(PLUGIN_DIR.glob("*.so")):
+        meta = {}
+        side = so.with_suffix(".json")
+        if side.exists():
+            try:
+                meta = json.loads(side.read_text())
+            except ValueError:
+                meta = {}
+        out.append({"name": so.stem, "title": meta.get("title", so.stem), "description": meta.get("description", ""),
+                    "args": meta.get("args", [])})
+    return out
+
+def list_kms_outputs() -> list[dict]:
+    """DRM connectors of this node as /dev/dri/cardN:CONNECTOR specs with their status."""
+    out = []
+    for status in sorted(Path("/sys/class/drm").glob("card*-*/status")):
+        name = status.parent.name  # card1-HDMI-A-1
+        card, conn = name.split("-", 1)
+        if conn.startswith("Writeback"):
+            continue
+        try:
+            st = status.read_text().strip()
+        except OSError:
+            continue
+        out.append({"spec": f"/dev/dri/{card}:{conn}", "status": st})
+    return out
+
+# ------------------------------------------------------------- operations
+def add_device(vmid: int, dev_id: str, plugin: str, args: str = "", bus: str = PORT_ID, display: bool = True,
+               kms: str | None = None, persistent: bool = False, port_addr: str | None = None,
+               extra: list[str] | None = None) -> list[str]:
+    """Define a device for VMID (and hot-plug it if the VM runs). Returns status lines."""
+    msgs = []
+    validate_device(dev_id, plugin, args or "", bus, kms)
+    if port_addr and not ADDR_RE.match(port_addr):
+        raise QdevError("port address must be like 0x08")
+    conf = load_conf(vmid)
+    if find_device(conf, dev_id):
+        raise QdevError(f"device {dev_id} already defined for VM {vmid}")
+    cfg = vm_config(vmid)
+    if not is_q35(cfg):
+        raise QdevError(f"VM {vmid} is not a q35 machine (machine: {cfg.get('machine', 'i440fx')}); PCIe hot-plug needs q35")
+    dev = {"id": dev_id, "plugin": plugin, "args": args or "", "bus": bus, "display": bool(display),
+           "kms": kms or None, "persistent": bool(persistent), "extra": extra or []}
+    conf["port_addr"] = port_addr or conf.get("port_addr", "0x08")
+    changed_port = False
+    if bus == PORT_ID:
+        changed_port = ensure_port_in_args(vmid, cfg, conf["port_addr"])
+    ensure_hookscript(vmid, cfg, conf)
+    conf["devices"].append(dev)
+    save_conf(conf)
+    write_unit_env(vmid, dev)
+    msgs.append(f"VM {vmid}: device {dev_id} ({plugin}) defined on bus {bus}")
+    if vm_running(vmid):
+        msgs.append(attach(vmid, dev))
+        if changed_port:
+            msgs.append(f"note: root port {PORT_ID} was added to args; it appears at the next VM start")
+    else:
+        msgs.append("VM is stopped: the device will be started and attached by the hookscript at VM start")
+    return msgs
+
+def remove_device(vmid: int, dev_id: str, keep_process: bool = False, purge_port: bool = False) -> list[str]:
+    msgs = []
+    conf = load_conf(vmid)
+    dev = find_device(conf, dev_id)
+    if not dev:
+        raise QdevError(f"no device {dev_id} on VM {vmid}")
+    msgs.append(detach(vmid, dev, keep_process))
+    conf["devices"] = [d for d in conf["devices"] if d["id"] != dev_id]
+    env = UNIT_DIR / f"{vmid}-{dev_id}.env"
+    if env.exists() and not keep_process:
+        env.unlink()
+    if not conf["devices"] and not keep_process:
+        cfg = vm_config(vmid)
+        restore_hookscript(vmid, conf)
+        if purge_port:
+            remove_port_from_args(vmid, cfg)
+        conf_path(vmid).unlink(missing_ok=True)
+        msgs.append(f"VM {vmid}: no devices left, hookscript restored" +
+                    (", root port removed from args" if purge_port else " (root port kept in args; --purge-port removes it)"))
+    else:
+        save_conf(conf)
+    return msgs
+
+def describe_vm(vmid: int) -> dict:
+    """Everything the UI needs for one VM: devices with live state, plugins, KMS outputs."""
+    node = vm_node(vmid)
+    me = local_node()
+    if node and node != me:
+        return {"vmid": vmid, "node": node, "local": False, "devices": []}
+    conf = load_conf(vmid)
+    cfg = vm_config(vmid)
+    running = vm_running(vmid)
+    present: dict[str, str] = {}
+    buses: set[str] = set()
+    if running:
+        for d in pci_devices(vmid):
+            if d["qdev_id"]:
+                present[d["qdev_id"]] = f"{d['bus']:02x}:{d['slot']:02x}.0"
+                buses.add(d["qdev_id"])
+    devices = []
+    for d in conf["devices"]:
+        active = process_active(vmid, d["id"])
+        if d["id"] in present:
+            state = "attached"
+        elif active:
+            state = "process"
+        else:
+            state = "stopped"
+        devices.append({**{k: d.get(k) for k in ("id", "plugin", "args", "bus", "display", "kms", "persistent")},
+                        "state": state, "process_active": active, "pci": present.get(d["id"]),
+                        "needs_restart": bool(running and d["bus"] not in buses)})
+    return {"vmid": vmid, "node": me, "local": True, "running": running, "q35": is_q35(cfg),
+            "machine": cfg.get("machine", ""), "port_addr": conf.get("port_addr", "0x08"),
+            "port_in_args": f"id={PORT_ID}" in cfg.get("args", ""), "port_in_vm": PORT_ID in buses,
+            "hookscript": cfg.get("hookscript"), "devices": devices,
+            "plugins": list_plugins(), "kms_outputs": list_kms_outputs()}

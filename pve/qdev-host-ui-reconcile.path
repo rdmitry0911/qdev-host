@@ -1,0 +1,10 @@
+[Unit]
+Description=Re-apply the qdev-host Hardware panel overlay when the PVE template changes
+Documentation=https://github.com/rdmitry0911/qdev-host
+
+[Path]
+PathChanged=/usr/share/pve-manager/index.html.tpl
+Unit=qdev-host-ui-reconcile.service
+
+[Install]
+WantedBy=multi-user.target
