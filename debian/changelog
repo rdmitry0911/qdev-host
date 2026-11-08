@@ -1,3 +1,18 @@
+qdev-host (0.5.1) unstable; urgency=medium
+
+  * virgl-gpu on NVIDIA: the GPU unit allows /dev/nvidia*, which NVIDIA's EGL
+    opens next to the render node, and gives the driver a shader cache
+    directory. Without them vhost-user-gpu exited with "Failed to initialize
+    virgl" when the guest driver loaded, and QEMU then logged
+    "failed to read msg header" without end.
+  * A primary virgl-gpu is refused, with the way out, for a VM on the native
+    shared display of the older QSM preview (dbus-display), which qemu-server
+    does not start without a graphical Display.
+  * A second device on the same PCIe root port is refused: a root port has
+    one slot.
+
+ -- Dmitry R <rdmitry0911@gmail.com>  Sun, 08 Nov 2026 17:10:00 +0200
+
 qdev-host (0.5.0) unstable; urgency=medium
 
   * Hardware panel: Edit (button or double click) on a qdev-host row changes

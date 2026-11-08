@@ -11,6 +11,7 @@ RuntimeDirectory=qdev-host/%i
 RuntimeDirectoryMode=0750
 CacheDirectory=qdev-host/%i
 Environment=MESA_SHADER_CACHE_DIR=/var/cache/qdev-host/%i
+Environment=__GL_SHADER_DISK_CACHE_PATH=/var/cache/qdev-host/%i
 ExecStart=/usr/lib/kvm/vhost-user-gpu $QDEV_ARGS
 Restart=no
 KillSignal=SIGTERM
@@ -33,3 +34,10 @@ RestrictAddressFamilies=AF_UNIX
 LockPersonality=true
 DevicePolicy=closed
 DeviceAllow=char-drm rw
+# NVIDIA's EGL also opens /dev/nvidiactl, /dev/nvidia0 and /dev/nvidia-modeset
+# (without them virglrenderer fails to initialise); absent majors are ignored.
+DeviceAllow=char-nvidia rw
+DeviceAllow=char-nvidiactl rw
+DeviceAllow=char-nvidia-modeset rw
+DeviceAllow=char-nvidia-caps rw
+DeviceAllow=char-nvidia-uvm rw

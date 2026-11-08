@@ -565,6 +565,10 @@ def apply_vug_args(vmid: int, conf: dict, cfg: dict[str, str]) -> list[str]:
     qm_set(vmid, "args", args or None)
     # the VM's own display device would come first, so QSM would not show the GPU
     vga_now = cfg.get("vga")
+    if primary and cfg.get("dbus-display") in ("1", "on", "yes", "true"):
+        raise QdevError("the VM uses the native shared display of the older QSM preview (dbus-display), which "
+                        "needs a graphical Display: switch it to QSM Display1 VirGL in Hardware > Display and its "
+                        "sound to QSM Console first, or add this GPU with vga=0")
     if primary and "saved_vga" not in conf:
         if vga_now != "none":
             conf["saved_vga"] = vga_now
@@ -629,6 +633,10 @@ def add_device(vmid: int, dev_id: str, plugin: str, args: str = "", bus: str = P
         raise QdevError(f"VM {vmid} is not a q35 machine (machine: {cfg.get('machine', 'i440fx')}); PCIe hot-plug needs q35")
     dev = {"id": dev_id, "plugin": plugin, "args": args or "", "bus": bus, "display": bool(display),
            "kms": kms or None, "persistent": bool(persistent), "extra": extra or []}
+    taken = next((d["id"] for d in conf["devices"] if d["bus"] == bus), None)
+    if taken and bus != "pcie.0":
+        raise QdevError(f"bus {bus} already holds device {taken}: a PCIe root port has one slot "
+                        "(remove that device first, or give this one another bus)")
     conf["port_addr"] = port_addr or conf.get("port_addr", "0x08")
     # every check that can fail comes before the first change to the VM
     check_editable(vmid)

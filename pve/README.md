@@ -68,6 +68,14 @@ qm stop 990 && qm start 990     # the GPU is on QEMU's command line from the nex
   display with `gl=on`, qsm-pve-direct 0.4.0+stock4.14~exp233 or later) the QSM console shows it. `vga=0` adds a `vhost-user-gpu-pci` next to the VM's display instead.
 - **Picture.** The GPU hands its frames to QEMU as dma-bufs, so only a GL display
   shows them. Without one the guest still renders, and the panel says so.
+- **NVIDIA and AMD.** Checked on an AMD Raphael (amdgpu) and an RTX 3080 with the
+  proprietary driver 595.91 (its GBM backend): a Kubuntu guest's KWin and SDDM
+  render through virgl on the host GPU, where `nvidia-smi` lists the
+  `vhost-user-gpu` process. If the GPU process dies while the VM runs, QEMU cannot
+  reconnect and logs `failed to read msg header` until the VM stops; stop the VM.
+- **Not with the native shared display** of the older QSM preview (`dbus-display: 1`):
+  move the VM to QSM Display1 VirGL (Hardware > Display) and its sound to QSM
+  Console first. One device per PCIe root port: a GPU and a tb-vga need two buses.
 - Settings: `render` (default the first render node), `vga`, `outputs` (1-4),
   `xres`, `yres`. Removing the GPU from a running VM changes its config only; the
   VM keeps the GPU until it stops.
