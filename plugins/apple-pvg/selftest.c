@@ -22,7 +22,7 @@
  * Usage: selftest PLUGIN.so [--personality DEVICE_ID]
  * With --personality, only the PCI identity is checked, then the client
  * connection is dropped (VFU_RESET_LOST_CONN): the plugin must run its quit
- * stop phase and exit the process with status 0 (exit-on-disconnect).
+ * stop phase and return QDP_RESET_EXIT (exit-on-disconnect); the host exits 0.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -306,17 +306,24 @@ int main(int argc, char **argv)
 
     if (personality) {
         /* The client goes away: with exit-on-disconnect (default on) the
-         * plugin runs the quit stop phase and exits the process with 0. */
+         * plugin runs the quit stop phase and asks the host to exit
+         * (QDP_RESET_EXIT); the host then calls teardown() and exits 0. */
         printf("SUMMARY personality 0x%x: %d checks, %d failures; now "
-               "reset(VFU_RESET_LOST_CONN), expecting process exit 0\n", personality,
+               "reset(VFU_RESET_LOST_CONN), expecting QDP_RESET_EXIT\n", personality,
                checks, failures);
         fflush(stdout);
         if (failures) {
             return 1;
         }
-        ops->reset(priv, VFU_RESET_LOST_CONN);
-        printf("FAIL reset(VFU_RESET_LOST_CONN) returned with exit-on-disconnect on\n");
-        return 1;
+        r = ops->reset(priv, VFU_RESET_LOST_CONN);
+        if (r != QDP_RESET_EXIT) {
+            printf("FAIL reset(VFU_RESET_LOST_CONN) returned %d with exit-on-disconnect on\n", r);
+            return 1;
+        }
+        ops->teardown(priv);
+        printf("PASS reset(VFU_RESET_LOST_CONN) returned QDP_RESET_EXIT; teardown done\n");
+        fflush(stdout);
+        _exit(0);   /* as the host does after a v2 teardown */
     }
 
     /* 4. guest RAM: one memfd split over two IOVA ranges, as QEMU's

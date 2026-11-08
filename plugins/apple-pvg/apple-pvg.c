@@ -2607,10 +2607,9 @@ static int pvg_reset(void *priv, vfu_reset_type_t type)
         pvg_memory_reopen_after_lost_conn(s);
         pvg_quit_stop(s);
         if (s->exit_on_disconnect) {
+            /* The host calls teardown() (idempotent stop, log flush) and exits 0. */
             pvg_log(s, "[apple-gfx-ml] exit after the lost connection (exit-on-disconnect)\n");
-            pvg_log_stop(s);
-            fflush(stderr);
-            _exit(0);
+            return QDP_RESET_EXIT;
         }
         pvg_log(s, "[apple-gfx-ml][WARN] device stopped; a new client gets a dead device\n");
         return 0;
