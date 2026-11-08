@@ -371,6 +371,8 @@ MOCK_DEFINE(dma_controller_add_region)(dma_controller_t *dma,
     region->access_mode = access_mode;
     region->offset = offset;
     region->fd = -1;
+    region->info.fd = -1;
+    region->info.fd_offset = offset;
 
     switch (access_mode) {
         case REGION_ACCESS_MODE_MSG:
@@ -387,6 +389,7 @@ MOCK_DEFINE(dma_controller_add_region)(dma_controller_t *dma,
                 goto destroy_region;
             }
             *fd = -1;  /* The fd is now owned by the cache */
+            region->info.fd = region->fd;
 
             page_size = fd_get_blocksize(region->fd);
             if (page_size < 0) {

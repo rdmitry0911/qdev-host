@@ -1792,6 +1792,7 @@ vfu_realize_ctx(vfu_ctx_t *vfu_ctx)
         vfu_ctx->irqs->err_efd = -1;
         vfu_ctx->irqs->req_efd = -1;
         vfu_ctx->irqs->max_ivs = max_ivs;
+        pthread_mutex_init(&vfu_ctx->irqs->lock, NULL);
 
         // Reflect on the config space whether INTX is available.
         if (vfu_ctx->irq_count[VFU_DEV_INTX_IRQ] != 0) {
@@ -1898,6 +1899,9 @@ vfu_destroy_ctx(vfu_ctx_t *vfu_ctx)
     free_sparse_mmap_areas(vfu_ctx);
     free_regions(vfu_ctx);
     free(vfu_ctx->migration);
+    if (vfu_ctx->irqs != NULL) {
+        pthread_mutex_destroy(&vfu_ctx->irqs->lock);
+    }
     free(vfu_ctx->irqs);
     free(vfu_ctx->uuid);
     free(vfu_ctx);
