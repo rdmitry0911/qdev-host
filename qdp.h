@@ -52,8 +52,11 @@ typedef struct qdp_scanout {
  * vaddr is the host's own mapping of [iova, iova + len), NULL when the region
  * has no fd (message-based DMA: the plugin must not use such a region from its
  * threads). fd stays owned by the host and is valid until dma_unregister of
- * this region returns; a plugin that needs it longer dup()s it. fd_offset is
- * the file offset that corresponds to iova. */
+ * this region returns; a plugin that needs it longer dup()s it. Regions backed
+ * by the same file may carry the same fd (descriptors are de-duplicated), so
+ * do not key anything by fd alone. vaddr may also be NULL with fd >= 0 if the
+ * client asked for file I/O access (QEMU does not). fd_offset is the file
+ * offset that corresponds to iova. */
 typedef struct qdp_dma_region {
     uint64_t iova;
     uint64_t len;
@@ -72,8 +75,9 @@ typedef struct qdp_frame_info {
 
 /* Cursor plane. pixels: width*height premultiplied ARGB8888 (host byte order),
  * valid until the next get_cursor() call; serial changes when the image
- * changes, so the host can skip unchanged images. Position is in scanout
- * pixels, of the top-left corner minus the hotspot. */
+ * changes, so the host can skip unchanged images. x, y: position of the
+ * image's top-left corner in scanout pixels, i.e. the pointer position minus
+ * the hotspot (the host reports x + hot_x, y + hot_y as the pointer). */
 typedef struct qdp_cursor {
     bool            visible;
     int32_t         x, y;
@@ -157,7 +161,11 @@ typedef struct qdp_device_ops {
      * range) the host calls quiesce(): the plugin must stop every access to
      * guest memory and every irq_trigger() and return 0 once it has (it may
      * block for that), or -errno to refuse (the host then fails the client
-     * request). resume() follows the map change. All four are optional. */
+     * request). resume() follows the map change. All four are optional.
+     * The host may quiesce more often than that: with libvfio-user it asks
+     * before every DMA_MAP and DMA_UNMAP, before a device reset or FLR and
+     * before dropping a lost client, so dma_register() and reset() also run
+     * between quiesce() and resume(). */
     int  (*quiesce)(void *priv);
     void (*resume)(void *priv);
     void (*dma_register)(void *priv, const qdp_dma_region *region);
