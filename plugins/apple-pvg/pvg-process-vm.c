@@ -15,7 +15,9 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "pvg-process-vm.h"
+#include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -501,6 +503,12 @@ static int agfx_eeee_task_allocate(void *ctx, uint64_t *address,
     return 1;
 }
 
+/* A refused remap is fatal in QMetal (ProviderFatal::remap): say why. */
+#define PVM_REMAP_FAIL(why, err) \
+    fprintf(stderr, "[apple-gfx-ml][pvm][ERROR] remap refused: %s errno=%d target=0x%" PRIx64 \
+            " len=0x%" PRIx64 " source=0x%" PRIx64 "\n", (why), (err), \
+            address ? *address : 0, length, source)
+
 static int agfx_eeee_task_remap_shared_fixed_overwrite(
     void *ctx, uint64_t *address, uint64_t length, uint64_t mask,
     uint64_t source, int *current_protection, int *maximum_protection)
@@ -520,6 +528,7 @@ static int agfx_eeee_task_remap_shared_fixed_overwrite(
     if (!address || !current_protection || !maximum_protection ||
         mask != page_size - 1 || !agfx_eeee_page_range(*address, length) ||
         !agfx_eeee_page_range(source, length)) {
+        PVM_REMAP_FAIL(mask != page_size - 1 ? "mask" : "alignment", 0);
         return 0;
     }
     /* QMetal holds the read section across translate/direct/RAM pointer and
@@ -527,12 +536,15 @@ static int agfx_eeee_task_remap_shared_fixed_overwrite(
     region = pvg_memory_region_from_host(s, (void *)(uintptr_t)source, &region_offset);
     if (!region || !region->map || region->fd < 0 ||
         region_offset > region->len || length > region->len - region_offset) {
+        PVM_REMAP_FAIL(!region ? "source not in a DMA region" : region->fd < 0 ? "region without fd" :
+                       !region->map ? "region not mapped" : "source range beyond region", 0);
         return 0;
     }
     file_offset = region->fd_offset;
     if (file_offset > UINT64_MAX - region_offset ||
         file_offset + region_offset > INT64_MAX ||
         !agfx_eeee_page_range(file_offset + region_offset, length)) {
+        PVM_REMAP_FAIL("file offset", 0);
         return 0;
     }
 
@@ -540,15 +552,19 @@ static int agfx_eeee_task_remap_shared_fixed_overwrite(
     allocation = agfx_eeee_allocation_containing(state, *address, length);
     if (!allocation || state->destroying ||
         GPOINTER_TO_UINT(g_hash_table_lookup(state->regions, region)) == 0) {
+        PVM_REMAP_FAIL(!allocation ? "target not in a provider allocation" : state->destroying ? "destroying" :
+                       "region not referenced by the task", 0);
         return 0;
     }
     saved_fd = fcntl(region->fd, F_DUPFD_CLOEXEC, 0);
     if (saved_fd < 0) {
+        PVM_REMAP_FAIL("dup fd", errno);
         return 0;
     }
     mapped = mmap((void *)(uintptr_t)*address, length, PROT_READ | PROT_WRITE,
                   MAP_SHARED | MAP_FIXED, saved_fd, (off_t)(file_offset + region_offset));
     if (mapped == MAP_FAILED || mapped != (void *)(uintptr_t)*address) {
+        PVM_REMAP_FAIL(mapped == MAP_FAILED ? "mmap" : "mmap moved", mapped == MAP_FAILED ? errno : 0);
         if (mapped != MAP_FAILED) {
             munmap(mapped, length);
         }
