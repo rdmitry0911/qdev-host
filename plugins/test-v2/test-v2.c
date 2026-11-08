@@ -85,9 +85,10 @@ typedef struct t2 {
     pthread_mutex_t rm;               /* region table */
     region_t regions[MAX_REGIONS];
 
-    /* BAR0 state (written on the main loop, read by the threads) */
-    volatile uint32_t irq_hz, fps;
-    volatile uint64_t rec;
+    /* BAR0 state: written on the main loop, read by the threads (and the other
+     * way round for the counters), always through LD()/ST()/ADD() */
+    uint32_t irq_hz, fps;
+    uint64_t rec;
     uint64_t probe, probe_val;
     uint32_t probe_status;
     uint64_t irqs_ok, irqs_drop, irq_ns_sum, irq_ns_max, frames, violations, quiesces, compares;
@@ -107,6 +108,9 @@ typedef struct t2 {
 static t2 *g;   /* libvfio-user region callbacks get no private pointer */
 
 #define TLOG(lvl, ...) g->host->log(g->host->host, lvl, __VA_ARGS__)
+#define LD(x)     __atomic_load_n(&(x), __ATOMIC_RELAXED)
+#define ST(x, v)  __atomic_store_n(&(x), (v), __ATOMIC_RELAXED)
+#define ADD(x, v) __atomic_add_fetch(&(x), (v), __ATOMIC_RELAXED)
 
 static uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec; }
 
@@ -261,10 +265,10 @@ static void *irq_thread(void *arg)
     t2 *d = arg;
     uint64_t seq = 0, next = now_ns();
     for (;;) {
-        uint32_t hz = d->irq_hz;
-        if (!hz) { if (d->stopping) break; sleep_ns(10000000); next = now_ns(); continue; }
+        uint32_t hz = LD(d->irq_hz);
+        if (!hz) { if (LD(d->stopping)) break; sleep_ns(10000000); next = now_ns(); continue; }
         if (!gate_enter(d)) break;
-        uint64_t rec = d->rec;
+        uint64_t rec = LD(d->rec);
         uint64_t *p = rec ? guest_ptr(d, rec, 16, NULL) : NULL;
         seq++;
         uint64_t t0 = now_ns();
@@ -273,10 +277,10 @@ static void *irq_thread(void *arg)
         uint64_t dt = now_ns() - t0;
         gate_leave(d);
         if (r == 0) {
-            d->irqs_ok++; d->irq_ns_sum += dt;
-            if (dt > d->irq_ns_max) d->irq_ns_max = dt;
+            ADD(d->irqs_ok, 1); ADD(d->irq_ns_sum, dt);
+            if (dt > LD(d->irq_ns_max)) ST(d->irq_ns_max, dt);
         } else {
-            d->irqs_drop++;
+            ADD(d->irqs_drop, 1);
         }
         next += 1000000000ull / hz;
         uint64_t now = now_ns();
@@ -304,8 +308,8 @@ static void *render_thread(void *arg)
     int bx = 0, by = 0, dx = 7, dy = 5;
     const int B = 64;
     for (;;) {
-        uint32_t fps = d->fps;
-        if (d->stopping) break;
+        uint32_t fps = LD(d->fps);
+        if (LD(d->stopping)) break;
         if (!fps) { sleep_ns(10000000); next = now_ns(); continue; }
         seq++;
         int ox = bx, oy = by;
@@ -321,7 +325,7 @@ static void *render_thread(void *arg)
         /* damage: old and new square plus pixel (0,0), i.e. [0, max right) x [0, max bottom) */
         qdp_frame_info f = { .seq = seq };
         if (!full) { f.w = (ox > bx ? ox : bx) + B; f.h = (oy > by ? oy : by) + B; }
-        d->frames = seq;
+        ST(d->frames, seq);
         d->host->frame_ready(d->host->host, &f);
         pthread_mutex_lock(&d->cm);
         d->cx = bx + B / 2; d->cy = by + B / 2;
@@ -345,9 +349,9 @@ static ssize_t bar0_cb(vfu_ctx_t *c, char *buf, size_t n, loff_t off, bool w)
     if (w) {
         memcpy(&v, buf, 4);
         switch (off) {
-        case 0x04: d->irq_hz = v; TLOG(2, "IRQ thread at %u Hz", v); break;
-        case 0x10: d->rec = (d->rec & ~0xffffffffull) | v; break;
-        case 0x14: d->rec = (d->rec & 0xffffffffull) | ((uint64_t)v << 32); break;
+        case 0x04: ST(d->irq_hz, v); TLOG(2, "IRQ thread at %u Hz", v); break;
+        case 0x10: ST(d->rec, (LD(d->rec) & ~0xffffffffull) | v); break;
+        case 0x14: ST(d->rec, (LD(d->rec) & 0xffffffffull) | ((uint64_t)v << 32)); break;
         case 0x18: d->probe = (d->probe & ~0xffffffffull) | v; break;
         case 0x1c:
             d->probe = (d->probe & 0xffffffffull) | ((uint64_t)v << 32);
@@ -356,29 +360,29 @@ static ssize_t bar0_cb(vfu_ctx_t *c, char *buf, size_t n, loff_t off, bool w)
             if (d->probe_status == 2) violation("probe: vaddr and mmap(fd, fd_offset) differ");
             TLOG(2, "probe 0x%llx: 0x%016llx status %u", (unsigned long long)d->probe, (unsigned long long)d->probe_val, d->probe_status);
             break;
-        case 0x2c: d->fps = v; TLOG(2, "rendering at %u fps", v); break;
+        case 0x2c: ST(d->fps, v); TLOG(2, "rendering at %u fps", v); break;
         }
         return n;
     }
     switch (off) {
     case 0x00: v = 0x7e570002; break;
-    case 0x04: v = d->irq_hz; break;
-    case 0x08: v = d->irqs_ok; break;
-    case 0x0c: v = d->irqs_drop; break;
-    case 0x10: v = d->rec; break;
-    case 0x14: v = d->rec >> 32; break;
+    case 0x04: v = LD(d->irq_hz); break;
+    case 0x08: v = LD(d->irqs_ok); break;
+    case 0x0c: v = LD(d->irqs_drop); break;
+    case 0x10: v = LD(d->rec); break;
+    case 0x14: v = LD(d->rec) >> 32; break;
     case 0x18: v = d->probe; break;
     case 0x1c: v = d->probe >> 32; break;
     case 0x20: v = d->probe_val; break;
     case 0x24: v = d->probe_val >> 32; break;
     case 0x28: v = d->probe_status; break;
-    case 0x2c: v = d->fps; break;
-    case 0x30: v = d->frames; break;
+    case 0x2c: v = LD(d->fps); break;
+    case 0x30: v = LD(d->frames); break;
     case 0x34: v = __atomic_load_n(&d->violations, __ATOMIC_RELAXED); break;
     case 0x38: v = d->quiesces; break;
     case 0x3c: { pthread_mutex_lock(&d->rm); for (int i = 0; i < MAX_REGIONS; i++) v += d->regions[i].used; pthread_mutex_unlock(&d->rm); break; }
-    case 0x40: v = d->irqs_ok ? d->irq_ns_sum / d->irqs_ok : 0; break;
-    case 0x44: v = d->irq_ns_max; break;
+    case 0x40: { uint64_t n = LD(d->irqs_ok); v = n ? LD(d->irq_ns_sum) / n : 0; break; }
+    case 0x44: v = LD(d->irq_ns_max); break;
     case 0x48: v = d->compares; break;
     }
     memcpy(buf, &v, 4);
@@ -415,7 +419,7 @@ static int t2_reset(void *priv, vfu_reset_type_t type)
     pthread_mutex_unlock(&d->m);
     TLOG(2, "reset type %d%s", type, q ? " (quiesced)" : "");
     if (!q) violation("reset without quiesce");
-    d->irq_hz = 0; d->rec = 0;
+    ST(d->irq_hz, 0); ST(d->rec, 0);
     return 0;
 }
 
@@ -460,7 +464,7 @@ static int t2_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env, v
                          NULL, 0, -1, 0) < 0) return -errno;
     if (vfu_setup_device_nr_irqs(ctx, VFU_DEV_INTX_IRQ, 1) < 0 || vfu_setup_device_nr_irqs(ctx, VFU_DEV_MSI_IRQ, 1) < 0) return -errno;
     /* v2: no vfu_setup_device_dma()/vfu_setup_device_quiesce_cb() here, the host owns them */
-    d->irq_hz = irq_hz; d->fps = fps;
+    ST(d->irq_hz, irq_hz); ST(d->fps, fps);
     if (pthread_create(&d->irq_thr, NULL, irq_thread, d) || pthread_create(&d->render_thr, NULL, render_thread, d)) return -EAGAIN;
     *priv = d;
     TLOG(2, "test-v2 %ux%u, irq_hz %u, fps %u", d->w, d->h, irq_hz, fps);
@@ -472,7 +476,7 @@ static void t2_teardown(void *priv)
     t2 *d = priv;
     if (!d) return;
     pthread_mutex_lock(&d->m);
-    d->stopping = true;
+    ST(d->stopping, true);
     pthread_cond_broadcast(&d->cv);
     pthread_mutex_unlock(&d->m);
     pthread_join(d->irq_thr, NULL); pthread_join(d->render_thr, NULL);
