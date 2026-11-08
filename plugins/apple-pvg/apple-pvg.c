@@ -1771,13 +1771,19 @@ static ssize_t pvg_bar0_access(vfu_ctx_t *ctx, char *buf, size_t count, loff_t o
 /* =========================================================== QMetal peers */
 enum PvgInstallOutcome { PVG_INSTALLED, PVG_RETURNED_FAILURE, PVG_RETAINED };
 
+/* result < 0: the marker has no result field (fork
+ * agfx_ordinary_physical_retained); else as agfx_ordinary_task_memory_retained */
 static void G_GNUC_NORETURN pvg_retained_forever(const char *what, const char *stage,
-                                                 uint32_t result)
+                                                 int64_t result)
 {
     /* A known failed disposition is terminal evidence: the owners are kept,
      * nothing is retried or freed (fork: an endless main loop). */
-    fprintf(stderr, "%s stage=%s result=%u outcome=UNRETURNED owners_preserved=1\n",
-            what, stage, result);
+    if (result < 0) {
+        fprintf(stderr, "%s stage=%s outcome=UNRETURNED owners_preserved=1\n", what, stage);
+    } else {
+        fprintf(stderr, "%s stage=%s result=%u outcome=UNRETURNED owners_preserved=1\n",
+                what, stage, (uint32_t)result);
+    }
     fflush(stderr);
     for (;;) {
         pause();
@@ -1832,7 +1838,7 @@ static void pvg_destroy_ordinary_physical(PvgState *s)
     g_assert(s->qmu_dev && s->ordinary_physical_peer);
     if (!s->ordinary_physical_peer->destroy_returned(s->ordinary_physical_receipt,
                                                      s->qmu_dev)) {
-        pvg_retained_forever("AGFX_ORDINARY_PHYSICAL_RETAINED", "destroy", 0);
+        pvg_retained_forever("AGFX_ORDINARY_PHYSICAL_RETAINED", "destroy", -1);
     }
     s->qmu_dev = NULL;
 }
@@ -2014,22 +2020,18 @@ static void pvg_install_mapped_transport(PvgState *s)
     }
 }
 
-/* Failure after the Session exists: retire what was installed, in reverse
- * order (fork realize fail paths). */
-static void pvg_unwind_session(PvgState *s, bool task_memory_tried)
+/* Task-memory install failure: retire what was installed, in reverse order
+ * (fork realize fail path). */
+static void pvg_unwind_session(PvgState *s)
 {
-    if (task_memory_tried) {
-        agfx_eeee_native_context_stop_acquiring(s->ordinary_task_memory_context);
-    }
+    agfx_eeee_native_context_stop_acquiring(s->ordinary_task_memory_context);
     agfx_ordinary_physical_context_stop(s->ordinary_physical_context);
     pvg_destroy_ordinary_physical(s);
-    if (task_memory_tried) {
-        pvg_return_ordinary_task_memory_after_destroy(s);
-    }
+    pvg_return_ordinary_task_memory_after_destroy(s);
     if (s->ordinary_physical_receipt) {
         if (!s->ordinary_physical_peer->dispose_returned(s->ordinary_physical_receipt)) {
             pvg_retained_forever("AGFX_ORDINARY_PHYSICAL_RETAINED",
-                                 "startup_dispose_after_destroy", 0);
+                                 "startup_dispose_after_destroy", -1);
         }
         s->ordinary_physical_receipt = NULL;
     }
@@ -2399,16 +2401,26 @@ static int pvg_create_session(PvgState *s)
     case PVG_INSTALLED:
         break;
     case PVG_RETAINED:
-        pvg_retained_forever("AGFX_ORDINARY_PHYSICAL_RETAINED", "install", 0);
+        /* marker printed; the SAME receipt, Session and context stay owned
+         * (fork: realize returns its error without any finalization) */
+        pvg_log(s, "[apple-gfx-ml] [ERROR] realize: Ordinary physical install retained "
+                "original unknown receipt\n");
+        return -ENODEV;
     case PVG_RETURNED_FAILURE:
-        if (s->ordinary_physical_context) {
-            pvg_destroy_ordinary_physical(s);
-            agfx_ordinary_physical_context_retire(s->ordinary_physical_context);
-        }
+        /* a null receipt is covered by the V2 destroy (prepare rejection) */
+        pvg_destroy_ordinary_physical(s);
+        agfx_ordinary_physical_context_retire(s->ordinary_physical_context);
         return -ENODEV;
     }
     if (!pvg_install_ordinary_physical_comparison(s)) {
-        pvg_unwind_session(s, false);
+        agfx_ordinary_physical_context_stop(s->ordinary_physical_context);
+        pvg_destroy_ordinary_physical(s);
+        if (!s->ordinary_physical_peer->dispose_returned(s->ordinary_physical_receipt)) {
+            pvg_retained_forever("AGFX_ORDINARY_PHYSICAL_RETAINED",
+                                 "comparison_install_dispose_after_destroy", -1);
+        }
+        s->ordinary_physical_receipt = NULL;
+        agfx_ordinary_physical_context_retire(s->ordinary_physical_context);
         return -ENODEV;
     }
     switch (pvg_install_ordinary_task_memory(s)) {
@@ -2418,7 +2430,7 @@ static int pvg_create_session(PvgState *s)
         pvg_retained_forever("AGFX_ORDINARY_TASK_MEMORY_RETAINED", "install",
                              s->ordinary_task_memory_install_result);
     case PVG_RETURNED_FAILURE:
-        pvg_unwind_session(s, true);
+        pvg_unwind_session(s);
         return -ENODEV;
     }
     qmu_log_set_callback(pvg_qmu_log_callback, s);
