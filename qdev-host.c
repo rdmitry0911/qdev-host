@@ -88,10 +88,19 @@ static struct {
  * the irq ones are bumped from plugin threads (atomics) */
 static struct { uint64_t irq_ok, irq_drop, frame_calls, frames, cursor_calls, cursor_sent, quiesce, dma_maps, dma_unmaps; } hstat;
 
+static bool plugin_exit;           /* v2 reset(LOST_CONN) returned QDP_RESET_EXIT */
+static void host_exit(int status);
+
 static int reset_cb(vfu_ctx_t *c, vfu_reset_type_t t)
 {
     DBG("device reset (type %d)", t);
-    return ops->reset ? ops->reset(priv, t) : 0;
+    int r = ops->reset ? ops->reset(priv, t) : 0;
+    if (abi >= 2 && r == QDP_RESET_EXIT) {
+        if (t == VFU_RESET_LOST_CONN) plugin_exit = true;
+        else LOG("plugin returned QDP_RESET_EXIT for reset type %d (only meaningful for a lost connection)", t);
+        return 0;
+    }
+    return r;
 }
 
 /* Guest RAM regions (v2): libvfio-user calls these on the main loop for every
@@ -222,6 +231,10 @@ static gboolean vfu_io_cb(gint fd, GIOCondition cond, gpointer data)
         LOG("client attached");
     } else {
         int r = vfu_run_ctx(vfu), e = errno;
+        if (plugin_exit) {                /* lost client, and the plugin cannot serve another one */
+            LOG("client detached; the plugin cannot serve another client (QDP_RESET_EXIT): exiting");
+            host_exit(0);
+        }
         plugin_resume();                  /* the map change (or reset) of this request is done */
         errno = e;
         if (r < 0) {
@@ -242,7 +255,7 @@ static gboolean vfu_io_cb(gint fd, GIOCondition cond, gpointer data)
 
 static void load_plugin(void)
 {
-    void *h = dlopen(opt.plugin, RTLD_NOW | RTLD_LOCAL);
+    void *h = dlopen(opt.plugin, RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE);   /* never unloaded */
     if (!h) { LOG("dlopen %s: %s", opt.plugin, dlerror()); exit(1); }
     qdp_plugin_v1_fn fn = (qdp_plugin_v1_fn)dlsym(h, QDP_PLUGIN_SYMBOL);
     if (!fn) { LOG("%s: no %s symbol", opt.plugin, QDP_PLUGIN_SYMBOL); exit(1); }
@@ -439,6 +452,17 @@ static void disp_frame(uint64_t seq, bool full, uint32_t x0, uint32_t y0, uint32
     disp_presented(seq);
 }
 
+/* v2: the initial scanout, once right after setup() (a QDP_F_PLUGIN_DAMAGE
+ * plugin is otherwise asked only after frame_ready()) */
+static void disp_initial(void)
+{
+    qdp_scanout now;
+    if (abi < 2 || !ops->get_scanout || !ops->get_scanout(priv, &now)) return;
+    if (!disp_set_mode(&now) || !disp.cur.enabled) return;
+    if (disp.shadow) memset(disp.shadow, 0xff, (size_t)disp.cur.width * 4 * disp.cur.height);   /* polling: first tick sends all */
+    else disp_feed(0, 0, disp.cur.width, disp.cur.height);
+}
+
 /* v2: plugin tick at its own tick_ms */
 static gboolean plugin_tick(gpointer data) { ops->tick(priv); return G_SOURCE_CONTINUE; }
 
@@ -483,14 +507,18 @@ static gboolean kms_hotplug_poll(gpointer data)
     g_strlcpy(last, st, sizeof(last));
     return G_SOURCE_CONTINUE;
 }
-static gboolean on_term(gpointer data)
+/* Teardown is the last call into the plugin; the plugin is never dlclose()d.
+ * After a v2 teardown the process leaves with _exit(): threads the plugin
+ * could not join (GPU driver, QMetal) must not race library destructors. */
+static void host_exit(int status)
 {
-    LOG("terminating");
     if (kms) kms_close(kms);
     kms = NULL;
-    if (ops && ops->teardown) ops->teardown(priv);    /* stops plugin threads: no host service is called after this */
-    exit(0);
+    if (ops && ops->teardown) ops->teardown(priv);
+    if (abi >= 2) { fflush(NULL); _exit(status); }
+    exit(status);
 }
+static gboolean on_term(gpointer data) { LOG("terminating"); host_exit(0); return G_SOURCE_REMOVE; }
 
 /* --------------------------------------------------------------- PPM sink */
 static unsigned dump_count;
@@ -1488,6 +1516,7 @@ int main(int argc, char **argv)
     g_unix_fd_add(wake_fd, G_IO_IN, wake_cb, NULL);
     load_plugin();
     setup_vfu();
+    disp_initial();
     setup_input_forwarding();
     setup_qmp();
     setup_display1();
