@@ -52,7 +52,8 @@ typedef struct qdp_scanout {
  * vaddr is the host's own mapping of [iova, iova + len), NULL when the region
  * has no fd (message-based DMA: the plugin must not use such a region from its
  * threads). fd stays owned by the host and is valid until dma_unregister of
- * this region returns; a plugin that needs it longer dup()s it. Regions backed
+ * this region returns; a plugin that needs it longer dup()s it. A region
+ * without an fd arrives with fd == -1 and vaddr == NULL. Regions backed
  * by the same file may carry the same fd (descriptors are de-duplicated), so
  * do not key anything by fd alone. vaddr may also be NULL with fd >= 0 if the
  * client asked for file I/O access (QEMU does not). fd_offset is the file
@@ -96,7 +97,12 @@ typedef struct qdp_host_ops {
 
     /* Raise MSI/MSI-X vector (or INTx when subindex == 0 and no MSI) of the
      * device. Returns 0, or -errno (e.g. -EINVAL when the guest has not
-     * enabled the interrupt; the event is then dropped, as on real PCI). */
+     * enabled the interrupt; the event is then dropped, as on real PCI).
+     * It takes only a lock internal to libvfio-user that the host never holds
+     * while it calls into the plugin (quiesce, resume, reset, dma_register,
+     * dma_unregister, region and IRQ-state callbacks), and never waits for the
+     * main loop: a plugin may hold its own mutex across irq_trigger() and take
+     * that mutex in any of those callbacks. */
     int  (*irq_trigger)(void *host, uint32_t subindex);
 
     /* The plugin has presented a new frame (QDP_F_PLUGIN_DAMAGE plugins). */
@@ -107,7 +113,11 @@ typedef struct qdp_host_ops {
     void (*cursor_changed)(void *host);
 
     /* Log through the host (stderr, with the host's prefix and verbosity).
-     * level: 0 error, 1 warning, 2 info, 3 debug. */
+     * level: 0 error, 1 warning, 2 info, 3 debug. Each call is one line
+     * "qdev-host: <name>: [error: |warning: |debug: ]<text>"; level 3 only
+     * with -v. A plugin may also write to stderr itself: the host neither
+     * captures nor rewrites fd 2, so the plugin's own lines pass through
+     * unchanged. */
     void (*log)(void *host, int level, const char *fmt, ...)
         __attribute__((format(printf, 3, 4)));
 } qdp_host_ops;
@@ -115,6 +125,11 @@ typedef struct qdp_host_ops {
 /* Plugin flags (qdp_device_ops.flags, v2). */
 #define QDP_F_PLUGIN_DAMAGE  (1u << 0)   /* frames are announced with frame_ready();
                                             the host does not poll/compare */
+
+/* v2: returned by reset(VFU_RESET_LOST_CONN) when the device cannot serve
+ * another client. The host then calls teardown() (not resume()) and exits
+ * with status 0 instead of waiting for the next client. */
+#define QDP_RESET_EXIT 1
 
 /* What the host knows that a plugin may want: the EDID of the physical
  * display attached through the KMS sink (NULL without one). v2 appends the
@@ -137,11 +152,24 @@ typedef struct qdp_device_ops {
      * (may be NULL), env: host environment (never NULL). Returns 0 or -errno.
      * *priv is handed back to all ops. A v2 plugin must not call
      * vfu_setup_device_dma() or vfu_setup_device_quiesce_cb(): the host owns
-     * them and forwards the events below. */
+     * them and forwards the events below. v2: right after setup() returns
+     * the host calls get_scanout() once, on the main loop and before it serves
+     * the client, to pick up the initial scanout. */
     int  (*setup)(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env, void **priv);
+    /* The last call into the plugin (on SIGTERM/SIGINT or after
+     * QDP_RESET_EXIT); no host service may be called after it starts. The
+     * host never dlclose()s a plugin, and after the teardown of a v2 plugin it
+     * leaves with _exit() (stdio flushed): threads the plugin could not join
+     * keep running until the process ends and do not race library
+     * destructors. */
     void (*teardown)(void *priv);
 
-    /* Device reset requested by the client (or connection lost). */
+    /* Device reset requested by the client (or connection lost). Returns 0
+     * or -errno. v2 with a quiesce op: reset() runs quiesced. On a lost
+     * connection the order is quiesce(), reset(VFU_RESET_LOST_CONN) while
+     * the guest RAM regions are still mapped, dma_unregister() of every
+     * region, the IRQ eventfds are closed, then resume() and the host waits
+     * for the next client; reset(LOST_CONN) may return QDP_RESET_EXIT. */
     int  (*reset)(void *priv, vfu_reset_type_t type);
 
     /* Optional: called from the host main loop every tick_ms (0 = never). */
@@ -150,7 +178,19 @@ typedef struct qdp_device_ops {
 
     /* Optional display: fill *out with the current scanout. Return false if
      * the plugin has no display. Without QDP_F_PLUGIN_DAMAGE the host polls
-     * this and detects damage by comparing the framebuffer contents. */
+     * this and detects damage by comparing the framebuffer contents; with it
+     * the host calls it once after setup() and after each batch of
+     * frame_ready() calls. Always on the host main loop.
+     * Scanout custody: the host reads only the buffer of its latest
+     * get_scanout() result, and all its reads (inline Display1 Scanout/Update,
+     * PPM dumps and screendumps, the KMS copy path) happen on the main loop,
+     * so when it calls get_scanout() again it is done with the previous buffer
+     * (a different buffer is unmapped before that call returns to the main
+     * loop). Not covered: a Display1 listener that took the memfd with
+     * ScanoutMap reads it on its own, asynchronously, until the next
+     * ScanoutMap, and the zero-copy KMS sink scans the memfd out until it
+     * switches to the new buffer; a plugin that reuses an older buffer may
+     * show torn frames there. */
     bool (*get_scanout)(void *priv, qdp_scanout *out);
 
     /* ------------------------------------------------------------ v2 */
