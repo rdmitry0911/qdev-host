@@ -4,7 +4,7 @@
 over QEMU's own D-Bus display protocol (`org.qemu.Display1`).**
 
 `qdev-host` runs a device model in its own process and plugs it into a running,
-unmodified QEMU through `vfio-user-pci` (QEMU ≥ 10.1, Proxmox VE 9 ships 11.1).
+unmodified QEMU through `vfio-user-pci` (QEMU ≥ 10.1; Proxmox VE 9.2 ships 11.0, verified with pve-qemu-kvm 11.0.3).
 Device models are plugins (`.so`) with a small, versioned ABI, so new devices can
 be added, removed and replaced while the VM keeps running, and no QEMU fork or
 patch has to follow QEMU releases. The first plugin, `tb-vga`, is the
@@ -105,7 +105,7 @@ worker, macOS validation, several devices per host process.
 
 - Linux host with KVM.
 - QEMU ≥ 10.1 with the `vfio-user-pci` device (`qemu-system-x86_64 -device vfio-user-pci,help`).
-  Proxmox VE 9: `pve-qemu-kvm` 11.1.x has it. Ubuntu 24.04's QEMU 8.2 does not.
+  Proxmox VE 9.2: `pve-qemu-kvm` 11.0.3 has it. Ubuntu 24.04's QEMU 8.2 does not.
 - [libvfio-user](https://github.com/nutanix/libvfio-user) (needs json-c; cmocka only for its tests).
 - GLib/GIO ≥ 2.64 with `gdbus-codegen` (`libglib2.0-dev`, `libglib2.0-dev-bin`).
 - For the tests: `debugfs` (e2fsprogs), Python 3, optionally `iasl` to rebuild the

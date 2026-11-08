@@ -1,0 +1,37 @@
+Title: qdev-host: hot-plug emulated PCIe devices into running VMs on stock Proxmox VE 9 (vfio-user) — looking for feedback
+
+Hi guys, I would like to show a small project and hear what you think: qdev-host. It runs a PCI device model in its own process on the PVE host and plugs it into a running VM through QEMU's vfio-user-pci, which the stock pve-qemu-kvm of PVE 9.2 already has. Nothing in QEMU or Proxmox is patched or rebuilt.
+
+Why. Adding an emulated device to QEMU normally means a QEMU patch, and then following every QEMU release with it. With vfio-user the device lives outside QEMU: device models are plugins (.so) with a small versioned ABI, and a device can be added, removed and replaced while the VM keeps running.
+
+The first plugin, tb-vga, is a hot-pluggable display: a Bochs-compatible PCIe VGA endpoint that the stock Linux bochs-drm driver binds without changes. Its picture does not stay inside qdev-host. It is exported over QEMU's own D-Bus display protocol (org.qemu.Display1), so a client of "-display dbus" can show it: the display probe of my WebRTC console, QSM Direct (thread 187042), receives its frames unchanged. It can also drive a real monitor of the host through DRM/KMS, with zero-copy scanout where the GPU can import the memory.
+
+On PVE it is two packages:
+- qdev-host: the device host, the plugins and a private copy of libvfio-user
+- qdev-host-pve: the qdevctl command, a hookscript, systemd units, and an entry in the VM's Hardware panel
+
+In the Hardware panel, Add has a "qdev-host Device" entry: pick the plugin, an ID and the plugin's arguments, optionally a KMS output of the node. Each device shows up as its own row with its live state, for example "attached (01:00.0)", and Remove hot-unplugs it. From the shell the same is:
+
+qdevctl add 109 tbvga0 --plugin tb-vga --args vram=16
+qdevctl list
+qdevctl remove 109 tbvga0 --purge-port
+
+How it fits into stock PVE: qm for config changes, the node's own PVE::QemuServer::Monitor for device_add, device_del and query-pci, the standard hookscript to start the device process with the VM, and systemd for the device processes. The VM needs a root port of its own with room for the device's memory; qdevctl adds it to the VM's args, so the first time it appears after one VM restart. The panel talks to a small HTTPS service on the node, which checks the browser's PVE ticket against the node's own /access/ticket. Because the operations edit args, only root@pam may use it by default. The page entry goes through pve-ui-overlays (separate thread), so it coexists with QSM Direct and other add-ons. On a node behind QSM's TCP 8006 gateway the panel reaches its service through port 8006 as well.
+
+Measured overhead of vfio-user against the same device inside QEMU: a posted MMIO write (doorbell) costs 4.8-5.0 µs instead of 3.1, a register read 22-26 µs instead of 3.3, access to an mmap-ed BAR has no exit at all. For a display that does not matter: a few register writes per mode change, and the framebuffer is shared memory. For a fast device the rule is doorbells as posted writes and queues in guest memory.
+
+Install, from the same signed APT repository as QSM Direct (see its README for the key and the pin file, and add qdev-host qdev-host-pve to its Package: line):
+
+apt install qdev-host qdev-host-pve
+
+Requirements: a q35 VM, and a directory storage with "snippets" content for the hookscript (usually local). qdev-host refuses, before changing anything, a VM whose config has settings the node's qemu-server cannot read, because qm set would drop them.
+
+Verified so far: Debian 11 and 13 guests under PVE 9.2.21 with pve-qemu-kvm 11.0.3, from the Hardware panel and from the shell: add, attach, hot-unplug and replug, remove, with bochs-drm binding in the guest; the frames reach QSM Direct's display probe; on a laptop, guest frames go to the real panel at 4K. Not yet: the full QSM console on such a device end to end, with sound. Not yet: editing a device in place (remove and add again), a VM on another cluster node than the one serving the page, several devices per process, macOS and Windows guests.
+
+What I would like to hear: which devices would you want as plugins? And does the hookscript plus args approach work with your setups, for example with your own hookscripts (qdev-host chains an existing one) or cluster nodes?
+
+Source, docs and measurements: https://github.com/rdmitry0911/qdev-host
+APT repository: https://rdmitry0911.github.io/qsm-rd/
+
+Project sponsor: Takt (https://taktcycles.com/).
+Thank you, Dmitry
