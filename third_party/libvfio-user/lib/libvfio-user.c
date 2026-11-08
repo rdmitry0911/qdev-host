@@ -1835,13 +1835,19 @@ free_sparse_mmap_areas(vfu_ctx_t *vfu_ctx)
 static void
 vfu_reset_ctx_quiesced(vfu_ctx_t *vfu_ctx)
 {
+    /*
+     * qdev-host patch: the reset callback runs before the DMA regions are
+     * removed, so the device can finish or cancel work on guest memory while
+     * it is still mapped; the dma_unregister callbacks follow.
+     *
+     * FIXME what happens if the device reset callback fails?
+     */
+    device_reset(vfu_ctx, VFU_RESET_LOST_CONN);
+
     if (vfu_ctx->dma != NULL) {
         dma_controller_remove_all_regions(vfu_ctx->dma, vfu_ctx->dma_unregister,
                                           vfu_ctx);
     }
-
-    /* FIXME what happens if the device reset callback fails? */
-    device_reset(vfu_ctx, VFU_RESET_LOST_CONN);
 
     if (vfu_ctx->irqs != NULL) {
         irqs_reset(vfu_ctx);

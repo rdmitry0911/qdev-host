@@ -343,6 +343,8 @@ typedef enum vfu_reset_type {
      * The vfio-user socket client connection was closed or reset. The attached
      * context is cleaned up after returning from the reset callback, and
      * vfu_attach_ctx() must be called to establish a new client.
+     * (qdev-host patch: DMA regions are still mapped during this callback;
+     * their dma_unregister callbacks follow it.)
      */
     VFU_RESET_LOST_CONN,
 
