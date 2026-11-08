@@ -28,8 +28,10 @@ Project sponsor: [Takt](https://taktcycles.com/).
 - [Build](#build)
 - [Run](#run)
 - [Display export (QSM Direct)](#display-export-qsm-direct)
+- [Input forwarding](#input-forwarding)
+- [Control socket (automation)](#control-socket-automation)
 - [Proxmox VE](#proxmox-ve)
-- [Plugin ABI](#plugin-abi)
+- [Plugin ABI](#plugin-abi) (versions 1 and 2, tests without a VM)
 - [The tb-vga plugin](#the-tb-vga-plugin)
 - [Thunderbolt hotplug layer on stock QEMU](#thunderbolt-hotplug-layer-on-stock-qemu)
 - [Performance](#performance)
@@ -48,11 +50,11 @@ Project sponsor: [Takt](https://taktcycles.com/).
  └───────────┘   │     the plugin memfd │             │       BAR2 regs via messages      │
                  └──────────┬───────────┘             │                                   │
                             │ QMP device_add/del      │ scanout (memfd, mode)             │
-                      tools/tbctl.py                  │   └ damage detection (shadow diff)│
+                      tools/tbctl.py                  │   └ damage: shadow diff or plugin │
                                                       │       ├ sink: org.qemu.Display1   │
                                                       │       │   p2p socket / message bus│
-                                                      │       ├ sink: PPM dump (SIGUSR1)  │
-                                                      │       └ sink: DRM/KMS (planned)   │
+                                                      │       ├ sink: PPM (SIGUSR1, ctl)  │
+                                                      │       └ sink: DRM/KMS             │
                                                       └─────────────┬─────────────────────┘
                                                                     │ Display1 (same as -display dbus)
                                                       QSM Direct worker / qemu-display-probe
@@ -106,7 +108,12 @@ worker, macOS validation, several devices per host process.
 - Linux host with KVM.
 - QEMU ≥ 10.1 with the `vfio-user-pci` device (`qemu-system-x86_64 -device vfio-user-pci,help`).
   Proxmox VE 9.2: `pve-qemu-kvm` 11.0.3 has it. Ubuntu 24.04's QEMU 8.2 does not.
-- [libvfio-user](https://github.com/nutanix/libvfio-user) (needs json-c; cmocka only for its tests).
+  Plugins that do DMA from their own threads (ABI v2, GPUs) need QEMU ≥ 11.0: the
+  10.x client's `VFIO_USER_DMA_READ/WRITE` messages use a 32-bit count where the
+  protocol has 64 bits (fixed upstream in e64eb57443).
+- [libvfio-user](https://github.com/nutanix/libvfio-user): a patched copy is vendored
+  in `third_party/libvfio-user` and built by `make` (meson, ninja, json-c and cmocka
+  headers: `meson ninja-build libjson-c-dev libcmocka-dev`).
 - GLib/GIO ≥ 2.64 with `gdbus-codegen` (`libglib2.0-dev`, `libglib2.0-dev-bin`).
 - For the tests: `debugfs` (e2fsprogs), Python 3, optionally `iasl` to rebuild the
   SSDT and `qemu-display-probe` from the qsm-rd repository.
@@ -114,13 +121,26 @@ worker, macOS validation, several devices per host process.
 ## Build
 
 ```bash
-# libvfio-user from source (if not packaged):
-git clone https://github.com/nutanix/libvfio-user && cd libvfio-user && meson setup build -Dprefix=/usr/local && ninja -C build install
-
-make                          # uses pkg-config libvfio-user if present
-make VFU_PREFIX=/opt/vfu      # or an install prefix
+make                          # builds third_party/libvfio-user into build/vfu, then the host,
+                              # plugins and tools (rpath to build/vfu/lib)
+make vfu                      # only the vendored libvfio-user
+make VFU_PREFIX=/opt/vfu      # use a libvfio-user installed elsewhere (it must carry the patches below)
 make install PREFIX=/usr/local
+make distclean                # also removes build/
 ```
+
+The vendored libvfio-user (`VENDORED_COMMIT`) carries three patches the host and v2
+plugins rely on; an upstream build does not compile with the host (`#error`):
+
+- `vfu_dma_info_t` has `int fd` and `uint64_t fd_offset` (appended): the region's
+  backing file as the client passed it (-1 for message-based regions) and the file
+  offset of `iova`. It is the fd cache's de-duplicated descriptor, shared by regions
+  of the same file, closed after the `dma_unregister` callback of the last of them.
+- `vfu_irq_trigger()` is thread-safe: a mutex serialises the eventfd lookup and
+  write against `SET_IRQS` and context reset; it is never held across a callback.
+- On a lost connection the reset callback (`VFU_RESET_LOST_CONN`) runs before the
+  DMA regions are removed (upstream removed them first, although its documentation
+  says the context is cleaned up after the callback).
 
 `dbus/dbus-display1.xml` is QEMU's interface definition (Linux variant); the GDBus
 glue is generated at build time with `gdbus-codegen`.
@@ -151,6 +171,8 @@ qdev-host --plugin plugins/tb-vga/tb-vga.so --socket /run/qdev/tbvga0.sock \
 | `--kms /dev/dri/cardN[:CONNECTOR]` | scan the device out on a real monitor (see below) |
 | `--on-connect CMD`, `--on-disconnect CMD` | run when that connector's status changes (e.g. `tbctl.py … plug/unplug`) |
 | `--qemu-display ADDR`, `--qemu-display-dest NAME`, `--qemu-console N` | forward keyboard/mouse to the VM's own Display1 console (see below) |
+| `--qemu-qmp PATH` | forward keyboard/mouse with QMP `input-send-event`, for VMs without a graphic console (see below) |
+| `--control PATH` | control socket for automation: `screendump FILE`, `frame`, `stats` (see below) |
 | `--stats-interval S` | print damage-detection and KMS statistics every S seconds (`SIGUSR2` prints once) |
 | `--kms-copy` | force the dumb-buffer copy path instead of zero-copy |
 | `--head-origin X,Y`, `--desktop WxH` | guest desktop layout for the pointer on this head (see below) |
@@ -199,7 +221,7 @@ kernel and initrd with `debugfs` and injects a serial autologin).
 |---|---|---|
 | `/org/qemu/Display1/VM` | `VM` | `Name`, `UUID`, `ConsoleIDs = [0]` |
 | `/org/qemu/Display1/Console_0` | `Console`, `Keyboard`, `Mouse` | `Type = Graphic`, `Width/Height` follow the guest's mode; `RegisterListener(fd)` opens a p2p connection to the client's `Listener` object |
-| client's `/org/qemu/Display1/Listener` | `Listener`, `Listener.Unix.Map` | `ScanoutMap(memfd, offset, w, h, stride, pixman)` + `UpdateMap(x, y, w, h)` when the listener advertises `Unix.Map` (QSM Direct does), otherwise inline `Scanout` / `Update`; `Disable` when the guest turns the output off |
+| client's `/org/qemu/Display1/Listener` | `Listener`, `Listener.Unix.Map` | `ScanoutMap(memfd, offset, w, h, stride, pixman)` + `UpdateMap(x, y, w, h)` when the listener advertises `Unix.Map` (QSM Direct does), otherwise inline `Scanout` / `Update`; `Disable` when the guest turns the output off; `CursorDefine` + `MouseSet` for plugins with a cursor plane (v2) |
 
 Two transports, usable at the same time:
 
@@ -214,8 +236,16 @@ Two transports, usable at the same time:
 Damage detection: the host keeps a shadow copy of the scanout and compares it
 `--fps` times per second (per row, then per pixel at the edges), sending one
 bounding rectangle per tick. Guest writes to the mmap-ed VRAM are invisible to the
-host, so this is the only generic option; a plugin with its own damage knowledge
-(e.g. a GPU plugin with dma-buf scanouts) can refine this later.
+host, so this is the only generic option. A v2 plugin that knows its frames (a
+GPU) sets `QDP_F_PLUGIN_DAMAGE` and calls `frame_ready()`: no polling, no shadow;
+the host re-reads `get_scanout()` and sends the plugin's damage rectangle (united
+over the frames announced since the last batch) to every sink.
+
+Cursor (v2 `get_cursor()`): after `cursor_changed()` the host sends `CursorDefine`
+when the image serial changes and `MouseSet(x + hot_x, y + hot_y, visible)` when
+anything changes; a listener that registers later gets the current cursor. The
+cursor is not drawn into PPM dumps or the KMS picture (as with QEMU's own
+`screendump`).
 
 Verified with QSM Direct's `qemu-display-probe` in both transports:
 `scanout inline/map: 0/1`, `updates inline/map: 0/N`, `session errors: 0`, and the
@@ -268,6 +298,19 @@ size to the VM console's size, `Mouse.IsAbsolute` mirrors the VM's. Calls are
 forwarded asynchronously; the extra hop costs one D-Bus method call
 (`tools/display1-input-bench` measures it: direct vs. through `qdev-host`).
 
+Device as the only display (`--qemu-qmp PATH`): a VM whose only display is the
+external device (e.g. a paravirtual GPU with its own option ROM) has no graphic
+console in QEMU, so there is no Display1 console to relay to. `qdev-host` then
+sends the events to the VM's QMP socket as `input-send-event` (no `device`/`head`:
+QEMU's default handlers, e.g. `usb-kbd` and `usb-tablet`). Display1 key codes are
+QEMU key numbers, the same encoding as a QMP key of type `number`; buttons map to
+`InputButton` names; absolute positions are scaled to 0..0x7fff over this display
+(or the `--desktop` layout). `Mouse.IsAbsolute` is true when QEMU has an absolute
+mouse (`query-mice`). The QMP connection is asynchronous and retried every
+second, so `qdev-host` can (and for a cold-plugged device must) start before QEMU,
+and it reconnects after a QEMU restart. QMP accepts one client per monitor: give
+QEMU a second `-qmp` for other tools. `--qemu-display` wins if both are given.
+
 Second head: the VM's tablet spans the whole guest desktop, so a point on this
 display is mapped to desktop coordinates first (`--head-origin X,Y`, default: right
 of the VM console; `--desktop WxH`, default: VM console + this display) and then
@@ -281,6 +324,30 @@ attached to the external display gets the VM's clipboard and audio as if it were
 attached to QEMU: clipboard calls go both ways (QEMU's callbacks reach the client),
 audio listener fds are handed to QEMU, which then talks to the client directly.
 One clipboard peer per QEMU is a QEMU rule, which the relay respects.
+
+## Control socket (automation)
+
+QMP `screendump` cannot see an external device's display (QEMU has no console for
+it), so test harnesses use `--control PATH`: a unix stream socket with one command
+per line and one reply line per command, answered in order.
+
+| Command | Reply |
+|---|---|
+| `screendump FILE` | waits for the next presented frame, at most 1 s, then writes the current scanout to `FILE` as binary PPM (`P6`, written as `FILE.tmp` and renamed) and replies `ok <seq> <w>x<h>` |
+| `frame` | `ok <seq> <w>x<h> stride <bytes> format 0x<pixman>`, or `ok <seq> off` |
+| `stats` | `ok key=value ...`: `seq`, `mode`, `frames`, `frame_calls`, `ticks`, `damaged`, `idle_s`, `irqs`, `irqs_dropped`, `dma_regions`, `dma_mib`, `dma_maps`, `dma_unmaps`, `quiesce`, `cursor_calls`, `cursor_sent`, `listeners`, `attached`, `cpu_s` |
+
+Errors are `err <reason>` (`err scanout off`, `err unknown command ...`). `<seq>`
+is the plugin's frame sequence number for `QDP_F_PLUGIN_DAMAGE` plugins; for
+polling plugins the host counts the ticks that found damage (a pending
+`screendump` keeps the comparison running even with no other consumer). `FILE` is
+relative to `qdev-host`'s working directory; give an absolute path. 32 bpp pixman
+formats of type ARGB, ABGR, BGRA and RGBA are written; the cursor is not included.
+
+```bash
+printf 'screendump /tmp/shot.ppm\nframe\n' | socat - UNIX-CONNECT:/run/qdev/gpu0.ctl
+tools/qdev-control.py /run/qdev/gpu0.ctl "screendump /tmp/shot.ppm" stats
+```
 
 ## Proxmox VE
 
@@ -358,13 +425,15 @@ hookscript-free path for VMs whose firmware already reserves enough window space
 
 ## Plugin ABI
 
-`qdp.h`, version 1. A plugin is a shared object exporting one symbol:
+`qdp.h`, versions 1 and 2 (`QDP_ABI_VERSION_MIN` .. `QDP_ABI_VERSION`). A plugin
+is a shared object exporting one symbol (the name stays `qdp_plugin_v1` for every
+version):
 
 ```c
 const qdp_device_ops *qdp_plugin_v1(void);
 
 typedef struct qdp_device_ops {
-    uint32_t    abi_version;              /* QDP_ABI_VERSION */
+    uint32_t    abi_version;              /* QDP_ABI_VERSION the plugin was built for */
     const char *name, *version;
     int  (*setup)(vfu_ctx_t *ctx, const char *args,
                   const qdp_host_env *env, void **priv);            /* configure the device on ctx */
@@ -372,11 +441,19 @@ typedef struct qdp_device_ops {
     int  (*reset)(void *priv, vfu_reset_type_t type);               /* client reset or lost connection */
     uint32_t tick_ms; void (*tick)(void *priv);                     /* optional periodic work */
     bool (*get_scanout)(void *priv, qdp_scanout *out);              /* optional display */
+    /* v2 */
+    uint32_t flags;                                                 /* QDP_F_PLUGIN_DAMAGE */
+    int  (*quiesce)(void *priv);  void (*resume)(void *priv);       /* around guest memory map changes */
+    void (*dma_register)(void *priv, const qdp_dma_region *r);      /* guest RAM regions with fd + offset */
+    void (*dma_unregister)(void *priv, const qdp_dma_region *r);
+    bool (*get_cursor)(void *priv, qdp_cursor *out);                /* optional cursor plane */
 } qdp_device_ops;
 ```
 
-- `qdp_host_env` carries what the host knows: today the EDID of the physical
-  display behind the KMS sink (`edid`, `edid_len`), or `NULL`.
+Version 1:
+
+- `qdp_host_env` carries what the host knows: the EDID of the physical display
+  behind the KMS sink (`edid`, `edid_len`), or `NULL`.
 - `setup()` runs before `vfu_realize_ctx()`. It sets PCI identity and
   capabilities (`vfu_pci_init`, `vfu_pci_set_id`, `vfu_pci_add_capability`), BARs
   (`vfu_setup_region`, with a memfd and mmap areas for regions the guest should
@@ -384,15 +461,121 @@ typedef struct qdp_device_ops {
   and returns its private state in `*priv`.
 - The host owns the socket, the attach/detach cycle, the reset callback (chained
   to `reset()`), DMA registration callbacks and the main loop (GLib). Region
-  accesses are served by the callbacks the plugin registered.
+  accesses are served by the callbacks the plugin registered, on the main loop.
 - `get_scanout()` describes the current framebuffer: a memfd + offset, size,
   stride and pixman format (`0x20020888` = `x8r8g8b8`). `enabled = false` means
   blank. The host maps it, detects damage and feeds the sinks.
+- `tick()` is called at the poll rate (the v1 host behaviour, kept for v1
+  plugins); `teardown()` on `SIGTERM`/`SIGINT`.
 - Rules for a fast device (measured, see below): doorbells as posted MMIO writes;
   no register reads or port I/O on the hot path; status and queues in guest
   memory (shared) with MSI-X completions; never do message-based DMA inside an
   access handler (the client holds its global lock while waiting for the reply,
   the request deadlocks until the 5 s timeout).
+
+Version 2 (GPU plugins) appends to `qdp_device_ops` and `qdp_host_env`; the host
+reads the v2 fields of a v2 plugin only, so v1 plugins load unchanged.
+
+- **Guest RAM regions.** `dma_register()` / `dma_unregister()` get a
+  `qdp_dma_region {iova, len, vaddr, fd, fd_offset, prot}` for every region the
+  client maps (with QEMU and `memory-backend-memfd,share=on`: the RAM sections
+  around the PCI hole and the PAM areas, all on the same memfd at their own
+  offsets). `vaddr` is the host's mapping, `fd`/`fd_offset` let the plugin map the
+  region itself or build a dma-buf (udmabuf). Both stay valid until
+  `dma_unregister()` of that region returns; regions of one file share the fd
+  (never close it, `dup()` to keep it). Regions without an fd (firmware ROMs:
+  message-based) have `vaddr == NULL` and must not be used from plugin threads.
+  An identical re-map is not reported twice. A v2 plugin does not call
+  `vfu_setup_device_dma()` or `vfu_setup_device_quiesce_cb()`.
+- **Quiesce.** `quiesce()` is synchronous: stop every guest memory access and
+  every `irq_trigger()`, then return 0 (it may block), or `-errno` to fail the
+  client's request. The host calls it before every `DMA_MAP` and `DMA_UNMAP`,
+  before a device reset or FLR and before it drops a lost client (so
+  `dma_register()`, `dma_unregister()` and `reset()` run quiesced), and calls
+  `resume()` once the request has been handled.
+- **Lost connection.** Order: `quiesce()`, `reset(VFU_RESET_LOST_CONN)` with the
+  guest RAM regions still mapped, `dma_unregister()` of each region, IRQ eventfds
+  closed, `resume()`, then the host waits for the next client with the plugin's
+  state kept. A device that cannot serve another client returns `QDP_RESET_EXIT`
+  from `reset(LOST_CONN)`: the host calls `teardown()` instead of `resume()` and
+  exits with status 0.
+- **Lifetime.** `teardown()` (on `SIGTERM`/`SIGINT` or after `QDP_RESET_EXIT`) is
+  the last call into the plugin. The host never `dlclose()`s a plugin (it is
+  opened `RTLD_NODELETE`) and leaves a v2 plugin's teardown with `_exit()`
+  after flushing stdio, so threads the plugin cannot join do not race library
+  destructors.
+- **Scanout.** The host calls `get_scanout()` once right after `setup()` (before
+  serving the client), then after each `frame_ready()` batch (or at the poll rate
+  without `QDP_F_PLUGIN_DAMAGE`), always on the main loop. It reads only the
+  buffer of its latest `get_scanout()` result, and all its reads (inline Display1
+  updates, PPM, the KMS copy path) are on the main loop, so it is done with the
+  previous buffer when it calls `get_scanout()` again. Not covered: Display1
+  listeners that took the memfd with `ScanoutMap` read it asynchronously until the
+  next `ScanoutMap`, and the zero-copy KMS sink scans the memfd out until it
+  switches; a plugin that reuses an older buffer may show torn frames there. A
+  buffer change (another fd or offset) is a mode change for the sinks (unmap/map,
+  a new `ScanoutMap` to each listener), so flipping between two buffers costs a
+  synchronous D-Bus call per listener and frame.
+- **Host services** (`env->host_ops`, callable from any plugin thread between
+  `setup()` returning and `teardown()`):
+  - `irq_trigger(host, subindex)`: raise MSI/MSI-X vector `subindex` (INTx with 0
+    when MSI is off). It writes the client's eventfd directly (KVM irqfd, no QEMU
+    thread on the way), serialised only against `SET_IRQS`/reset inside
+    libvfio-user, never against the main loop: a plugin thread does not wait for
+    an MMIO request being handled, and a region handler or `quiesce()` may block
+    on a thread that raises IRQs. The host never holds that lock while it calls
+    into the plugin, so a plugin may hold its own mutex across `irq_trigger()`
+    and take it in `quiesce()`, `resume()`, `reset()` or the DMA callbacks. Returns `-EINVAL` when the guest has not enabled
+    the interrupt (the event is dropped, as on real PCI). Cost: about 1-2 µs per
+    call (measured with test-v2, see below).
+  - `frame_ready(host, {seq, x, y, w, h})`: a new frame is in the scanout
+    (`QDP_F_PLUGIN_DAMAGE`); `w == 0` means all of it. The host wakes its main
+    loop through an eventfd once per batch, re-reads `get_scanout()` and feeds the
+    sinks. Frames announced faster than the main loop drains them are merged
+    (damage united, the last `seq` wins).
+  - `cursor_changed(host)`: the host calls `get_cursor()` on its main loop soon
+    after. `qdp_cursor.x/y` is the image's top-left corner (pointer minus hotspot).
+  - `log(host, level, fmt, ...)`: through the host's stderr, one line per call,
+    `qdev-host: <name>: [error: |warning: |debug: ]<text>`; level 3 only with `-v`.
+    A plugin may also write to stderr itself: the host does not capture or rewrite
+    fd 2, so the plugin's own lines (and their prefixes) pass through unchanged.
+- `tick()` runs every `tick_ms` (0 = never) for v2 plugins.
+
+The scanout of a v2 plugin is still a memfd (`get_scanout()`); a GPU plugin copies
+its finished frame into it (or renders into memory imported from it) and calls
+`frame_ready()`. dma-buf scanouts are on the roadmap.
+
+### Testing plugins without a VM
+
+`plugins/test-v2` is a v2 device without function that uses every v2 callback and
+host service and checks the host's rules (see its header comment for the BAR0
+registers). `tools/vfu-test-client` is a minimal vfio-user client (its own
+transport, only `vfio-user.h`) that maps memfd-backed DMA regions, sets IRQ
+eventfds and reads/writes regions:
+
+```bash
+make
+tools/test-abi-v2.sh /tmp/qdev-test                     # test-v2 + tb-vga, no QEMU at all
+tools/test-abi-v2.sh /tmp/qdev-test-v1 /path/to/old/tb-vga.so   # a v1 binary
+QEMU=/path/to/qemu-11/build/qemu-system-x86_64 tools/test-v2-qemu.sh /tmp/qdev-qemu
+```
+
+- `test-abi-v2.sh`: DMA regions with fd/offset (two regions on one memfd share
+  the fd), vaddr == `mmap(fd, fd_offset)`, an identical re-map, a region without
+  fd; IRQs from the plugin thread with latency through a DMA record; 200 eventfd
+  replacements under IRQ load; 100 unmap/map cycles of the region the IRQ thread
+  writes into (quiesce); reset; `reset(LOST_CONN)` with the regions still mapped;
+  the initial `get_scanout()` without any `frame_ready()`; `QDP_RESET_EXIT` (host
+  exits 0 by itself); Display1 listener (`Scanout`, `Update` per frame,
+  `CursorDefine`, `MouseSet`); control socket `screendump` checked against the
+  frame seq in the picture; tb-vga config space, EDID/DISPI/QEXT registers, mode
+  set, VRAM write and PPM.
+- `test-v2-qemu.sh`: a stock QEMU ≥ 11 with the qtest accelerator (no guest code,
+  no disk image) as the client: QEMU's memfd RAM through `DMA_MAP`, MMIO through
+  QEMU, plugin DMA writes visible in guest RAM, INTx and MSI from the plugin thread
+  (MSI aimed at guest RAM so the message write can be read back), PAM map changes
+  (quiesce), `system_reset`, and the `--qemu-qmp` input relay checked in QEMU's
+  input trace.
 
 Compatibility: `abi_version` is checked at load; new fields are appended.
 
@@ -459,8 +642,10 @@ in [docs/live-display-results.md](docs/live-display-results.md).
 
 ## Roadmap
 
-1. **GPU plugins**: dma-buf scanouts (`ScanoutDMABUF`) instead of memfd, damage
-   from the plugin instead of shadow comparison.
+1. **GPU plugins**: ABI v2 (guest RAM with fd, quiesce, thread-safe IRQs, plugin
+   damage, cursor) is done; next are dma-buf scanouts (`ScanoutDMABUF`) instead of
+   memfd, a KMS cursor plane, and a dedicated vfio-user thread so MMIO is not
+   served on the main loop next to D-Bus and the damage comparison.
 2. **Several devices per host process** and **plugin replacement**: load v2 next
    to v1, move the guest over, retire v1 (the ABI already keeps state in the
    plugin process).
@@ -472,23 +657,27 @@ in [docs/live-display-results.md](docs/live-display-results.md).
 ## Repository layout
 
 ```text
-qdev-host.c        host: plugin loader, vfio-user main loop, damage detection, Display1 server, PPM sink
+qdev-host.c        host: plugin loader (ABI 1, 2), vfio-user main loop, DMA/quiesce forwarding, host services,
+                   damage detection, Display1 server, PPM sink, control socket, input relays
 qdp.h              plugin ABI
 dbus/              org.qemu.Display1 interface XML (from QEMU, Linux variant); GDBus code generated at build time
 plugins/tb-vga/    the display plugin + sample EDID
+plugins/test-v2/   ABI v2 test device (DMA regions, IRQ thread, frames, cursor, quiesce checks)
 kms-sink.c/.h      DRM/KMS sink (real monitor), EDID export, page flips, hot-plug hooks
 tools/             tbctl.py (QMP plug/unplug/connect), run-guest.sh, prep-guest.sh, test-flow.sh,
                    remote-kms-test.sh / remote-features-test.sh (live-display tests on a GPU host),
                    guest_cmd.py (serial console driver), guest-draw.py, guest-animate.py (fps load, raw BAR
                    writes), guest-abs-read.py, ppm2png.py, display1-input-bench.c (input round trip),
-                   display1-abs-test.py, display1-clipboard-test.py, pve-ui-test.mjs (headless PVE UI test)
+                   display1-abs-test.py, display1-clipboard-test.py, pve-ui-test.mjs (headless PVE UI test),
+                   vfu-test-client.c (vfio-user client without a VM), test-abi-v2.sh / test-v2-qemu.sh (+ -drive.py),
+                   display1-listener-test.py, qdev-control.py (control socket)
 acpi/              SSDT with the Thunderbolt ACPI properties (.dsl + .aml)
 bench/             the vfio-user overhead microbenchmark (libvfio-user pci-testdev + kvm-unit-tests patch)
 docs/              overhead report, Thunderbolt-on-stock notes (Russian), live-display measurements
 pve/               qdevctl + qdev_pve.py (operations), qdev_host_api.py (node service), qdev-host-hardware.js +
                    qdev-host.overlay.json (Hardware panel overlay for pve-ui-overlays), hookscript, systemd units
 debian/, scripts/  Debian packaging; mkchroot.sh and build-deb-in-chroot.sh build the debs in a trixie chroot
-third_party/       vendored libvfio-user (BSD-3-Clause)
+third_party/       vendored libvfio-user (BSD-3-Clause), with the three patches described under Build
 ```
 
 ## License

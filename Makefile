@@ -1,39 +1,90 @@
 # qdev-host: out-of-process device host for stock QEMU (vfio-user) with
 # org.qemu.Display1-compatible display export. Plugins are shared objects.
 #
-# libvfio-user: either installed with a pkg-config file, or give its install
-# prefix in VFU_PREFIX (include/vfio-user, lib*/libvfio-user.so).
-VFU_PREFIX ?= /usr/local
-ifneq ($(shell pkg-config --exists libvfio-user && echo yes),)
-VFU_CFLAGS := $(shell pkg-config --cflags libvfio-user)
-VFU_LIBS   := $(shell pkg-config --libs libvfio-user)
-else
-VFU_LIBDIR := $(firstword $(wildcard $(VFU_PREFIX)/lib/x86_64-linux-gnu $(VFU_PREFIX)/lib))
+# libvfio-user: the vendored copy in third_party/libvfio-user carries patches
+# the host and v2 plugins need (DMA region fd/offset, thread-safe
+# vfu_irq_trigger), so an upstream libvfio-user does not work. By default it is
+# built with meson/ninja (needs json-c and cmocka headers) into build/vfu and
+# linked with an rpath there ("make vfu" builds only the library). To use a
+# copy installed elsewhere, give its prefix in VFU_PREFIX (include/vfio-user,
+# lib/libvfio-user.so); PRIVLIB sets a different rpath (packages).
+VFU_SRC    := third_party/libvfio-user
+VFU_LOCAL  := $(CURDIR)/build/vfu
+VFU_PREFIX ?= $(VFU_LOCAL)
+VFU_LIBDIR := $(firstword $(wildcard $(VFU_PREFIX)/lib/x86_64-linux-gnu) $(VFU_PREFIX)/lib)
 VFU_CFLAGS := -I$(VFU_PREFIX)/include/vfio-user
-# PRIVLIB: directory where the package ships libvfio-user.so.0 (rpath), else the build prefix
 VFU_LIBS   := -L$(VFU_LIBDIR) -lvfio-user -Wl,-rpath,$(if $(PRIVLIB),$(PRIVLIB),$(VFU_LIBDIR))
+ifeq ($(VFU_PREFIX),$(VFU_LOCAL))
+VFU_DEP    := $(VFU_LOCAL)/lib/libvfio-user.so.0
 endif
 GLIB_CFLAGS := $(shell pkg-config --cflags gio-unix-2.0 glib-2.0)
 GLIB_LIBS   := $(shell pkg-config --libs gio-unix-2.0 glib-2.0)
 DRM_CFLAGS  := $(shell pkg-config --cflags libdrm)
 DRM_LIBS    := $(shell pkg-config --libs libdrm)
 CFLAGS ?= -O2 -g -Wall -Wno-unused-parameter
-PLUGINS := plugins/tb-vga/tb-vga.so
+PLUGINS := plugins/tb-vga/tb-vga.so plugins/test-v2/test-v2.so
 
-all: qdev-host $(PLUGINS) tools/display1-input-bench
+# apple-pvg (Apple ParavirtualizedGraphics GPU) links QMetal's libmlapi.so and
+# is built only when QMETAL_INCLUDE is given:
+#   make QMETAL_INCLUDE=<qmetal>/include QMETAL_LIBDIR=<dir of libmlapi.so>
+# QMETAL_RPATH (default QMETAL_LIBDIR) is recorded as the plugin's rpath; with
+# QMETAL_RPATH= empty, put libmlapi.so (and its libair2spirv.so.1) on
+# LD_LIBRARY_PATH when starting qdev-host instead.
+QMETAL_INCLUDE ?=
+QMETAL_LIBDIR ?=
+QMETAL_RPATH ?= $(QMETAL_LIBDIR)
+APPLE_PVG_SRC := $(addprefix plugins/apple-pvg/,apple-pvg.c pvg-memory.c pvg-process-vm.c pvg-dmabuf.c)
+APPLE_PVG_HDR := plugins/apple-pvg/pvg.h plugins/apple-pvg/pvg-process-vm.h \
+                 $(wildcard plugins/apple-pvg/qmu-private/*.h)
+GLIB_ONLY_CFLAGS = $(shell pkg-config --cflags glib-2.0)
+GLIB_ONLY_LIBS   = $(shell pkg-config --libs glib-2.0)
+ifneq ($(QMETAL_INCLUDE),)
+PLUGINS += plugins/apple-pvg/apple-pvg.so
+endif
+
+all: qdev-host $(PLUGINS) tools/display1-input-bench tools/vfu-test-client
+
+vfu: $(VFU_LOCAL)/lib/libvfio-user.so.0
+$(VFU_LOCAL)/lib/libvfio-user.so.0: $(wildcard $(VFU_SRC)/lib/*.[ch] $(VFU_SRC)/include/*.h $(VFU_SRC)/include/*/*.h)
+	[ -f build/vfu-build/build.ninja ] || meson setup build/vfu-build $(VFU_SRC) --prefix=$(VFU_LOCAL) --libdir=lib -Dbuildtype=release
+	ninja -C build/vfu-build install >/dev/null
+	touch $@
 
 dbus/dbus-display1.c dbus/dbus-display1.h: dbus/dbus-display1.xml
 	cd dbus && gdbus-codegen dbus-display1.xml --glib-min-required 2.64 --output-directory . \
 	    --interface-prefix org.qemu. --c-namespace QemuDBus --generate-c-code dbus-display1
 
-qdev-host: qdev-host.c kms-sink.c kms-sink.h dbus/dbus-display1.c dbus/dbus-display1.h qdp.h
-	$(CC) $(CFLAGS) -I. $(VFU_CFLAGS) $(GLIB_CFLAGS) $(DRM_CFLAGS) -o $@ qdev-host.c kms-sink.c dbus/dbus-display1.c $(VFU_LIBS) $(GLIB_LIBS) $(DRM_LIBS) -ldl
+qdev-host: qdev-host.c kms-sink.c kms-sink.h dbus/dbus-display1.c dbus/dbus-display1.h qdp.h $(VFU_DEP)
+	$(CC) $(CFLAGS) -I. $(VFU_CFLAGS) $(GLIB_CFLAGS) $(DRM_CFLAGS) -o $@ qdev-host.c kms-sink.c dbus/dbus-display1.c $(VFU_LIBS) $(GLIB_LIBS) $(DRM_LIBS) -ldl -lpthread
 
 tools/display1-input-bench: tools/display1-input-bench.c
 	$(CC) $(CFLAGS) $(GLIB_CFLAGS) -o $@ $< $(GLIB_LIBS)
 
-plugins/%.so: plugins/%.c qdp.h
-	$(CC) $(CFLAGS) -fPIC -shared -I. $(VFU_CFLAGS) -o $@ $< $(VFU_LIBS)
+# test client for plugins without a VM: speaks vfio-user itself, needs only the protocol header
+tools/vfu-test-client: tools/vfu-test-client.c $(VFU_DEP)
+	$(CC) $(CFLAGS) $(VFU_CFLAGS) -o $@ $< -lpthread
+
+plugins/%.so: plugins/%.c qdp.h $(VFU_DEP)
+	$(CC) $(CFLAGS) -fPIC -shared -I. $(VFU_CFLAGS) -o $@ $< $(VFU_LIBS) -lpthread
+
+plugins/apple-pvg/apple-pvg.so: $(APPLE_PVG_SRC) $(APPLE_PVG_HDR) qdp.h $(VFU_DEP)
+	@test -n "$(QMETAL_INCLUDE)" -a -n "$(QMETAL_LIBDIR)" || \
+	    { echo "apple-pvg needs QMETAL_INCLUDE and QMETAL_LIBDIR" >&2; exit 1; }
+	$(CC) $(CFLAGS) -fPIC -shared -pthread -fvisibility=hidden -I. -Iplugins/apple-pvg \
+	    -I$(QMETAL_INCLUDE) $(VFU_CFLAGS) $(GLIB_ONLY_CFLAGS) -o $@ $(APPLE_PVG_SRC) \
+	    $(VFU_LIBS) -L$(QMETAL_LIBDIR) -lmlapi $(if $(QMETAL_RPATH),-Wl$(comma)-rpath$(comma)$(QMETAL_RPATH)) \
+	    $(GLIB_ONLY_LIBS) -ldl
+
+# Self-test of the apple-pvg plugin on a vfu context without a VM (see
+# plugins/apple-pvg/README.md). Runs the real libmlapi; select the Vulkan
+# driver with VK_ICD_FILENAMES (e.g. lavapipe) when no GPU should be used.
+plugins/apple-pvg/selftest: plugins/apple-pvg/selftest.c qdp.h $(VFU_DEP)
+	$(CC) $(CFLAGS) -pthread -rdynamic -I. -I$(QMETAL_INCLUDE) $(VFU_CFLAGS) -o $@ $< \
+	    $(VFU_LIBS) -ldl
+
+apple-pvg-selftest: plugins/apple-pvg/apple-pvg.so plugins/apple-pvg/selftest
+	plugins/apple-pvg/selftest plugins/apple-pvg/apple-pvg.so
+	plugins/apple-pvg/selftest plugins/apple-pvg/apple-pvg.so --personality 0xeee1
 
 install: all
 	install -D -m 755 qdev-host $(DESTDIR)$(PREFIX)/bin/qdev-host
@@ -42,7 +93,11 @@ install: all
 	install -D -m 644 plugins/tb-vga/edid-1280x800.bin $(DESTDIR)$(PREFIX)/share/qdev-host/edid-1280x800.bin
 
 clean:
-	rm -f qdev-host plugins/*/*.so tools/display1-input-bench dbus/dbus-display1.c dbus/dbus-display1.h
+	rm -f qdev-host plugins/*/*.so plugins/apple-pvg/selftest tools/display1-input-bench tools/vfu-test-client dbus/dbus-display1.c dbus/dbus-display1.h
+
+distclean: clean
+	rm -rf build
 
 PREFIX ?= /usr/local
-.PHONY: all clean install
+comma := ,
+.PHONY: all clean distclean install vfu apple-pvg-selftest

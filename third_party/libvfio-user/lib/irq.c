@@ -121,9 +121,11 @@ irqs_disable(vfu_ctx_t *vfu_ctx, uint32_t index, uint32_t start, uint32_t count)
         break;
     }
 
+    pthread_mutex_lock(&vfu_ctx->irqs->lock);
     for (i = start; i < count; i++) {
         close_safely(&efds[i]);
     }
+    pthread_mutex_unlock(&vfu_ctx->irqs->lock);
 }
 
 void
@@ -135,9 +137,11 @@ irqs_reset(vfu_ctx_t *vfu_ctx)
     irqs_disable(vfu_ctx, VFIO_PCI_REQ_IRQ_INDEX, 0, 0);
     irqs_disable(vfu_ctx, VFIO_PCI_ERR_IRQ_INDEX, 0, 0);
 
+    pthread_mutex_lock(&vfu_ctx->irqs->lock);
     for (i = 0; i < vfu_ctx->irqs->max_ivs; i++) {
         close_safely(&efds[i]);
     }
+    pthread_mutex_unlock(&vfu_ctx->irqs->lock);
 }
 
 static void
@@ -243,13 +247,15 @@ irqs_set_data_eventfd(vfu_ctx_t *vfu_ctx, struct vfio_irq_set *irq_set,
     for (i = irq_set->start, j = 0; i < (irq_set->start + irq_set->count);
          i++, j++) {
         efd = irqs_get_efd(vfu_ctx, irq_set->index, i);
-        close_safely(efd);
         assert(data[j] >= 0);
         /*
          * We've already checked in handle_device_set_irqs that
          * nr_fds == irq_set->count.
          */
+        pthread_mutex_lock(&vfu_ctx->irqs->lock);
+        close_safely(efd);
         *efd = consume_fd(data, irq_set->count, j);
+        pthread_mutex_unlock(&vfu_ctx->irqs->lock);
         switch (irq_set->index) {
         case VFIO_PCI_ERR_IRQ_INDEX:
             vfu_log(vfu_ctx, LOG_DEBUG, "err fd=%d", *efd);
@@ -437,6 +443,7 @@ EXPORT int
 vfu_irq_trigger(vfu_ctx_t *vfu_ctx, uint32_t subindex)
 {
     eventfd_t val = 1;
+    int ret;
 
     assert(vfu_ctx != NULL);
 
@@ -444,12 +451,16 @@ vfu_irq_trigger(vfu_ctx_t *vfu_ctx, uint32_t subindex)
         return ERROR_INT(EINVAL);
     }
 
+    pthread_mutex_lock(&vfu_ctx->irqs->lock);
     if (vfu_ctx->irqs->efds[subindex] == -1) {
+        pthread_mutex_unlock(&vfu_ctx->irqs->lock);
         vfu_log(vfu_ctx, LOG_ERR, "no fd for interrupt %d", subindex);
         return ERROR_INT(ENOENT);
     }
+    ret = eventfd_write(vfu_ctx->irqs->efds[subindex], val);
+    pthread_mutex_unlock(&vfu_ctx->irqs->lock);
 
-    return eventfd_write(vfu_ctx->irqs->efds[subindex], val);
+    return ret;
 }
 
 /* ex: set tabstop=4 shiftwidth=4 softtabstop=4 expandtab: */

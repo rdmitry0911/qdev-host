@@ -343,6 +343,8 @@ typedef enum vfu_reset_type {
      * The vfio-user socket client connection was closed or reset. The attached
      * context is cleaned up after returning from the reset callback, and
      * vfu_attach_ctx() must be called to establish a new client.
+     * (qdev-host patch: DMA regions are still mapped during this callback;
+     * their dma_unregister callbacks follow it.)
      */
     VFU_RESET_LOST_CONN,
 
@@ -466,6 +468,12 @@ vfu_setup_device_reset_cb(vfu_ctx_t *vfu_ctx, vfu_reset_cb_t *reset);
  * @page_size: if @vaddr is non-NULL, page size of the mapping (e.g. 2MB)
  * @prot: if @vaddr is non-NULL, protection settings of the mapping as per
  *   mmap(2)
+ * @fd: (qdev-host patch) file descriptor backing the region, -1 if the client
+ *   passed none (message-based access). Owned by libvfio-user: regions backed
+ *   by the same open file share one de-duplicated descriptor, which is closed
+ *   only after the dma_unregister callback of the last such region returns.
+ *   Do not close it; dup() it to keep it longer.
+ * @fd_offset: (qdev-host patch) file offset in @fd that corresponds to @iova
  *
  * For a real example, using the gpio sample server, and a qemu configured to
  * use huge pages and share its memory:
@@ -496,7 +504,12 @@ typedef struct vfu_dma_info {
     struct iovec mapping;
     size_t page_size;
     uint32_t prot;
+    int fd;
+    uint64_t fd_offset;
 } vfu_dma_info_t;
+
+/* qdev-host patch: vfu_dma_info_t carries the backing fd and file offset. */
+#define VFU_DMA_INFO_HAS_FD 1
 
 /*
  * Called when a guest registers one of its DMA regions via a VFIO_USER_DMA_MAP
@@ -660,13 +673,23 @@ vfu_setup_device_migration_callbacks(vfu_ctx_t *vfu_ctx,
  * libvfio-user takes care of using the correct IRQ type (IRQ index: INTx or
  * MSI/X), the caller only needs to specify the sub-index.
  *
+ * (qdev-host patch) Unlike the rest of the API, this function may be called
+ * from any thread once the context is realized: the eventfd lookup and write
+ * are serialised with an internal lock against VFIO_USER_DEVICE_SET_IRQS and
+ * context reset, which replace or close the eventfds. The lock is never held
+ * across a callback.
+ *
  * @vfu_ctx: the libvfio-user context to trigger interrupt
  * @subindex: vector subindex to trigger interrupt on
  *
- * @returns 0 on success, or -1 on failure. Sets errno.
+ * @returns 0 on success, or -1 on failure. Sets errno: EINVAL for a bad
+ * subindex, ENOENT when the client has not set an eventfd for it.
  */
 int
 vfu_irq_trigger(vfu_ctx_t *vfu_ctx, uint32_t subindex);
+
+/* qdev-host patch: vfu_irq_trigger() is thread-safe (see above). */
+#define VFU_IRQ_TRIGGER_THREAD_SAFE 1
 
 /**
  * Takes a guest physical address range and populates an array of scatter/gather

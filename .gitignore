@@ -1,6 +1,7 @@
 qdev-host
 plugins/*.so
 plugins/*/*.so
+plugins/apple-pvg/selftest
 dbus/dbus-display1.c
 dbus/dbus-display1.h
 results/
@@ -16,3 +17,5 @@ debian/*.debhelper*
 debian/*.substvars
 debian/files
 debian/debhelper-build-stamp
+build/
+tools/vfu-test-client

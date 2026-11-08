@@ -34,6 +34,7 @@
 #define LIB_VFIO_USER_PRIVATE_H
 
 #include <errno.h>
+#include <pthread.h>
 #include <sys/queue.h>
 
 #include "common.h"
@@ -94,6 +95,7 @@ typedef struct {
     int         err_efd;    /* eventfd for irq err */
     int         req_efd;    /* eventfd for irq req */
     uint32_t    max_ivs;    /* maximum number of ivs supported */
+    pthread_mutex_t lock;   /* efds[] changes vs. vfu_irq_trigger() (qdev-host) */
     int         efds[0];    /* must be last */
 } vfu_irqs_t;
 

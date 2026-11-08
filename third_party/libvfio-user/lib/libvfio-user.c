@@ -1792,6 +1792,7 @@ vfu_realize_ctx(vfu_ctx_t *vfu_ctx)
         vfu_ctx->irqs->err_efd = -1;
         vfu_ctx->irqs->req_efd = -1;
         vfu_ctx->irqs->max_ivs = max_ivs;
+        pthread_mutex_init(&vfu_ctx->irqs->lock, NULL);
 
         // Reflect on the config space whether INTX is available.
         if (vfu_ctx->irq_count[VFU_DEV_INTX_IRQ] != 0) {
@@ -1834,13 +1835,19 @@ free_sparse_mmap_areas(vfu_ctx_t *vfu_ctx)
 static void
 vfu_reset_ctx_quiesced(vfu_ctx_t *vfu_ctx)
 {
+    /*
+     * qdev-host patch: the reset callback runs before the DMA regions are
+     * removed, so the device can finish or cancel work on guest memory while
+     * it is still mapped; the dma_unregister callbacks follow.
+     *
+     * FIXME what happens if the device reset callback fails?
+     */
+    device_reset(vfu_ctx, VFU_RESET_LOST_CONN);
+
     if (vfu_ctx->dma != NULL) {
         dma_controller_remove_all_regions(vfu_ctx->dma, vfu_ctx->dma_unregister,
                                           vfu_ctx);
     }
-
-    /* FIXME what happens if the device reset callback fails? */
-    device_reset(vfu_ctx, VFU_RESET_LOST_CONN);
 
     if (vfu_ctx->irqs != NULL) {
         irqs_reset(vfu_ctx);
@@ -1898,6 +1905,9 @@ vfu_destroy_ctx(vfu_ctx_t *vfu_ctx)
     free_sparse_mmap_areas(vfu_ctx);
     free_regions(vfu_ctx);
     free(vfu_ctx->migration);
+    if (vfu_ctx->irqs != NULL) {
+        pthread_mutex_destroy(&vfu_ctx->irqs->lock);
+    }
     free(vfu_ctx->irqs);
     free(vfu_ctx->uuid);
     free(vfu_ctx);
