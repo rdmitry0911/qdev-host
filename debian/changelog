@@ -1,3 +1,28 @@
+qdev-host (0.5.2) unstable; urgency=medium
+
+  * Hardware panel behind QSM Direct's TCP 8006 gateway: one failed or
+    timed-out request, or an error page of HAProxy, no longer moves the page
+    to the service's own port 8017, where the browser had often not accepted
+    the certificate and the row asked to accept it. Only pveproxy answering
+    /qdev-host/ (a gateway without the route) does; other failures are
+    retried once and the next refresh uses the gateway again. The error row
+    says which way failed, the hint about the certificate is shown only for
+    port 8017, and failed requests are logged to the browser console.
+  * The node service marks its answers with X-QDev-Host and exposes Server
+    and X-QDev-Host to the panel on port 8017 too.
+  * The panel's GET reads the VM config from pmxcfs (pending changes applied,
+    as qm config prints it) and the running state from the pid file, as
+    qemu-server does, instead of starting qm twice: about 0.2 s instead of
+    1.3 s per refresh. Changes still go through qm.
+  * qdev-host: plugin ABI v2 host side (guest RAM regions with fd/offset,
+    quiesce/resume, host services from plugin threads, plugin damage, cursor
+    plane, QDP_RESET_EXIT), the vendored libvfio-user with the patches it
+    needs, --control socket, --qemu-qmp input relay, NOFILE limit as QEMU.
+    v1 plugins (tb-vga) are unchanged. The apple-pvg plugin is in the source
+    tree and needs QMetal (QMETAL_INCLUDE); it is not in this package.
+
+ -- Dmitry R <rdmitry0911@gmail.com>  Sun, 08 Nov 2026 23:00:00 +0200
+
 qdev-host (0.5.1) unstable; urgency=medium
 
   * virgl-gpu on NVIDIA: the GPU unit allows /dev/nvidia*, which NVIDIA's EGL

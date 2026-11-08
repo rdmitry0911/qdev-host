@@ -126,9 +126,19 @@ Device* and *Remove*. Two parts, modelled on QSM Direct's PVE integration:
    applied by a dpkg trigger without a pveproxy restart. The panel sees the
    gateway in `window.QSM_DIRECT_ENDPOINT` and uses that same-origin path, so a
    browser that reaches only the forwarded port 8006 needs neither port 8017 nor
-   a certificate exception. When the reply does not come from the service (an
-   older gateway without the route), it falls back to port 8017.
-   `qsm-pve-direct-gateway routes` lists what is published.
+   a certificate exception. Only when pveproxy itself answers that path (an
+   older gateway without the route) does the panel use port 8017 for the rest
+   of the page's life. A failed or timed-out request, or an error page of
+   HAProxy, is retried once and reported in the row; the next refresh uses the
+   gateway again (before 0.5.2 one such failure moved the page to port 8017,
+   where the browser had often not accepted the certificate). The service
+   marks its answers with `X-QDev-Host: 1`; the panel logs failed requests to
+   the browser console (`qdev-host: ...`). `qsm-pve-direct-gateway routes`
+   lists what is published.
+
+   The panel's GET reads the VM config from `/etc/pve/qemu-server/VMID.conf`
+   (pending changes applied, as `qm config` prints it) and the running state
+   from the pid file, as qemu-server does; changes still go through `qm set`.
 
    | Method | Path | Action |
    |---|---|---|
@@ -156,12 +166,17 @@ argument fields.
 
 Troubleshooting:
 
-- The row says *node service unreachable*: the browser has not accepted the
-  node certificate on port 8017 yet; the row links to `https://NODE:8017/`,
-  open it once, then reload the UI. Also check `systemctl status qdev-host-api`.
-  On a node behind the QSM gateway the browser may not reach 8017 at all:
-  check `qsm-pve-direct-gateway routes` (empty = the gateway is older than
-  exp230 or the route was not applied: `qsm-pve-direct-gateway refresh`).
+- The row says *node service did not answer at https://NODE:8017*: the
+  browser has not accepted the node certificate on port 8017 yet; the row
+  links to `https://NODE:8017/`, open it once, then reload the UI. Also check
+  `systemctl status qdev-host-api`.
+- The row says *did not answer through the TCP 8006 gateway*: the page's own
+  certificate is used, nothing to accept. Check `systemctl status
+  qdev-host-api` and `qsm-pve-direct-gateway routes`; the browser console
+  shows the failed request. If the panel moved to port 8017 on a gateway
+  node, `qsm-pve-direct-gateway routes` is probably empty (the gateway is
+  older than exp230 or the route was not applied: `qsm-pve-direct-gateway
+  refresh`).
 - No qdev-host entries at all: `pve-ui-overlays status`;
   `disabled-unsupported-pve` after a PVE upgrade means the new `pve-manager`
   is not in the allow-list yet (review the template, add the row printed by

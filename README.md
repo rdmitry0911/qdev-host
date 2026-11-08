@@ -395,12 +395,14 @@ Direct's structural pattern:
   with `path=/vms/VMID` and `privs=VM.Config.HWType`, and additionally requires
   the confirmed user to be in `/etc/qdev-host/ui.json` (`root@pam` by default,
   because the operations edit the VM's `args`, which PVE reserves to root).
-  The browser must trust the certificate on port 8017 once (the panel shows a
-  link when the service is unreachable).
+  Without the gateway the browser must trust the certificate on port 8017
+  once (the panel shows a link when the service does not answer).
 - On a node behind QSM Direct's TCP 8006 gateway (exp230 or later) the
   package's route publishes the service as `https://NODE:8006/qdev-host/`, and
   the panel uses that same origin: a browser that reaches only port 8006 needs
-  no TCP 8017 ([details](pve/README.md)).
+  no TCP 8017. It goes to port 8017 only when pveproxy answers that path (a
+  gateway without the route), not after a failed request
+  ([details](pve/README.md)).
 
 Details in [pve/README.md](pve/README.md). Verified on a PVE 9.2.21 node
 (pve-qemu-kvm 11.0.3, qemu-server 9.2.11, qsm-pve-direct installed, in both

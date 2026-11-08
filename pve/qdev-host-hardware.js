@@ -19,9 +19,13 @@
 
     // Behind QSM Direct's TCP 8006 gateway (qsm-pve-direct-gateway from exp230) the
     // node service is published under /qdev-host/ of the page's own origin, so a
-    // browser that reaches only port 8006 can use it.  An older gateway lacks the
-    // route: then pveproxy or HAProxy answers instead of the service, and the
-    // panel falls back to the service's own port for the rest of the page's life.
+    // browser that reaches only port 8006 can use it, with the certificate it has
+    // already accepted for the page.  Only one answer means the gateway has no
+    // such route: pveproxy itself answering the path (an older gateway passes
+    // every path to it).  Then the panel uses the service's own port for the rest
+    // of the page's life.  A failed or timed-out request, or an error page of
+    // HAProxy (it sends no Server header), says nothing about the route: the
+    // request is retried once and the next refresh uses the gateway again.
     const GATEWAY_PREFIX = '/qdev-host';
     let viaGateway = !!(typeof window !== 'undefined' && window.QSM_DIRECT_ENDPOINT && window.QSM_DIRECT_ENDPOINT.gateway);
     const portOrigin = () => {
@@ -30,7 +34,12 @@
         return address.origin;
     };
     const serviceOrigin = () => (viaGateway ? `${location.origin}${GATEWAY_PREFIX}` : portOrigin());
-    const fromService = (response) => !!response && /^qdev-host-api\b/.test(response.headers.get('Server') || '');
+    const serverOf = (response) => (response && response.headers.get('Server')) || '';
+    const fromService = (response) => !!response
+        && (/^qdev-host-api\b/.test(serverOf(response)) || response.headers.get('X-QDev-Host') === '1');
+    // pveproxy (Server: pve-api-daemon/...) or another web server answered instead of the service
+    const otherServer = (response) => !!response && !fromService(response) && serverOf(response) !== '';
+    const warn = (...args) => { if (typeof console !== 'undefined') { console.warn('qdev-host:', ...args); } };
     const request = async (method, path, params) => {
         const cookieName = (Proxmox.Setup && Proxmox.Setup.auth_cookie_name) || 'PVEAuthCookie';
         const ticket = Ext.util.Cookies.get(cookieName);
@@ -46,17 +55,43 @@
             }
             return value;
         };
-        const send = () => fetch(`${serviceOrigin()}${path}`, options()).catch(() => null);
+        // Set when no answer of the service came back: a network error, a timeout, or,
+        // through the gateway, a reply of pveproxy or HAProxy.  On the service's own
+        // port only the service can answer (and its Server header is not visible to a
+        // cross-origin script anyway).
+        let failure = null;
+        const TIMEOUT = 'no answer in time';
+        const send = async () => {
+            const gateway = viaGateway;
+            const url = `${serviceOrigin()}${path}`;
+            failure = null;
+            try {
+                const response = await fetch(url, options());
+                if (gateway && !fromService(response)) {
+                    failure = `HTTP ${response.status}${serverOf(response) ? ` from ${serverOf(response)}` : ''}`;
+                    warn(`${method} ${url}: the node service did not answer (${failure})`);
+                }
+                return response;
+            } catch (error) {
+                failure = error && error.name === 'TimeoutError' ? TIMEOUT : String((error && error.message) || error);
+                warn(`${method} ${url}: ${failure}`);
+                return null;
+            }
+        };
         let response = await send();
-        // Retry on the port only when the service cannot have seen the request:
-        // another server answered, or a read failed before any reply.
-        if (viaGateway && !fromService(response) && (response || method === 'GET')) {
+        if (viaGateway && otherServer(response)) {
+            // the gateway has no /qdev-host/ route, so the service has not seen the request
+            warn(`the TCP 8006 gateway has no ${GATEWAY_PREFIX}/ route; using ${portOrigin()} from now on`);
             viaGateway = false;
             response = await send();
+        } else if (method === 'GET' && failure && failure !== TIMEOUT) {
+            response = await send(); // a dropped connection or a passing gateway error
         }
-        if (!response) {
-            const error = new Error(`qdev-host node service at ${serviceOrigin()} is unreachable`);
+        if (failure) {
+            const where = viaGateway ? `through the TCP 8006 gateway (${serviceOrigin()})` : `at ${serviceOrigin()}`;
+            const error = new Error(`qdev-host node service did not answer ${where}: ${failure}`);
             error.unreachable = true;
+            error.viaGateway = viaGateway;
             throw error;
         }
         const body = await response.json().catch(() => ({}));
@@ -308,8 +343,11 @@
                     me.rows[ERROR_KEY] = {
                         group: GROUP, header: 'qdev-host', iconCls: 'exclamation-triangle', never_delete: true,
                         renderer: (value, metaData) => {
-                            if (me.qdevUnreachable) {
-                                metaData.tdAttr = `data-qtip="${Ext.htmlEncode('Open ' + serviceOrigin() + '/ once to accept the node certificate, then reload this page')}"`;
+                            if (me.qdevUnreachable && me.qdevUnreachableViaGateway) {
+                                // the page's own origin and certificate: nothing to accept in the browser
+                                metaData.tdAttr = `data-qtip="${Ext.htmlEncode('Retried at the next refresh. On the node: systemctl status qdev-host-api; qsm-pve-direct-gateway routes')}"`;
+                            } else if (me.qdevUnreachable) {
+                                metaData.tdAttr = `data-qtip="${Ext.htmlEncode('If the browser does not trust the certificate of ' + serviceOrigin() + ', open it once to accept it, then reload this page')}"`;
                                 return `${Ext.htmlEncode(value)} — <a href="${Ext.htmlEncode(serviceOrigin())}/" target="_blank" rel="noopener">${gettext('open')} ${Ext.htmlEncode(serviceOrigin())}</a>`;
                             }
                             return Ext.htmlEncode(value);
@@ -328,6 +366,7 @@
                 }).catch((error) => {
                     me.qdevInfo = null;
                     me.qdevUnreachable = !!error.unreachable;
+                    me.qdevUnreachableViaGateway = !!error.viaGateway;
                     me.qdevError = error.message;
                 }).finally(() => {
                     inflight = null;

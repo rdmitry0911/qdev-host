@@ -214,6 +214,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-QDev-User")
         self.send_header("Access-Control-Max-Age", "600")
+        self.send_header("Access-Control-Expose-Headers", "Server, X-QDev-Host")
 
     def _send(self, status: int, payload: dict[str, Any] | None = None, raw: bytes | None = None,
               ctype: str = "application/json") -> None:
@@ -223,6 +224,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-QDev-Host", "1")  # the panel tells this service from pveproxy and HAProxy by it
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(data)

@@ -132,9 +132,49 @@ def check_editable(vmid: int) -> None:
         raise QdevError(f"VM {vmid} has settings this node's qemu-server cannot read ({', '.join(keys)}); "
                         "saving its configuration would drop them, so qdev-host leaves the VM unchanged")
 
+def read_vm_config(vmid: int) -> dict[str, str]:
+    """The VM's config as `qm config` prints it (pending changes applied), read
+    from pmxcfs without starting qm, which costs about 0.6 s of perl per call.
+    For the panel's frequent reads; changes still go through qm."""
+    try:
+        text = Path(f"/etc/pve/qemu-server/{vmid}.conf").read_text()
+    except (OSError, UnicodeDecodeError):
+        return vm_config(vmid)
+    current: dict[str, str] = {}
+    pending: dict[str, str] = {}
+    section: dict[str, str] | None = current
+    for line in text.splitlines():
+        if line.startswith("["):
+            section = pending if line.strip() == "[PENDING]" else None  # snapshots are not the VM's config
+            continue
+        if section is None or line.startswith("#") or ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        section[k.strip()] = v.strip()
+    deleted = pending.pop("delete", "")
+    current.update(pending)
+    for key in deleted.split(","):
+        current.pop(key.strip().lstrip("!"), None)
+    return current
+
 def vm_running(vmid: int) -> bool:
-    r = run(["qm", "status", str(vmid)])
-    return "running" in r.stdout
+    """`qm status` = running, checked as qemu-server's vm_running_locally does:
+    the pid file names a live, non-zombie process started with that pid file."""
+    pidfile = f"/var/run/qemu-server/{vmid}.pid"
+    try:
+        pid = int(Path(pidfile).read_text().strip())
+        args = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except (OSError, ValueError):
+        return False
+    try:
+        i = args.index(b"-pidfile")
+    except ValueError:
+        return False
+    if i + 1 >= len(args) or args[i + 1].decode(errors="replace") != pidfile:
+        return False
+    state = stat.rsplit(")", 1)[-1].split()
+    return bool(state) and state[0] != "Z"
 
 def qm_set(vmid: int, key: str, value: str | None) -> None:
     if value is None or value == "":
@@ -780,7 +820,7 @@ def describe_vm(vmid: int) -> dict:
     if node and node != me:
         return {"vmid": vmid, "node": node, "local": False, "devices": []}
     conf = load_conf(vmid)
-    cfg = vm_config(vmid)
+    cfg = read_vm_config(vmid)
     running = vm_running(vmid)
     present: dict[str, str] = {}
     buses: set[str] = set()
