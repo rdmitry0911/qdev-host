@@ -6,8 +6,11 @@
  *        * org.qemu.Display1 (p2p server socket and/or message bus, bus name
  *          org.qemu): what QSM Direct / qemu-display-probe connect to, exactly
  *          like a QEMU started with -display dbus
- *        * PPM dump on SIGUSR1
- *        * (planned) DRM/KMS: a real monitor as the output of the guest device
+ *        * PPM dump on SIGUSR1 and on request over the control socket (--control)
+ *        * DRM/KMS: a real monitor as the output of the guest device
+ *   ABI v2 plugins (GPUs) also get guest RAM regions with fd/offset, a quiesce
+ *   before map changes, and host services callable from their own threads
+ *   (IRQ trigger, frame-ready with damage, cursor, log).
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -22,6 +25,12 @@
 #include <sys/mman.h>
 #include <time.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/eventfd.h>
+#include <inttypes.h>
+#include <stdarg.h>
+#include <pthread.h>
 #include <glib.h>
 #include <glib-unix.h>
 #include <gio/gio.h>
@@ -37,7 +46,7 @@
 static struct {
     const char *plugin, *socket, *plugin_args, *display_p2p, *display_bus,
                *display_name, *vm_name, *dump_dir, *kms, *on_connect, *on_disconnect,
-               *qemu_display, *qemu_display_dest, *head_origin, *desktop;
+               *qemu_display, *qemu_display_dest, *head_origin, *desktop, *control;
     int fps, idle_fps, idle_after, qemu_console, stats_interval;
     bool verbose, kms_copy;
 } opt = { .display_name = "org.qemu", .vm_name = "qdev-host", .dump_dir = ".", .fps = 30,
@@ -52,19 +61,155 @@ static double now_s(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t
 #define DBG(...) do { if (opt.verbose) LOG(__VA_ARGS__); } while (0)
 
 /* ------------------------------------------------------- plugin + vfio-user */
+#if !defined(VFU_DMA_INFO_HAS_FD) || !defined(VFU_IRQ_TRIGGER_THREAD_SAFE)
+#error "qdev-host needs the patched libvfio-user of third_party/libvfio-user (make vfu)"
+#endif
 static vfu_ctx_t *vfu;
 static const qdp_device_ops *ops;
 static void *priv;
 static bool attached;
 static guint vfu_watch;
+static int vfu_realized;          /* atomic: vfu_irq_trigger() is usable from plugin threads */
+
+/* v2 fields of the plugin, copied at load time; all zero for a v1 plugin, whose
+ * qdp_device_ops ends at get_scanout and must not be read beyond it */
+static uint32_t abi;
+static struct {
+    uint32_t flags;
+    int  (*quiesce)(void *);
+    void (*resume)(void *);
+    void (*dma_register)(void *, const qdp_dma_region *);
+    void (*dma_unregister)(void *, const qdp_dma_region *);
+    bool (*get_cursor)(void *, qdp_cursor *);
+} v2;
+#define PLUGIN_DAMAGE (v2.flags & QDP_F_PLUGIN_DAMAGE)
+
+/* counters shown by SIGUSR2/--stats-interval and the control socket "stats";
+ * the irq ones are bumped from plugin threads (atomics) */
+static struct { uint64_t irq_ok, irq_drop, frame_calls, frames, cursor_calls, cursor_sent, quiesce, dma_maps, dma_unmaps; } hstat;
 
 static int reset_cb(vfu_ctx_t *c, vfu_reset_type_t t)
 {
     DBG("device reset (type %d)", t);
     return ops->reset ? ops->reset(priv, t) : 0;
 }
-static void dma_register(vfu_ctx_t *c, vfu_dma_info_t *i) {}
-static void dma_unregister(vfu_ctx_t *c, vfu_dma_info_t *i) {}
+
+/* Guest RAM regions (v2): libvfio-user calls these on the main loop for every
+ * DMA_MAP/DMA_UNMAP and for each region still mapped when the client goes away.
+ * The identical re-map of a region already mapped is not forwarded again, so the
+ * plugin sees one register and one unregister per region. */
+static GHashTable *dma_map;       /* &region->iova -> qdp_dma_region*, regions known to the plugin */
+static uint64_t dma_bytes;
+static void dma_register(vfu_ctx_t *c, vfu_dma_info_t *i)
+{
+    if (abi < 2) return;
+    uint64_t iova = (uintptr_t)i->iova.iov_base;
+    if (g_hash_table_lookup(dma_map, &iova)) { DBG("dma: identical re-map of 0x%" PRIx64 " not forwarded", iova); return; }
+    qdp_dma_region *r = g_new0(qdp_dma_region, 1);
+    *r = (qdp_dma_region){ .iova = iova, .len = i->iova.iov_len, .vaddr = i->vaddr, .fd = i->fd,
+                           .fd_offset = i->fd_offset, .prot = i->prot };
+    g_hash_table_insert(dma_map, &r->iova, r);
+    dma_bytes += r->len; hstat.dma_maps++;
+    DBG("dma map iova 0x%" PRIx64 " len 0x%" PRIx64 " fd %d offset 0x%" PRIx64 " vaddr %p prot %x",
+        r->iova, r->len, r->fd, r->fd_offset, r->vaddr, r->prot);
+    if (v2.dma_register) v2.dma_register(priv, r);
+}
+static void dma_unregister(vfu_ctx_t *c, vfu_dma_info_t *i)
+{
+    if (abi < 2) return;
+    uint64_t iova = (uintptr_t)i->iova.iov_base;
+    qdp_dma_region *r = g_hash_table_lookup(dma_map, &iova);
+    if (!r) return;
+    DBG("dma unmap iova 0x%" PRIx64 " len 0x%" PRIx64, r->iova, r->len);
+    if (v2.dma_unregister) v2.dma_unregister(priv, r);    /* fd and vaddr stay valid until this returns */
+    dma_bytes -= r->len; hstat.dma_unmaps++;
+    g_hash_table_remove(dma_map, &iova);
+}
+
+/* Quiesce (v2 plugins with a quiesce op). libvfio-user asks before every
+ * DMA_MAP, DMA_UNMAP, device reset (also FLR) and before dropping a lost
+ * client. The plugin's quiesce is synchronous; resume() follows once
+ * vfu_run_ctx() has handled the request. A refusal fails the client request
+ * (it must not be EBUSY, which would mean "asynchronous" to libvfio-user). */
+static bool plugin_quiesced;
+static int quiesce_cb(vfu_ctx_t *c)
+{
+    if (plugin_quiesced) return 0;           /* a reset after a failed reply, same request */
+    int r = v2.quiesce(priv);
+    if (r < 0) { LOG("plugin refused to quiesce: %s", strerror(-r)); errno = r == -EBUSY ? EAGAIN : -r; return -1; }
+    plugin_quiesced = true; hstat.quiesce++;
+    return 0;
+}
+static void plugin_resume(void)
+{
+    if (!plugin_quiesced) return;
+    plugin_quiesced = false;
+    if (v2.resume) v2.resume(priv);
+}
+
+/* ----------------------------------------------- host services (ABI v2)
+ * Called from any plugin thread. irq_trigger goes straight to the eventfd
+ * (vfu_irq_trigger is thread-safe in the vendored libvfio-user and never waits
+ * for the main loop). frame_ready/cursor_changed record what changed under
+ * hs_lock and wake the main loop through an eventfd, once per batch. */
+static int wake_fd = -1;
+static pthread_mutex_t hs_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct {                     /* under hs_lock */
+    bool frame, cursor, full;
+    uint64_t seq;
+    uint32_t x0, y0, x1, y1;        /* union of the damage since the last batch */
+} hs;
+
+static void wake_main(void) { uint64_t one = 1; if (write(wake_fd, &one, sizeof(one)) < 0 && errno != EAGAIN) LOG("wake: %s", strerror(errno)); }
+
+static int host_irq_trigger(void *h, uint32_t subindex)
+{
+    if (!__atomic_load_n(&vfu_realized, __ATOMIC_ACQUIRE)) return -EINVAL;
+    if (vfu_irq_trigger(vfu, subindex) < 0) {
+        int e = errno;
+        __atomic_add_fetch(&hstat.irq_drop, 1, __ATOMIC_RELAXED);
+        return e == ENOENT ? -EINVAL : -e;  /* ENOENT: the client set no eventfd, i.e. not enabled */
+    }
+    __atomic_add_fetch(&hstat.irq_ok, 1, __ATOMIC_RELAXED);
+    return 0;
+}
+
+static void host_frame_ready(void *h, const qdp_frame_info *f)
+{
+    pthread_mutex_lock(&hs_lock);
+    bool kick = !hs.frame && !hs.cursor;
+    if (f->w == 0 || f->h == 0) hs.full = true;
+    else if (!hs.frame) { hs.x0 = f->x; hs.y0 = f->y; hs.x1 = f->x + f->w; hs.y1 = f->y + f->h; }
+    else { hs.x0 = MIN(hs.x0, f->x); hs.y0 = MIN(hs.y0, f->y); hs.x1 = MAX(hs.x1, f->x + f->w); hs.y1 = MAX(hs.y1, f->y + f->h); }
+    hs.seq = f->seq; hs.frame = true; __atomic_add_fetch(&hstat.frame_calls, 1, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&hs_lock);
+    if (kick) wake_main();
+}
+
+static void host_cursor_changed(void *h)
+{
+    pthread_mutex_lock(&hs_lock);
+    bool kick = !hs.frame && !hs.cursor;
+    hs.cursor = true; __atomic_add_fetch(&hstat.cursor_calls, 1, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&hs_lock);
+    if (kick) wake_main();
+}
+
+static void host_log(void *h, int level, const char *fmt, ...)
+{
+    static const char *pfx[] = { "error: ", "warning: ", "", "debug: " };
+    if (level >= 3 && !opt.verbose) return;
+    char buf[1024]; va_list ap;
+    va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+    size_t n = strlen(buf); while (n && buf[n - 1] == '\n') buf[--n] = 0;
+    fprintf(stderr, "qdev-host: %s: %s%s\n", ops->name, pfx[level < 0 ? 0 : level > 3 ? 3 : level], buf);   /* one call: one line */
+}
+
+static int host_token;
+static const qdp_host_ops host_ops = {
+    .size = sizeof(qdp_host_ops), .host = &host_token, .irq_trigger = host_irq_trigger,
+    .frame_ready = host_frame_ready, .cursor_changed = host_cursor_changed, .log = host_log,
+};
 
 static gboolean vfu_io_cb(gint fd, GIOCondition cond, gpointer data)
 {
@@ -76,8 +221,13 @@ static gboolean vfu_io_cb(gint fd, GIOCondition cond, gpointer data)
         attached = true;
         LOG("client attached");
     } else {
-        if (vfu_run_ctx(vfu) < 0) {
+        int r = vfu_run_ctx(vfu), e = errno;
+        plugin_resume();                  /* the map change (or reset) of this request is done */
+        errno = e;
+        if (r < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return G_SOURCE_CONTINUE;
+            /* a v1 plugin's own asynchronous quiesce is pending: it calls vfu_device_quiesced() */
+            if (errno == EBUSY) return G_SOURCE_CONTINUE;
             if (errno != ENOTCONN) { LOG("vfu_run_ctx: %s", strerror(errno)); exit(1); }
             attached = false;
             LOG("client detached, device state kept, waiting for the next client");
@@ -97,10 +247,16 @@ static void load_plugin(void)
     qdp_plugin_v1_fn fn = (qdp_plugin_v1_fn)dlsym(h, QDP_PLUGIN_SYMBOL);
     if (!fn) { LOG("%s: no %s symbol", opt.plugin, QDP_PLUGIN_SYMBOL); exit(1); }
     ops = fn();
-    if (!ops || ops->abi_version != QDP_ABI_VERSION) {
-        LOG("%s: ABI %u, host wants %u", opt.plugin, ops ? ops->abi_version : 0, QDP_ABI_VERSION); exit(1);
+    if (!ops || ops->abi_version < QDP_ABI_VERSION_MIN || ops->abi_version > QDP_ABI_VERSION) {
+        LOG("%s: ABI %u, host supports %u..%u", opt.plugin, ops ? ops->abi_version : 0, QDP_ABI_VERSION_MIN, QDP_ABI_VERSION);
+        exit(1);
     }
-    LOG("plugin %s %s (ABI %u)", ops->name, ops->version, ops->abi_version);
+    abi = ops->abi_version;
+    if (abi >= 2) {
+        v2.flags = ops->flags; v2.quiesce = ops->quiesce; v2.resume = ops->resume;
+        v2.dma_register = ops->dma_register; v2.dma_unregister = ops->dma_unregister; v2.get_cursor = ops->get_cursor;
+    }
+    LOG("plugin %s %s (ABI %u%s)", ops->name, ops->version, abi, PLUGIN_DAMAGE ? ", plugin damage" : "");
 }
 
 static void setup_vfu(void)
@@ -110,13 +266,16 @@ static void setup_vfu(void)
     if (!vfu) { LOG("vfu_create_ctx %s: %s", opt.socket, strerror(errno)); exit(1); }
     qdp_host_env env = { .size = sizeof(env) };
     if (kms) env.edid = kms_edid(kms, &env.edid_len);
+    if (abi >= 2) env.host_ops = &host_ops;
     int r = ops->setup(vfu, opt.plugin_args, &env, &priv);
     if (r < 0) { LOG("plugin setup failed: %s", strerror(-r)); exit(1); }
     if (vfu_setup_device_reset_cb(vfu, reset_cb) < 0) { LOG("reset cb: %s", strerror(errno)); exit(1); }
     if (vfu_setup_device_dma(vfu, LIBVFIO_USER_MAX_DMA_REGIONS, dma_register, dma_unregister) < 0) {
         LOG("dma setup: %s", strerror(errno)); exit(1);
     }
+    if (v2.quiesce) vfu_setup_device_quiesce_cb(vfu, quiesce_cb);
     if (vfu_realize_ctx(vfu) < 0) { LOG("vfu_realize_ctx: %s", strerror(errno)); exit(1); }
+    __atomic_store_n(&vfu_realized, 1, __ATOMIC_RELEASE);
     vfu_watch = g_unix_fd_add(vfu_get_poll_fd(vfu), G_IO_IN, vfu_io_cb, NULL);
     LOG("vfio-user socket %s", opt.socket);
 }
@@ -136,10 +295,13 @@ static struct {
     uint8_t *map;           /* mapping of the framebuffer (page aligned base) */
     size_t   map_len;
     uint8_t *pix;           /* first pixel of the scanout */
-    uint8_t *shadow;        /* last pixels sent (width*4*height, packed) */
+    uint8_t *shadow;        /* last pixels sent (width*4*height, packed); none with plugin damage */
     bool shadow_stale;
     GPtrArray *sinks;
+    uint64_t seq;           /* last presented frame: the plugin's seq, or a count of damaged ticks */
 } disp;
+static void disp_presented(uint64_t seq);
+static bool ctl_shots_pending(void);
 
 static void disp_unmap(void)
 {
@@ -156,7 +318,7 @@ static bool disp_map(const qdp_scanout *s)
     uint8_t *m = mmap(NULL, len, PROT_READ, MAP_SHARED, s->fd, aligned);
     if (m == MAP_FAILED) { LOG("mmap scanout: %s", strerror(errno)); return false; }
     disp.map = m; disp.map_len = len; disp.pix = m + (s->offset - aligned);
-    disp.shadow = g_malloc0((size_t)s->width * 4 * s->height);
+    if (!PLUGIN_DAMAGE) disp.shadow = g_malloc0((size_t)s->width * 4 * s->height);
     return true;
 }
 
@@ -199,26 +361,45 @@ static void disp_notify_scanout(void)
     }
 }
 
+/* Take a new scanout from the plugin; on a mode change tell the sinks. Returns
+ * true when the mode changed (the next update must then cover everything). */
+static bool disp_set_mode(const qdp_scanout *now)
+{
+    if (!mode_changed(now, &disp.cur)) return false;
+    disp_unmap();
+    disp.cur = *now;
+    if (now->enabled && !disp_map(now)) disp.cur.enabled = false;
+    LOG("scanout %s %ux%u stride %u fmt 0x%x", disp.cur.enabled ? "on" : "off",
+        now->width, now->height, now->stride, now->pixman_format);
+    disp_notify_scanout();
+    return true;
+}
+
+static void disp_feed(int x, int y, int w, int h)
+{
+    for (guint i = 0; i < disp.sinks->len; i++) {
+        sink_t *s = g_ptr_array_index(disp.sinks, i);
+        if (s->update) s->update(s, x, y, w, h);
+    }
+}
+
+/* polling path (v1, and v2 without QDP_F_PLUGIN_DAMAGE): damage by comparison */
 static gboolean disp_tick(gpointer data)
 {
-    if (ops->tick) ops->tick(priv);
+    if (ops->tick && abi < 2) ops->tick(priv);    /* v1 hosts always ticked at the poll rate; v2 honours tick_ms */
     if (!ops->get_scanout) return G_SOURCE_CONTINUE;
     qdp_scanout now;
     if (!ops->get_scanout(priv, &now)) return G_SOURCE_CONTINUE;
-    if (mode_changed(&now, &disp.cur)) {
-        disp_unmap();
-        disp.cur = now;
-        if (now.enabled && !disp_map(&now)) disp.cur.enabled = false;
-        LOG("scanout %s %ux%u stride %u fmt 0x%x", disp.cur.enabled ? "on" : "off",
-            now.width, now.height, now.stride, now.pixman_format);
-        disp_notify_scanout();
+    if (disp_set_mode(&now)) {
         if (!disp.cur.enabled) return G_SOURCE_CONTINUE;
         /* first frame: everything is damage */
         memset(disp.shadow, 0xff, (size_t)now.width * 4 * now.height);
     }
     if (!disp.cur.enabled) return G_SOURCE_CONTINUE;
-    /* nobody needs damage rectangles: zero-copy KMS reads the memfd itself and no Display1 listener is attached */
-    if (listeners->len == 0 && (!kms || kms_zero_copy(kms))) { disp.shadow_stale = true; return G_SOURCE_CONTINUE; }
+    /* nobody needs damage rectangles: zero-copy KMS reads the memfd itself, no Display1 listener
+     * is attached and no screendump waits for a frame */
+    if (listeners->len == 0 && !ctl_shots_pending() && (!kms || kms_zero_copy(kms))) { disp.shadow_stale = true; return G_SOURCE_CONTINUE; }
+    bool baseline = disp.shadow_stale;   /* the shadow is old: this compare only refreshes it, it is no new frame */
     if (disp.shadow_stale) { memset(disp.shadow, 0xff, (size_t)disp.cur.width * 4 * disp.cur.height); disp.shadow_stale = false; }
     int x, y, w, h;
     double t0 = now_s();
@@ -227,10 +408,8 @@ static gboolean disp_tick(gpointer data)
     tstat.ticks++; tstat.cmp_sum += tc; if (tc > tstat.cmp_max) tstat.cmp_max = tc;
     if (dmg) {
         tstat.damaged++; last_damage_t = t0;
-        for (guint i = 0; i < disp.sinks->len; i++) {
-            sink_t *s = g_ptr_array_index(disp.sinks, i);
-            if (s->update) s->update(s, x, y, w, h);
-        }
+        disp_feed(x, y, w, h);
+        if (!baseline) disp_presented(disp.seq + 1);
     }
     /* adaptive polling: drop to --idle-fps after --idle-after seconds without damage */
     if (opt.idle_fps > 0 && opt.idle_fps < opt.fps) {
@@ -245,6 +424,24 @@ static gboolean disp_tick(gpointer data)
     return G_SOURCE_CONTINUE;
 }
 
+/* plugin damage path (QDP_F_PLUGIN_DAMAGE): one batch of frame_ready() calls */
+static void disp_frame(uint64_t seq, bool full, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1)
+{
+    qdp_scanout now;
+    hstat.frames++;
+    if (!ops->get_scanout || !ops->get_scanout(priv, &now)) return;
+    if (disp_set_mode(&now)) full = true;
+    if (!disp.cur.enabled) return;
+    uint32_t W = disp.cur.width, H = disp.cur.height;
+    if (full) { x0 = 0; y0 = 0; x1 = W; y1 = H; }
+    x1 = MIN(x1, W); y1 = MIN(y1, H);
+    if (x0 < x1 && y0 < y1) disp_feed(x0, y0, x1 - x0, y1 - y0);
+    disp_presented(seq);
+}
+
+/* v2: plugin tick at its own tick_ms */
+static gboolean plugin_tick(gpointer data) { ops->tick(priv); return G_SOURCE_CONTINUE; }
+
 static void print_stats(bool reset)
 {
     struct rusage ru; getrusage(RUSAGE_SELF, &ru);
@@ -252,6 +449,11 @@ static void print_stats(bool reset)
         (unsigned long long)tstat.ticks, (unsigned long long)tstat.damaged, poll_idle ? opt.idle_fps : opt.fps,
         tstat.ticks ? tstat.cmp_sum / tstat.ticks * 1e3 : 0.0, tstat.cmp_max * 1e3,
         ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6, ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6);
+    if (abi >= 2)
+        LOG("stats: v2: frames %" PRIu64 " (frame_ready %" PRIu64 "), seq %" PRIu64 ", irqs %" PRIu64 " (dropped %" PRIu64 "), dma %u regions %" PRIu64 " MiB, quiesce %" PRIu64 ", cursor %" PRIu64 "/%" PRIu64,
+            hstat.frames, __atomic_load_n(&hstat.frame_calls, __ATOMIC_RELAXED), disp.seq,
+            __atomic_load_n(&hstat.irq_ok, __ATOMIC_RELAXED), __atomic_load_n(&hstat.irq_drop, __ATOMIC_RELAXED),
+            g_hash_table_size(dma_map), dma_bytes >> 20, hstat.quiesce, hstat.cursor_sent, __atomic_load_n(&hstat.cursor_calls, __ATOMIC_RELAXED));
     if (kms) kms_stats(kms, stderr, reset);
     if (reset) memset(&tstat, 0, sizeof(tstat));
 }
@@ -281,23 +483,56 @@ static gboolean kms_hotplug_poll(gpointer data)
     g_strlcpy(last, st, sizeof(last));
     return G_SOURCE_CONTINUE;
 }
-static gboolean on_term(gpointer data) { LOG("terminating"); if (kms) kms_close(kms); kms = NULL; exit(0); }
+static gboolean on_term(gpointer data)
+{
+    LOG("terminating");
+    if (kms) kms_close(kms);
+    kms = NULL;
+    if (ops && ops->teardown) ops->teardown(priv);    /* stops plugin threads: no host service is called after this */
+    exit(0);
+}
 
 /* --------------------------------------------------------------- PPM sink */
 static unsigned dump_count;
+/* Write the current scanout as binary PPM (P6), through FILE.tmp + rename so a
+ * reader never sees a partial file. 32 bpp pixman formats of type ARGB, ABGR,
+ * BGRA and RGBA (alpha/padding ignored). */
+static bool write_ppm(const char *path)
+{
+    const qdp_scanout *s = &disp.cur;
+    if (!s->enabled || !disp.pix) { errno = ENODATA; return false; }
+    uint32_t type = (s->pixman_format >> 16) & 0xff;
+    int rs, gs, bs;
+    switch (type) {
+    case 2: rs = 16; gs = 8; bs = 0; break;      /* ARGB: x8r8g8b8, a8r8g8b8 */
+    case 3: rs = 0; gs = 8; bs = 16; break;      /* ABGR */
+    case 8: rs = 8; gs = 16; bs = 24; break;     /* BGRA */
+    case 9: rs = 24; gs = 16; bs = 8; break;     /* RGBA */
+    default: errno = ENOTSUP; return false;
+    }
+    if ((s->pixman_format >> 24) != 32) { errno = ENOTSUP; return false; }
+    g_autofree char *tmp = g_strdup_printf("%s.tmp", path);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return false;
+    fprintf(f, "P6\n%u %u\n255\n", s->width, s->height);
+    g_autofree uint8_t *row = g_malloc((size_t)s->width * 3);
+    for (uint32_t y = 0; y < s->height; y++) {
+        const uint32_t *px = (const uint32_t *)(disp.pix + (size_t)y * s->stride);
+        for (uint32_t x = 0; x < s->width; x++) {
+            uint32_t v = px[x];
+            row[x * 3] = v >> rs; row[x * 3 + 1] = v >> gs; row[x * 3 + 2] = v >> bs;
+        }
+        fwrite(row, 3, s->width, f);
+    }
+    if (fclose(f) != 0 || rename(tmp, path) != 0) { int e = errno; unlink(tmp); errno = e; return false; }
+    return true;
+}
 static void dump_ppm(void)
 {
     const qdp_scanout *s = &disp.cur;
     if (!s->enabled) { LOG("dump: scanout disabled"); return; }
     g_autofree char *name = g_strdup_printf("%s/qdev-fb-%u.ppm", opt.dump_dir, dump_count++);
-    FILE *f = fopen(name, "wb");
-    if (!f) { LOG("dump: %s: %s", name, strerror(errno)); return; }
-    fprintf(f, "P6\n%u %u\n255\n", s->width, s->height);
-    for (uint32_t y = 0; y < s->height; y++) {
-        const uint8_t *row = disp.pix + (size_t)y * s->stride;
-        for (uint32_t x = 0; x < s->width; x++) { fputc(row[x*4+2], f); fputc(row[x*4+1], f); fputc(row[x*4], f); }
-    }
-    fclose(f);
+    if (!write_ppm(name)) { LOG("dump: %s: %s", name, strerror(errno)); return; }
     LOG("dump: %s (%ux%u)", name, s->width, s->height);
 }
 static gboolean on_sigusr1(gpointer data)
@@ -308,6 +543,143 @@ static gboolean on_sigusr1(gpointer data)
         if (kms_dump_front(kms, name)) LOG("dump: %s (scanned-out buffer)", name);
     }
     return G_SOURCE_CONTINUE;
+}
+
+/* ------------------------------------------------- control socket (--control)
+ * Line protocol on a unix stream socket, one reply line per command, for test
+ * harnesses (QMP screendump cannot see the display of an external device):
+ *   screendump FILE  wait for the next presented frame (at most 1 s), write the
+ *                    scanout as PPM P6 -> "ok <seq> <w>x<h>"
+ *   frame            -> "ok <seq> <w>x<h> stride <n> format 0x<pixman>" or "ok <seq> off"
+ *   stats            -> "ok key=value ..."
+ * Errors: "err <reason>". A client's commands are answered in order: while its
+ * screendump waits, its later lines stay queued. */
+typedef struct { int fd; guint watch; GString *in; char *shot; guint shot_timer; } ctl_t;
+static GPtrArray *ctls;
+static double last_present_t;
+
+static void ctl_reply(ctl_t *c, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void ctl_reply(ctl_t *c, const char *fmt, ...)
+{
+    va_list ap; va_start(ap, fmt);
+    g_autofree char *body = g_strdup_vprintf(fmt, ap);
+    va_end(ap);
+    g_autofree char *line = g_strconcat(body, "\n", NULL);
+    if (send(c->fd, line, strlen(line), MSG_NOSIGNAL) < 0) DBG("control: send: %s", strerror(errno));
+}
+static bool ctl_shots_pending(void)
+{
+    for (guint i = 0; ctls && i < ctls->len; i++) if (((ctl_t *)g_ptr_array_index(ctls, i))->shot) return true;
+    return false;
+}
+static void ctl_process(ctl_t *c);
+static void ctl_shot_done(ctl_t *c)
+{
+    const qdp_scanout *s = &disp.cur;
+    if (!s->enabled) ctl_reply(c, "err scanout off");
+    else if (!write_ppm(c->shot)) ctl_reply(c, "err %s: %s", c->shot, strerror(errno));
+    else ctl_reply(c, "ok %" PRIu64 " %ux%u", disp.seq, s->width, s->height);
+    g_clear_pointer(&c->shot, g_free);
+    if (c->shot_timer) { g_source_remove(c->shot_timer); c->shot_timer = 0; }
+    ctl_process(c);
+}
+static gboolean ctl_shot_timeout(gpointer data)
+{
+    ctl_t *c = data;
+    c->shot_timer = 0;               /* idle: take what is there */
+    ctl_shot_done(c);
+    return G_SOURCE_REMOVE;
+}
+/* a frame went to the sinks: complete the screendumps that waited for it */
+static void disp_presented(uint64_t seq)
+{
+    disp.seq = seq; last_present_t = now_s();
+    if (!ctls) return;
+    g_autoptr(GPtrArray) done = g_ptr_array_new();
+    for (guint i = 0; i < ctls->len; i++) { ctl_t *c = g_ptr_array_index(ctls, i); if (c->shot) g_ptr_array_add(done, c); }
+    for (guint i = 0; i < done->len; i++) ctl_shot_done(g_ptr_array_index(done, i));
+}
+static void ctl_command(ctl_t *c, char *line)
+{
+    const qdp_scanout *s = &disp.cur;
+    if (!*line) return;
+    if (!strncmp(line, "screendump", 10) && (line[10] == ' ' || line[10] == 0)) {
+        char *path = g_strstrip(line + 10);
+        if (!*path) { ctl_reply(c, "err usage: screendump FILE"); return; }
+        c->shot = g_strdup(path);
+        c->shot_timer = g_timeout_add(1000, ctl_shot_timeout, c);
+    } else if (!strcmp(line, "frame")) {
+        if (s->enabled) ctl_reply(c, "ok %" PRIu64 " %ux%u stride %u format 0x%08x", disp.seq, s->width, s->height, s->stride, s->pixman_format);
+        else ctl_reply(c, "ok %" PRIu64 " off", disp.seq);
+    } else if (!strcmp(line, "stats")) {
+        struct rusage ru; getrusage(RUSAGE_SELF, &ru);
+        ctl_reply(c, "ok seq=%" PRIu64 " mode=%ux%u frames=%" PRIu64 " frame_calls=%" PRIu64 " ticks=%" PRIu64 " damaged=%" PRIu64
+                  " idle_s=%.1f irqs=%" PRIu64 " irqs_dropped=%" PRIu64 " dma_regions=%u dma_mib=%" PRIu64 " dma_maps=%" PRIu64
+                  " dma_unmaps=%" PRIu64 " quiesce=%" PRIu64 " cursor_calls=%" PRIu64 " cursor_sent=%" PRIu64 " listeners=%u"
+                  " attached=%d cpu_s=%.2f",
+                  disp.seq, s->enabled ? s->width : 0, s->enabled ? s->height : 0, hstat.frames,
+                  __atomic_load_n(&hstat.frame_calls, __ATOMIC_RELAXED), tstat.ticks, tstat.damaged,
+                  last_present_t ? now_s() - last_present_t : -1.0,
+                  __atomic_load_n(&hstat.irq_ok, __ATOMIC_RELAXED), __atomic_load_n(&hstat.irq_drop, __ATOMIC_RELAXED),
+                  dma_map ? g_hash_table_size(dma_map) : 0, dma_bytes >> 20, hstat.dma_maps, hstat.dma_unmaps, hstat.quiesce,
+                  __atomic_load_n(&hstat.cursor_calls, __ATOMIC_RELAXED), hstat.cursor_sent, listeners->len, attached,
+                  ru.ru_utime.tv_sec + ru.ru_stime.tv_sec + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6);
+    } else {
+        ctl_reply(c, "err unknown command (screendump FILE | frame | stats)");
+    }
+}
+static void ctl_process(ctl_t *c)
+{
+    char *nl;
+    while (!c->shot && (nl = memchr(c->in->str, '\n', c->in->len))) {
+        size_t len = nl - c->in->str;
+        g_autofree char *line = g_strndup(c->in->str, len);
+        g_string_erase(c->in, 0, len + 1);
+        ctl_command(c, g_strstrip(line));
+    }
+}
+static void ctl_free(ctl_t *c)
+{
+    if (c->watch) g_source_remove(c->watch);
+    if (c->shot_timer) g_source_remove(c->shot_timer);
+    close(c->fd); g_string_free(c->in, TRUE); g_free(c->shot);
+    g_ptr_array_remove(ctls, c); g_free(c);
+}
+static gboolean ctl_read(gint fd, GIOCondition cond, gpointer data)
+{
+    ctl_t *c = data; char buf[4096];
+    ssize_t n = read(fd, buf, sizeof(buf));
+    if (n < 0 && (errno == EINTR || errno == EAGAIN)) return G_SOURCE_CONTINUE;
+    if (n <= 0 || c->in->len + n > 65536) { DBG("control client gone"); c->watch = 0; ctl_free(c); return G_SOURCE_REMOVE; }
+    g_string_append_len(c->in, buf, n);
+    ctl_process(c);
+    return G_SOURCE_CONTINUE;
+}
+static gboolean ctl_accept(gint fd, GIOCondition cond, gpointer data)
+{
+    int cfd = accept4(fd, NULL, NULL, SOCK_CLOEXEC);
+    if (cfd < 0) { if (errno != EAGAIN && errno != EINTR) LOG("control accept: %s", strerror(errno)); return G_SOURCE_CONTINUE; }
+    ctl_t *c = g_new0(ctl_t, 1);
+    c->fd = cfd; c->in = g_string_new(NULL);
+    c->watch = g_unix_fd_add(cfd, G_IO_IN | G_IO_HUP | G_IO_ERR, ctl_read, c);
+    g_ptr_array_add(ctls, c);
+    DBG("control client connected");
+    return G_SOURCE_CONTINUE;
+}
+static void setup_control(void)
+{
+    if (!opt.control) return;
+    struct sockaddr_un a = { .sun_family = AF_UNIX };
+    if (strlen(opt.control) >= sizeof(a.sun_path)) { LOG("--control path too long"); exit(1); }
+    strcpy(a.sun_path, opt.control);
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+    unlink(opt.control);
+    if (fd < 0 || bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0 || listen(fd, 8) < 0) {
+        LOG("control socket %s: %s", opt.control, strerror(errno)); exit(1);
+    }
+    ctls = g_ptr_array_new();
+    g_unix_fd_add(fd, G_IO_IN, ctl_accept, NULL);
+    LOG("control socket %s", opt.control);
 }
 
 /* ------------------------------------------------------ Display1 listener */
@@ -398,6 +770,63 @@ static void listener_send_update(listener_t *l, int x, int y, int w, int h)
     }
 }
 
+/* Cursor plane (v2 get_cursor): CursorDefine when the image changes (serial),
+ * MouseSet with the pointer position, i.e. the image's top-left plus hotspot,
+ * when anything changes. The last state is kept for listeners that come later. */
+static struct {
+    bool have, visible;
+    int32_t x, y;
+    uint32_t hot_x, hot_y, w, h;
+    uint64_t serial;
+    GBytes *img;            /* w*h*4 bytes, ARGB8888 host order */
+} cur;
+
+static void listener_send_cursor(listener_t *l, bool define)
+{
+    if (define && cur.img)
+        qemu_dbus_display1_listener_call_cursor_define(l->proxy, cur.w, cur.h, cur.hot_x, cur.hot_y,
+            g_variant_new_from_bytes(G_VARIANT_TYPE_BYTESTRING, cur.img, TRUE),
+            G_DBUS_CALL_FLAGS_NONE, DBUS_TIMEOUT, NULL, NULL, NULL);
+    qemu_dbus_display1_listener_call_mouse_set(l->proxy, cur.x + (int32_t)cur.hot_x, cur.y + (int32_t)cur.hot_y,
+        cur.visible, G_DBUS_CALL_FLAGS_NONE, DBUS_TIMEOUT, NULL, NULL, NULL);
+}
+
+static void cursor_update(void)
+{
+    qdp_cursor c;
+    if (!v2.get_cursor || !v2.get_cursor(priv, &c)) return;
+    bool define = !cur.have || c.serial != cur.serial;
+    if (define) {
+        g_clear_pointer(&cur.img, g_bytes_unref);
+        if (c.pixels && c.width && c.height && c.width <= 1024 && c.height <= 1024)
+            cur.img = g_bytes_new(c.pixels, (size_t)c.width * c.height * 4);
+        cur.w = c.width; cur.h = c.height; cur.hot_x = c.hot_x; cur.hot_y = c.hot_y; cur.serial = c.serial;
+    }
+    bool changed = define || c.visible != cur.visible || c.x != cur.x || c.y != cur.y;
+    cur.visible = c.visible; cur.x = c.x; cur.y = c.y; cur.have = true;
+    if (!changed) return;
+    for (guint i = 0; i < listeners->len; i++) listener_send_cursor(g_ptr_array_index(listeners, i), define);
+    hstat.cursor_sent++;
+}
+
+/* main loop side of frame_ready()/cursor_changed() */
+static gboolean wake_cb(gint fd, GIOCondition cond, gpointer data)
+{
+    uint64_t v;
+    if (read(wake_fd, &v, sizeof(v)) < 0 && errno != EAGAIN) LOG("wake read: %s", strerror(errno));
+    pthread_mutex_lock(&hs_lock);
+    bool frame = hs.frame, cursor = hs.cursor, full = hs.full;
+    uint64_t seq = hs.seq; uint32_t x0 = hs.x0, y0 = hs.y0, x1 = hs.x1, y1 = hs.y1;
+    hs.frame = hs.cursor = hs.full = false;
+    pthread_mutex_unlock(&hs_lock);
+    if (frame) {
+        if (PLUGIN_DAMAGE) disp_frame(seq, full, x0, y0, x1, y1);
+        else DBG("frame_ready ignored: the plugin did not set QDP_F_PLUGIN_DAMAGE");
+    }
+    if (cursor) cursor_update();
+    return G_SOURCE_CONTINUE;
+}
+
 static void display1_sink_scanout(sink_t *s)
 {
     for (guint i = 0; i < listeners->len; i++) listener_send_scanout(g_ptr_array_index(listeners, i));
@@ -454,6 +883,7 @@ static gboolean handle_register_listener(QemuDBusDisplay1Console *object, GDBusM
     g_ptr_array_add(listeners, l);
     LOG("listener registered (Unix.Map: %s)", l->can_map ? "yes" : "no");
     listener_send_scanout(l);
+    if (cur.have) listener_send_cursor(l, true);
     return TRUE;
 }
 
@@ -851,6 +1281,7 @@ static void usage(void)
         "  --qemu-console N         console index there (default 0)\n"
         "  --head-origin X,Y|auto   where this display sits on the guest desktop (default: right of the VM console)\n"
         "  --desktop WxH|auto       guest desktop size for pointer mapping (default: VM console + this display)\n"
+        "  --control PATH           control socket for automation: screendump FILE | frame | stats\n"
         "  --kms-copy               force the copy path (no udmabuf zero-copy)\n"
         "  --stats-interval S       print stats every S seconds (SIGUSR2 prints them once)\n"
         "  -v                       verbose\n");
@@ -866,7 +1297,8 @@ int main(int argc, char **argv)
         { "kms", 1, 0, 'K' }, { "on-connect", 1, 0, 1 }, { "on-disconnect", 1, 0, 2 },
         { "qemu-display", 1, 0, 'Q' }, { "qemu-display-dest", 1, 0, 3 }, { "qemu-console", 1, 0, 4 },
         { "stats-interval", 1, 0, 'S' }, { "idle-fps", 1, 0, 5 }, { "idle-after", 1, 0, 6 },
-        { "head-origin", 1, 0, 7 }, { "desktop", 1, 0, 8 }, { "kms-copy", 0, 0, 9 }, { "help", 0, 0, 'h' }, { 0 }
+        { "head-origin", 1, 0, 7 }, { "desktop", 1, 0, 8 }, { "kms-copy", 0, 0, 9 }, { "control", 1, 0, 10 },
+        { "help", 0, 0, 'h' }, { 0 }
     };
     int c;
     while ((c = getopt_long(argc, argv, "p:s:a:P:B:N:V:D:f:K:Q:S:vh", lopts, NULL)) != -1) {
@@ -883,6 +1315,7 @@ int main(int argc, char **argv)
         case 5: opt.idle_fps = atoi(optarg); break; case 6: opt.idle_after = atoi(optarg); break;
         case 7: opt.head_origin = optarg; break;   case 8: opt.desktop = optarg; break;
         case 9: opt.kms_copy = true; break;
+        case 10: opt.control = optarg; break;
         default: usage();
         }
     }
@@ -904,11 +1337,17 @@ int main(int argc, char **argv)
         g_ptr_array_add(disp.sinks, &kms_sink);
         g_timeout_add(1000, kms_hotplug_poll, NULL);
     }
+    dma_map = g_hash_table_new_full(g_int64_hash, g_int64_equal, NULL, g_free);
+    wake_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (wake_fd < 0) { LOG("eventfd: %s", strerror(errno)); exit(1); }
+    g_unix_fd_add(wake_fd, G_IO_IN, wake_cb, NULL);
     load_plugin();
     setup_vfu();
     setup_input_forwarding();
     setup_display1();
-    g_timeout_add(1000 / opt.fps, disp_tick, NULL);
+    setup_control();
+    if (!PLUGIN_DAMAGE) g_timeout_add(1000 / opt.fps, disp_tick, NULL);   /* else frame_ready() drives the sinks */
+    if (abi >= 2 && ops->tick && ops->tick_ms) g_timeout_add(ops->tick_ms, plugin_tick, NULL);
     g_unix_signal_add(SIGUSR1, on_sigusr1, NULL);
     g_unix_signal_add(SIGUSR2, on_sigusr2, NULL);
     g_unix_signal_add(SIGTERM, on_term, NULL);
