@@ -65,8 +65,7 @@ qm stop 990 && qm start 990     # the GPU is on QEMU's command line from the nex
   display. qdev-host sets the VM's Display to none and takes the place of QSM
   Direct's in-process VirGL GPU (`virtio-vga-gl,id=qsm-direct-gpu`); both come back
   when the GPU is removed. With QSM Direct's Display1 VirGL profile (a D-Bus
-  display with `gl=on`, qsm-pve-direct 0.4.0+stock4.14~exp233 or later) the QSM console shows it
-  from boot. `vga=0` adds a `vhost-user-gpu-pci` next to the VM's display instead.
+  display with `gl=on`, qsm-pve-direct 0.4.0+stock4.14~exp233 or later) the QSM console shows it. `vga=0` adds a `vhost-user-gpu-pci` next to the VM's display instead.
 - **Picture.** The GPU hands its frames to QEMU as dma-bufs, so only a GL display
   shows them. Without one the guest still renders, and the panel says so.
 - Settings: `render` (default the first render node), `vga`, `outputs` (1-4),
