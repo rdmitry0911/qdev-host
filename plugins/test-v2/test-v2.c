@@ -39,7 +39,10 @@
  *   0x40 IRQ_NS_AVG, 0x44 IRQ_NS_MAX  RO duration of the irq_trigger() call
  *   0x48 COMPARES    RO region words compared equal through vaddr and fd
  *
- * Plugin args: "irq_hz=N,fps=N,mode=WxH" (defaults 0, 0, 640x480).
+ * Plugin args: "irq_hz=N,fps=N,mode=WxH,exit_on_disconnect=1" (defaults 0, 0,
+ * 640x480, 0). With exit_on_disconnect reset(LOST_CONN) returns QDP_RESET_EXIT.
+ * reset(LOST_CONN) also checks that the regions are still mapped (it reads the
+ * first word of each through vaddr) and logs how many were.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -92,6 +95,8 @@ typedef struct t2 {
     uint64_t probe, probe_val;
     uint32_t probe_status;
     uint64_t irqs_ok, irqs_drop, irq_ns_sum, irq_ns_max, frames, violations, quiesces, compares;
+    bool exit_on_disconnect;
+    int lost_conn_regions;            /* regions still registered at reset(LOST_CONN), -1 = none yet */
 
     /* scanout + cursor */
     uint32_t w, h;
@@ -420,7 +425,21 @@ static int t2_reset(void *priv, vfu_reset_type_t type)
     TLOG(2, "reset type %d%s", type, q ? " (quiesced)" : "");
     if (!q) violation("reset without quiesce");
     ST(d->irq_hz, 0); ST(d->rec, 0);
-    return 0;
+    if (type != VFU_RESET_LOST_CONN) return 0;
+    /* the regions must still be mapped here: read the first word of each */
+    int n = 0;
+    uint64_t sum = 0;
+    pthread_mutex_lock(&d->rm);
+    for (int i = 0; i < MAX_REGIONS; i++) {
+        if (!d->regions[i].used) continue;
+        n++;
+        if (d->regions[i].r.vaddr) sum += *(volatile uint64_t *)d->regions[i].r.vaddr;
+    }
+    pthread_mutex_unlock(&d->rm);
+    d->lost_conn_regions = n;
+    TLOG(2, "lost connection with %d regions still mapped (checksum 0x%llx)%s", n, (unsigned long long)sum,
+         d->exit_on_disconnect ? ": cannot serve another client, QDP_RESET_EXIT" : "");
+    return d->exit_on_disconnect ? QDP_RESET_EXIT : 0;
 }
 
 static int t2_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env, void **priv)
@@ -431,7 +450,7 @@ static int t2_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env, v
     t2 *d = calloc(1, sizeof(*d));
     d->host = env->host_ops;
     d->setup_thread = pthread_self();
-    d->w = 640; d->h = 480;
+    d->w = 640; d->h = 480; d->lost_conn_regions = -1;
     unsigned irq_hz = 0, fps = 0;
     if (args) {
         char *copy = strdup(args), *save = NULL;
@@ -439,6 +458,7 @@ static int t2_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env, v
             if (!strncmp(tok, "irq_hz=", 7)) irq_hz = strtoul(tok + 7, NULL, 10);
             else if (!strncmp(tok, "fps=", 4)) fps = strtoul(tok + 4, NULL, 10);
             else if (!strncmp(tok, "mode=", 5)) sscanf(tok + 5, "%ux%u", &d->w, &d->h);
+            else if (!strncmp(tok, "exit_on_disconnect=", 19)) d->exit_on_disconnect = atoi(tok + 19) != 0;
             else { d->host->log(d->host->host, 0, "unknown arg '%s'", tok); free(copy); free(d); return -EINVAL; }
         }
         free(copy);
@@ -480,11 +500,12 @@ static void t2_teardown(void *priv)
     pthread_cond_broadcast(&d->cv);
     pthread_mutex_unlock(&d->m);
     pthread_join(d->irq_thr, NULL); pthread_join(d->render_thr, NULL);
-    TLOG(2, "teardown: irqs ok %llu dropped %llu (trigger avg %llu ns max %llu ns), frames %llu, quiesces %llu, compares %llu, violations %llu",
+    TLOG(2, "teardown: irqs ok %llu dropped %llu (trigger avg %llu ns max %llu ns), frames %llu, quiesces %llu, compares %llu, "
+         "regions at lost connection %d, violations %llu",
          (unsigned long long)d->irqs_ok, (unsigned long long)d->irqs_drop,
          (unsigned long long)(d->irqs_ok ? d->irq_ns_sum / d->irqs_ok : 0), (unsigned long long)d->irq_ns_max,
          (unsigned long long)d->frames, (unsigned long long)d->quiesces, (unsigned long long)d->compares,
-         (unsigned long long)d->violations);
+         d->lost_conn_regions, (unsigned long long)d->violations);
     munmap(d->fb, (size_t)d->w * d->h * 4); close(d->fb_fd);
     if (g == d) g = NULL;
     free(d);

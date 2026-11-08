@@ -32,6 +32,8 @@ timeout 60 ./tools/vfu-test-client "$RUN/dev.sock" info cfg expect32 bar0 0 0x7e
 result $? "vfu-test-client"
 sleep 0.2; stop_host
 grep -q "violations 0" "$OUT/t2-vfu.host.log"; result $? "plugin teardown reports 0 host rule violations"
+grep -q "lost connection with 4 regions still mapped" "$OUT/t2-vfu.host.log"
+result $? "reset(LOST_CONN) delivered while the 4 DMA regions are still mapped"
 
 step "test-v2: frames (plugin damage), cursor, control socket"
 start_host t2-display --plugin plugins/test-v2/test-v2.so --plugin-args fps=30 --socket "$RUN/dev.sock" \
@@ -43,6 +45,19 @@ timeout 20 python3 tools/qdev-control.py "$RUN/ctl.sock" frame "screendump $RUN/
     --check > "$OUT/t2-display.control.log" 2>&1
 result $? "control socket: screendump waits for the next frame, PPM matches the reply seq"
 stop_host
+
+step "test-v2: initial get_scanout() after setup (no frame_ready), QDP_RESET_EXIT on the lost client"
+start_host t2-exit --plugin plugins/test-v2/test-v2.so --plugin-args exit_on_disconnect=1 --socket "$RUN/dev.sock" \
+    --control "$RUN/ctl.sock"
+timeout 10 python3 tools/qdev-control.py "$RUN/ctl.sock" frame > "$OUT/t2-exit.control.log" 2>&1
+grep -q "< ok 0 640x480" "$OUT/t2-exit.control.log"; result $? "scanout known before any frame: $(tail -1 "$OUT/t2-exit.control.log")"
+timeout 20 ./tools/vfu-test-client "$RUN/dev.sock" dma msi > "$OUT/t2-exit.client.log" 2>&1
+result $? "vfu-test-client (maps, then disconnects)"
+t0=$(date +%s.%N); wait "$PID"; st=$?; t1=$(date +%s.%N)
+echo "   host exit status $st after $(echo "$t1 - $t0" | bc) s" | tee -a "$OUT/summary.txt"
+[ "$st" = 0 ] && grep -q "QDP_RESET_EXIT): exiting" "$OUT/t2-exit.host.log" && grep -q "teardown:.*regions at lost connection 4" "$OUT/t2-exit.host.log"
+result $? "host tore the plugin down and exited 0 by itself"
+rm -f "$RUN"/*.sock
 fi
 
 step "tb-vga ($TBVGA): load, config space, EDID/DISPI/QEXT registers, mode set, VRAM write, PPM"
