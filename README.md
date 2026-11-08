@@ -333,7 +333,11 @@ Direct's structural pattern:
 Details in [pve/README.md](pve/README.md). Verified on a PVE 9.2.21 node
 (pve-qemu-kvm 11.0.3, qemu-server 9.2.11, qsm-pve-direct installed, in both
 install orders): CLI and web UI add → attached → remove cycles, headless
-browser test in `tools/pve-ui-test.mjs`. The device process is `qdev-host-device@VMID-ID.service`;
+browser test in `tools/pve-ui-test.mjs`. Again on 2026-11-08 on the same node
+after its move to the official pve-manager 9.2.21 and to qsm-pve-direct
+0.4.0+stock4.14~exp229, the first qsm version that is itself a pve-ui-overlays
+client (its upgrade took over the template diversion qsm had held before):
+both entries on the page, the full web UI cycle on a test VM passes. The device process is `qdev-host-device@VMID-ID.service`;
 its Display1 socket (`/run/qdev-host/VMID-ID/display.sock`) is where a QSM Direct
 worker attaches, and when QSM's per-VM bus exists the device relays input,
 clipboard and audio to it automatically.
