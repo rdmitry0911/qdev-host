@@ -46,7 +46,7 @@
 static struct {
     const char *plugin, *socket, *plugin_args, *display_p2p, *display_bus,
                *display_name, *vm_name, *dump_dir, *kms, *on_connect, *on_disconnect,
-               *qemu_display, *qemu_display_dest, *head_origin, *desktop, *control;
+               *qemu_display, *qemu_display_dest, *head_origin, *desktop, *control, *qemu_qmp;
     int fps, idle_fps, idle_after, qemu_console, stats_interval;
     bool verbose, kms_copy;
 } opt = { .display_name = "org.qemu", .vm_name = "qdev-host", .dump_dir = ".", .fps = 30,
@@ -841,6 +841,7 @@ typedef struct {
     GDBusConnection *conn;
     GDBusObjectManagerServer *mgr;
     QemuDBusDisplay1Console *console;
+    QemuDBusDisplay1Mouse *mouse;
 } export_t;
 static GPtrArray *exports;   /* export_t*, one per connection serving the objects */
 
@@ -1079,24 +1080,141 @@ static void setup_input_forwarding(void)
         qemu_dbus_display1_mouse_get_is_absolute(fwd.mouse) ? "absolute" : "relative");
 }
 
+/* Input relay through QMP (--qemu-qmp, used when there is no --qemu-display):
+ * for VMs whose only display is this device, so QEMU has no graphic console to
+ * relay to. Events go to QEMU's input layer with input-send-event (no console:
+ * the default keyboard/pointer handlers). Display1 key codes are QEMU key
+ * numbers, which is also what a QMP KeyValue of type "number" carries; buttons
+ * map to InputButton names; absolute positions are scaled to 0..0x7fff over the
+ * guest desktop (this display unless --head-origin/--desktop say otherwise).
+ * Mouse.IsAbsolute is true when QEMU has any absolute mouse (query-mice).
+ * The connection is asynchronous and retried every second: a cold-plugged
+ * device needs qdev-host listening before QEMU starts, and QEMU answers QMP
+ * only once its main loop runs, after the device has been realized. Events
+ * before the handshake is done are dropped. Replies are read and dropped,
+ * errors logged. */
+enum { QMP_DOWN, QMP_CAPS, QMP_MICE, QMP_READY };
+static struct { int fd, state; GString *in; bool abs, warned; uint64_t sent, errors; } qmp = { .fd = -1, .abs = true };
+static void exports_set_absolute(bool abs);
+
+static void qmp_send(const char *json)
+{
+    if (qmp.fd < 0) return;
+    size_t len = strlen(json);
+    if (send(qmp.fd, json, len, MSG_NOSIGNAL) != (ssize_t)len) { LOG("qmp send: %s", strerror(errno)); return; }
+    qmp.sent++;
+}
+static void qmp_events(const char *events)
+{
+    if (qmp.state != QMP_READY) return;
+    g_autofree char *j = g_strdup_printf("{\"execute\":\"input-send-event\",\"arguments\":{\"events\":[%s]}}\n", events);
+    qmp_send(j);
+}
+static void qmp_key(guint k, bool down)
+{
+    g_autofree char *e = g_strdup_printf("{\"type\":\"key\",\"data\":{\"down\":%s,\"key\":{\"type\":\"number\",\"data\":%u}}}",
+                                         down ? "true" : "false", k);
+    qmp_events(e);
+}
+static void qmp_btn(guint b, bool down)
+{
+    static const char *names[] = { "left", "middle", "right", "wheel-up", "wheel-down", "side", "extra", "wheel-left", "wheel-right" };
+    if (b >= G_N_ELEMENTS(names)) { DBG("qmp: button %u not mapped", b); return; }
+    g_autofree char *e = g_strdup_printf("{\"type\":\"btn\",\"data\":{\"down\":%s,\"button\":\"%s\"}}", down ? "true" : "false", names[b]);
+    qmp_events(e);
+}
+/* one JSON line from QEMU (greeting, reply or event) */
+static void qmp_line(const char *line)
+{
+    bool ret = strstr(line, "\"return\"") != NULL, err = strstr(line, "\"error\"") != NULL;
+    if (err) { qmp.errors++; if (qmp.errors <= 10 || opt.verbose) LOG("qmp: %s", line); }
+    if (qmp.state == QMP_CAPS && (ret || err)) {
+        qmp.state = QMP_MICE;
+        qmp_send("{\"execute\":\"query-mice\"}\n");
+    } else if (qmp.state == QMP_MICE && (ret || err)) {
+        /* absolute if any mouse is (usb-tablet etc.): input-send-event hands abs events to the first
+         * handler that takes them, whatever query-mice calls "current" (before the guest activates the
+         * tablet that is the PS/2 mouse) */
+        DBG("qmp: %s", line);
+        if (ret && strstr(line, "\"name\"")) qmp.abs = strstr(line, "\"absolute\": true") != NULL;
+        qmp.state = QMP_READY;
+        exports_set_absolute(qmp.abs);
+        LOG("input forwarded to QEMU QMP %s with input-send-event (%s pointer)", opt.qemu_qmp, qmp.abs ? "absolute" : "relative");
+    }
+}
+static gboolean qmp_read(gint fd, GIOCondition cond, gpointer data)
+{
+    char buf[4096];
+    ssize_t n = read(fd, buf, sizeof(buf));
+    if (n < 0 && (errno == EINTR || errno == EAGAIN)) return G_SOURCE_CONTINUE;
+    if (n <= 0) {
+        LOG("qmp: QEMU closed the connection; input is dropped until it is back");
+        close(qmp.fd); qmp.fd = -1; qmp.state = QMP_DOWN; qmp.warned = false;
+        return G_SOURCE_REMOVE;
+    }
+    g_string_append_len(qmp.in, buf, n);
+    char *nl;
+    while ((nl = memchr(qmp.in->str, '\n', qmp.in->len))) {
+        g_autofree char *line = g_strndup(qmp.in->str, nl - qmp.in->str);
+        g_string_erase(qmp.in, 0, nl - qmp.in->str + 1);
+        qmp_line(g_strstrip(line));
+    }
+    return G_SOURCE_CONTINUE;
+}
+static gboolean qmp_connect(gpointer data)
+{
+    if (qmp.fd >= 0) return G_SOURCE_CONTINUE;
+    const char *path = g_str_has_prefix(opt.qemu_qmp, "unix:") ? opt.qemu_qmp + 5 : opt.qemu_qmp;
+    struct sockaddr_un a = { .sun_family = AF_UNIX };
+    g_strlcpy(a.sun_path, path, sizeof(a.sun_path));
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0 || connect(fd, (struct sockaddr *)&a, sizeof(a)) < 0) {
+        if (!qmp.warned) { LOG("qemu qmp %s: %s (retrying every second)", path, strerror(errno)); qmp.warned = true; }
+        if (fd >= 0) close(fd);
+        return G_SOURCE_CONTINUE;
+    }
+    struct timeval tv = { .tv_sec = 1 };   /* a stuck QEMU must not hold the main loop for long */
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    qmp.fd = fd; qmp.state = QMP_CAPS;
+    if (!qmp.in) qmp.in = g_string_new(NULL);
+    g_string_truncate(qmp.in, 0);
+    g_unix_fd_add(fd, G_IO_IN | G_IO_HUP | G_IO_ERR, qmp_read, NULL);
+    qmp_send("{\"execute\":\"qmp_capabilities\"}\n");   /* queued until QEMU's monitor runs */
+    DBG("qmp: connected to %s", path);
+    return G_SOURCE_CONTINUE;
+}
+static void setup_qmp(void)
+{
+    if (!opt.qemu_qmp) return;
+    if (opt.qemu_display) { LOG("--qemu-display given: input goes to its Display1 console, --qemu-qmp is not used"); return; }
+    const char *path = g_str_has_prefix(opt.qemu_qmp, "unix:") ? opt.qemu_qmp + 5 : opt.qemu_qmp;
+    if (strlen(path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) { LOG("--qemu-qmp path too long"); exit(1); }
+    qmp_connect(NULL);
+    g_timeout_add_seconds(1, qmp_connect, NULL);
+}
+
 static gboolean kbd_press(QemuDBusDisplay1Keyboard *o, GDBusMethodInvocation *inv, guint k, gpointer d)
 {
     if (fwd.kbd) { qemu_dbus_display1_keyboard_call_press(fwd.kbd, k, G_DBUS_CALL_FLAGS_NONE, DBUS_TIMEOUT, NULL, NULL, NULL); fwd.forwarded++; }
+    else if (qmp.state == QMP_READY) { qmp_key(k, true); fwd.forwarded++; }
     qemu_dbus_display1_keyboard_complete_press(o, inv); return TRUE;
 }
 static gboolean kbd_release(QemuDBusDisplay1Keyboard *o, GDBusMethodInvocation *inv, guint k, gpointer d)
 {
     if (fwd.kbd) { qemu_dbus_display1_keyboard_call_release(fwd.kbd, k, G_DBUS_CALL_FLAGS_NONE, DBUS_TIMEOUT, NULL, NULL, NULL); fwd.forwarded++; }
+    else if (qmp.state == QMP_READY) { qmp_key(k, false); fwd.forwarded++; }
     qemu_dbus_display1_keyboard_complete_release(o, inv); return TRUE;
 }
 static gboolean mouse_press(QemuDBusDisplay1Mouse *o, GDBusMethodInvocation *inv, guint b, gpointer d)
 {
     if (fwd.mouse) { qemu_dbus_display1_mouse_call_press(fwd.mouse, b, G_DBUS_CALL_FLAGS_NONE, DBUS_TIMEOUT, NULL, NULL, NULL); fwd.forwarded++; }
+    else if (qmp.state == QMP_READY) { qmp_btn(b, true); fwd.forwarded++; }
     qemu_dbus_display1_mouse_complete_press(o, inv); return TRUE;
 }
 static gboolean mouse_release(QemuDBusDisplay1Mouse *o, GDBusMethodInvocation *inv, guint b, gpointer d)
 {
     if (fwd.mouse) { qemu_dbus_display1_mouse_call_release(fwd.mouse, b, G_DBUS_CALL_FLAGS_NONE, DBUS_TIMEOUT, NULL, NULL, NULL); fwd.forwarded++; }
+    else if (qmp.state == QMP_READY) { qmp_btn(b, false); fwd.forwarded++; }
     qemu_dbus_display1_mouse_complete_release(o, inv); return TRUE;
 }
 /* Absolute pointer on a second head. The VM's tablet spans the whole guest
@@ -1123,12 +1241,28 @@ static gboolean mouse_abs(QemuDBusDisplay1Mouse *o, GDBusMethodInvocation *inv, 
         }
         qemu_dbus_display1_mouse_call_set_abs_position(fwd.mouse, x, y, G_DBUS_CALL_FLAGS_NONE, DBUS_TIMEOUT, NULL, NULL, NULL);
         fwd.forwarded++;
+    } else if (qmp.state == QMP_READY && disp.cur.enabled && disp.cur.width && disp.cur.height) {
+        /* no VM console: the desktop is this display, or what --head-origin/--desktop describe */
+        int ox, oy; guint dw, dh;
+        head_layout(0, 0, &ox, &oy, &dw, &dh);
+        int64_t X = MAX((int64_t)ox + x, 0), Y = MAX((int64_t)oy + y, 0);
+        uint64_t ax = MIN((uint64_t)X * 0x7fff / (dw ? dw : 1), 0x7fff), ay = MIN((uint64_t)Y * 0x7fff / (dh ? dh : 1), 0x7fff);
+        g_autofree char *e = g_strdup_printf("{\"type\":\"abs\",\"data\":{\"axis\":\"x\",\"value\":%" PRIu64 "}},"
+                                             "{\"type\":\"abs\",\"data\":{\"axis\":\"y\",\"value\":%" PRIu64 "}}", ax, ay);
+        qmp_events(e);
+        fwd.forwarded++;
     }
     qemu_dbus_display1_mouse_complete_set_abs_position(o, inv); return TRUE;
 }
 static gboolean mouse_rel(QemuDBusDisplay1Mouse *o, GDBusMethodInvocation *inv, gint dx, gint dy, gpointer d)
 {
     if (fwd.mouse) { qemu_dbus_display1_mouse_call_rel_motion(fwd.mouse, dx, dy, G_DBUS_CALL_FLAGS_NONE, DBUS_TIMEOUT, NULL, NULL, NULL); fwd.forwarded++; }
+    else if (qmp.state == QMP_READY) {
+        g_autofree char *e = g_strdup_printf("{\"type\":\"rel\",\"data\":{\"axis\":\"x\",\"value\":%d}},"
+                                             "{\"type\":\"rel\",\"data\":{\"axis\":\"y\",\"value\":%d}}", dx, dy);
+        qmp_events(e);
+        fwd.forwarded++;
+    }
     qemu_dbus_display1_mouse_complete_rel_motion(o, inv); return TRUE;
 }
 
@@ -1139,6 +1273,7 @@ static void export_closed(GDBusConnection *c, gboolean remote, GError *err, gpoi
     g_ptr_array_remove(exports, e);
     g_clear_object(&e->mgr);
     g_clear_object(&e->console);
+    g_clear_object(&e->mouse);
     g_clear_object(&e->conn);
     g_free(e);
 }
@@ -1175,7 +1310,8 @@ static void export_display1(GDBusConnection *conn)
     g_signal_connect(kbd, "handle-press", G_CALLBACK(kbd_press), NULL);
     g_signal_connect(kbd, "handle-release", G_CALLBACK(kbd_release), NULL);
     QemuDBusDisplay1Mouse *mouse = qemu_dbus_display1_mouse_skeleton_new();
-    qemu_dbus_display1_mouse_set_is_absolute(mouse, fwd.mouse ? qemu_dbus_display1_mouse_get_is_absolute(fwd.mouse) : TRUE);
+    qemu_dbus_display1_mouse_set_is_absolute(mouse, fwd.mouse ? qemu_dbus_display1_mouse_get_is_absolute(fwd.mouse) :
+                                                    opt.qemu_qmp ? qmp.abs : TRUE);
     g_signal_connect(mouse, "handle-press", G_CALLBACK(mouse_press), NULL);
     g_signal_connect(mouse, "handle-release", G_CALLBACK(mouse_release), NULL);
     g_signal_connect(mouse, "handle-set-abs-position", G_CALLBACK(mouse_abs), NULL);
@@ -1185,7 +1321,8 @@ static void export_display1(GDBusConnection *conn)
     g_dbus_object_skeleton_add_interface(co, G_DBUS_INTERFACE_SKELETON(kbd));
     g_dbus_object_skeleton_add_interface(co, G_DBUS_INTERFACE_SKELETON(mouse));
     g_dbus_object_manager_server_export(e->mgr, co);
-    g_object_unref(kbd); g_object_unref(mouse); g_object_unref(co);
+    e->mouse = mouse;
+    g_object_unref(kbd); g_object_unref(co);
 
     if (fwd.clip_to_qemu) {
         QemuDBusDisplay1Clipboard *cl = qemu_dbus_display1_clipboard_skeleton_new();
@@ -1227,6 +1364,12 @@ static void exports_sink_scanout(sink_t *s)
         qemu_dbus_display1_console_set_width(e->console, disp.cur.enabled ? disp.cur.width : 0);
         qemu_dbus_display1_console_set_height(e->console, disp.cur.enabled ? disp.cur.height : 0);
     }
+}
+
+static void exports_set_absolute(bool abs)
+{
+    for (guint i = 0; exports && i < exports->len; i++)
+        qemu_dbus_display1_mouse_set_is_absolute(((export_t *)g_ptr_array_index(exports, i))->mouse, abs);
 }
 
 static gboolean on_new_connection(GDBusServer *srv, GDBusConnection *conn, gpointer data)
@@ -1281,6 +1424,8 @@ static void usage(void)
         "  --qemu-console N         console index there (default 0)\n"
         "  --head-origin X,Y|auto   where this display sits on the guest desktop (default: right of the VM console)\n"
         "  --desktop WxH|auto       guest desktop size for pointer mapping (default: VM console + this display)\n"
+        "  --qemu-qmp PATH          the VM's QMP socket: forward keyboard/mouse with input-send-event\n"
+        "                           (for VMs without a graphic console; --qemu-display wins if both are given)\n"
         "  --control PATH           control socket for automation: screendump FILE | frame | stats\n"
         "  --kms-copy               force the copy path (no udmabuf zero-copy)\n"
         "  --stats-interval S       print stats every S seconds (SIGUSR2 prints them once)\n"
@@ -1298,7 +1443,7 @@ int main(int argc, char **argv)
         { "qemu-display", 1, 0, 'Q' }, { "qemu-display-dest", 1, 0, 3 }, { "qemu-console", 1, 0, 4 },
         { "stats-interval", 1, 0, 'S' }, { "idle-fps", 1, 0, 5 }, { "idle-after", 1, 0, 6 },
         { "head-origin", 1, 0, 7 }, { "desktop", 1, 0, 8 }, { "kms-copy", 0, 0, 9 }, { "control", 1, 0, 10 },
-        { "help", 0, 0, 'h' }, { 0 }
+        { "qemu-qmp", 1, 0, 11 }, { "help", 0, 0, 'h' }, { 0 }
     };
     int c;
     while ((c = getopt_long(argc, argv, "p:s:a:P:B:N:V:D:f:K:Q:S:vh", lopts, NULL)) != -1) {
@@ -1315,7 +1460,7 @@ int main(int argc, char **argv)
         case 5: opt.idle_fps = atoi(optarg); break; case 6: opt.idle_after = atoi(optarg); break;
         case 7: opt.head_origin = optarg; break;   case 8: opt.desktop = optarg; break;
         case 9: opt.kms_copy = true; break;
-        case 10: opt.control = optarg; break;
+        case 10: opt.control = optarg; break;      case 11: opt.qemu_qmp = optarg; break;
         default: usage();
         }
     }
@@ -1344,6 +1489,7 @@ int main(int argc, char **argv)
     load_plugin();
     setup_vfu();
     setup_input_forwarding();
+    setup_qmp();
     setup_display1();
     setup_control();
     if (!PLUGIN_DAMAGE) g_timeout_add(1000 / opt.fps, disp_tick, NULL);   /* else frame_ready() drives the sinks */
