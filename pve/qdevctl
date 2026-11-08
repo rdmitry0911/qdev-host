@@ -76,18 +76,50 @@ def cmd_stop(a):
             continue
         print(Q.detach(a.vmid, d, keep_process=False))
 
+def cmd_set(a):
+    kms = "" if a.no_kms else a.kms
+    display = True if a.display else (False if a.no_display else None)
+    persistent = True if a.persistent else (False if a.no_persistent else None)
+    for m in Q.update_device(a.vmid, a.id, a.args, kms, display, persistent):
+        print(m)
+
 def cmd_hook(a):
     conf = Q.load_conf(a.vmid)
     rc = 0
-    if a.phase == "post-start":
+    if a.phase == "pre-start":
+        # a vhost-user GPU is on QEMU's command line: its process must listen before QEMU starts
+        gpus = [d for d in conf["devices"] if Q.dev_kind(d) == "vhost-user-gpu"]
+        if gpus:
+            cfg = Q.vm_config(a.vmid)
+            problem = Q.shared_memory_mismatch(cfg)
+            if problem:
+                print(f"qdev-host: {problem}. Open the GPU in the VM's Hardware panel and save it "
+                      f"(or run: qdevctl set {a.vmid} {gpus[0]['id']}), then start the VM again.", file=sys.stderr)
+                return 2
+            for d in gpus:
+                if f"id={d['id']}," not in cfg.get("args", ""):
+                    print(f"qdev-host: {d['id']} is missing from the VM's args (edited by hand?); "
+                          f"run: qdevctl set {a.vmid} {d['id']}", file=sys.stderr)
+                    continue
+                try:
+                    Q.start_process(a.vmid, d)
+                    print(f"{d['id']}: GPU process ready")
+                except Q.QdevError as e:
+                    print(f"qdev-host: {d['id']}: {e}", file=sys.stderr)
+                    return 2
+    elif a.phase == "post-start":
         for d in conf["devices"]:
+            if Q.dev_kind(d) == "vhost-user-gpu":
+                continue
             try:
                 print(Q.attach(a.vmid, d))
             except Q.QdevError as e:
                 print(f"qdev-host: {d['id']}: {e}", file=sys.stderr); rc = 1
     elif a.phase == "post-stop":
         for d in conf["devices"]:
-            if not d.get("persistent"):
+            if Q.dev_kind(d) == "vhost-user-gpu":
+                Q.stop_process(a.vmid, d["id"], "vhost-user-gpu")
+            elif not d.get("persistent"):
                 Q.stop_process(a.vmid, d["id"])
     return rc
 
@@ -99,6 +131,12 @@ def main():
     s.add_argument("--kms"); s.add_argument("--no-display", action="store_true"); s.add_argument("--persistent", action="store_true")
     s.add_argument("--port-addr"); s.add_argument("--extra", action="append", help="extra qdev-host option (repeatable)")
     s.set_defaults(fn=cmd_add)
+    s = sub.add_parser("set", help="change a device's settings (no option: apply them to the VM config again)")
+    s.add_argument("vmid", type=int); s.add_argument("id"); s.add_argument("--args")
+    g = s.add_mutually_exclusive_group(); g.add_argument("--kms"); g.add_argument("--no-kms", action="store_true")
+    g = s.add_mutually_exclusive_group(); g.add_argument("--display", action="store_true"); g.add_argument("--no-display", action="store_true")
+    g = s.add_mutually_exclusive_group(); g.add_argument("--persistent", action="store_true"); g.add_argument("--no-persistent", action="store_true")
+    s.set_defaults(fn=cmd_set)
     s = sub.add_parser("remove"); s.add_argument("vmid", type=int); s.add_argument("id")
     s.add_argument("--keep-process", action="store_true"); s.add_argument("--purge-port", action="store_true"); s.set_defaults(fn=cmd_remove)
     s = sub.add_parser("list"); s.add_argument("vmid", type=int, nargs="?"); s.set_defaults(fn=cmd_list)

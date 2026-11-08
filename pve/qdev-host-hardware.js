@@ -69,8 +69,14 @@
     };
     const errorText = (error) => Ext.htmlEncode(error && error.message ? error.message : String(error));
     const showError = (error) => Ext.Msg.alert(gettext('Error'), errorText(error));
+    // The latest node service answer per VM, for the Edit dialog that PVE opens itself.
+    const latestInfo = {};
     const stateText = (dev) => {
         if (dev.state === 'attached') { return gettext('attached') + (dev.pci ? ` (${dev.pci})` : ''); }
+        if (dev.kind === 'vhost-user-gpu') {
+            if (dev.needs_restart) { return 'defined, present from the next VM start'; }
+            return dev.state === 'process' ? 'GPU process running' : 'starts with the VM';
+        }
         if (dev.state === 'process') {
             return dev.needs_restart ? 'process running, root port appears after the next VM start'
                 : 'process running, not attached';
@@ -81,9 +87,10 @@
         let text = dev.plugin;
         if (dev.args) { text += `, ${dev.args}`; }
         if (dev.kms) { text += `, kms=${dev.kms}`; }
-        if (dev.display === false) { text += ', no Display1'; }
+        if (dev.display === false && dev.kind !== 'vhost-user-gpu') { text += ', no Display1'; }
         if (dev.persistent) { text += ', persistent'; }
-        return `${text} — ${stateText(dev)}`;
+        text = `${text} — ${stateText(dev)}`;
+        return dev.warning ? `${text} — ${dev.warning}: open and save it before the next start` : text;
     };
 
     // ---- Add dialog ------------------------------------------------------
@@ -99,9 +106,30 @@
         qdevResult: null,
         fieldDefaults: { labelWidth: 130 },
 
+        autoLoad: false,
+
         initComponent: function () {
             const me = this;
+            // PVE's Edit button and double click open this class with confid "qdev:ID"
+            const editId = me.confid && String(me.confid).startsWith(ROW_PREFIX) ? String(me.confid).slice(ROW_PREFIX.length) : null;
+            if (editId) {
+                me.isCreate = false;
+                me.isAdd = false;
+                me.qdevVmid = me.qdevVmid || Number(me.pveSelNode && me.pveSelNode.data && me.pveSelNode.data.vmid);
+                me.qdevInfo = me.qdevInfo || latestInfo[me.qdevVmid];
+            }
             const info = me.qdevInfo || {};
+            const editDev = editId ? (info.devices || []).find((d) => d.id === editId) : null;
+            if (editId && !editDev) {
+                me.items = [{ xtype: 'displayfield', value: 'The device list is not loaded yet; close this window and try again.' }];
+                me.callParent();
+                return;
+            }
+            me.qdevEditDev = editDev;
+            const editArgs = {};
+            if (editDev && editDev.args) {
+                editDev.args.split(',').forEach((kv) => { const i = kv.indexOf('='); if (i > 0) { editArgs[kv.slice(0, i)] = kv.slice(i + 1); } });
+            }
             const plugins = info.plugins || [];
             const used = new Set((info.devices || []).map((d) => d.id));
             const freeId = (plugin) => {
@@ -117,27 +145,44 @@
                 argsPanel.removeAll();
                 const def = plugins.find((p) => p.name === plugin);
                 const spec = (def && def.args) || [];
+                const current = (name, fallback) => (editDev && editArgs[name] !== undefined ? editArgs[name] : fallback);
                 spec.forEach((arg) => {
                     const common = { name: `arg_${arg.name}`, fieldLabel: arg.label || arg.name, qdevArg: arg.name,
-                        emptyText: arg.hint || '', submitValue: false, allowBlank: true };
+                        qdevType: arg.type, emptyText: arg.hint || '', submitValue: false, allowBlank: true };
+                    if (arg.hint) { common.autoEl = { 'data-qtip': arg.hint }; }
                     if (arg.type === 'int') {
                         argsPanel.add(Ext.apply(common, { xtype: 'proxmoxintegerfield', minValue: arg.min,
-                            maxValue: arg.max, value: arg.default }));
+                            maxValue: arg.max, value: current(arg.name, arg.default) }));
                     } else if (arg.type === 'bool') {
-                        argsPanel.add(Ext.apply(common, { xtype: 'proxmoxcheckbox', checked: !!arg.default }));
+                        const value = current(arg.name, arg.default ? '1' : '0');
+                        argsPanel.add(Ext.apply(common, { xtype: 'proxmoxcheckbox', checked: value === true || value === '1' }));
+                    } else if (arg.type === 'render') {
+                        argsPanel.add(Ext.apply(common, {
+                            xtype: 'combobox', editable: true, queryMode: 'local', displayField: 'label', valueField: 'path',
+                            value: current(arg.name, arg.default || ''),
+                            store: { fields: ['path', 'label'], data: (info.render_nodes || []).map((n) => ({ path: n.path, label: `${n.path} (${n.driver}, ${n.pci})` })) },
+                        }));
                     } else {
-                        argsPanel.add(Ext.apply(common, { xtype: 'textfield', value: arg.default || '' }));
+                        argsPanel.add(Ext.apply(common, { xtype: 'textfield', value: current(arg.name, arg.default || '') }));
                     }
                 });
                 const descr = me.down('#qdevPluginDescr');
                 if (descr) { descr.setValue(def && def.description ? Ext.htmlEncode(def.description) : ''); }
+                // fields a plugin kind does not use (a GPU of QEMU's display has no KMS output of its own)
+                const fields = (def && def.fields) || { kms: true, display: true, persistent: true };
+                ['kms', 'display', 'persistent'].forEach((name) => {
+                    const field = me.down(`[name=${name}]`);
+                    if (field) { field.setHidden(!fields[name]); field.setDisabled(!fields[name]); }
+                });
+                const portHint = me.down('#qdevPortHint');
+                if (portHint) { portHint.setHidden(!!info.port_in_args || !!editDev); }
             };
-            const first = plugins.length ? plugins[0].name : '';
+            const first = editDev ? editDev.plugin : (plugins.length ? plugins[0].name : '');
             me.items = [
                 {
                     xtype: 'proxmoxKVComboBox', name: 'plugin', fieldLabel: gettext('Plugin'),
                     comboItems: plugins.map((p) => [p.name, p.title && p.title !== p.name ? `${p.name} — ${p.title}` : p.name]),
-                    value: first, allowBlank: false, disabled: !plugins.length,
+                    value: first, allowBlank: false, disabled: !plugins.length || !!editDev,
                     listeners: {
                         change: (field, value) => {
                             buildArgs(value);
@@ -150,27 +195,29 @@
                 {
                     xtype: 'textfield', name: 'id', fieldLabel: gettext('Device ID'), allowBlank: false,
                     regex: ID_RE, regexText: 'letters, digits, "-" and "_", starting with a letter (max 32)',
-                    value: freeId(first), listeners: { change: (field) => { field.qdevTouched = true; } },
+                    value: editDev ? editDev.id : freeId(first), readOnly: !!editDev,
+                    listeners: { change: (field) => { field.qdevTouched = true; } },
                 },
                 argsPanel,
                 {
                     xtype: 'combobox', name: 'kms', fieldLabel: 'KMS output', editable: true, queryMode: 'local',
                     displayField: 'label', valueField: 'spec', allowBlank: true,
                     emptyText: gettext('none') + ' (Display1 only)',
+                    value: editDev ? (editDev.kms || '') : '',
                     store: { fields: ['spec', 'label'], data: (info.kms_outputs || []).map((o) => ({ spec: o.spec, label: `${o.spec} (${o.status})` })) },
                     autoEl: { 'data-qtip': 'Show the device scanout on a physical connector of this node: /dev/dri/cardN:CONNECTOR' },
                 },
                 {
-                    xtype: 'proxmoxcheckbox', name: 'display', fieldLabel: 'Display1 export', checked: true,
+                    xtype: 'proxmoxcheckbox', name: 'display', fieldLabel: 'Display1 export', checked: editDev ? editDev.display !== false : true,
                     boxLabel: 'export the scanout over org.qemu.Display1 (QSM Direct)',
                 },
                 {
-                    xtype: 'proxmoxcheckbox', name: 'persistent', fieldLabel: gettext('Persistent'), checked: false,
+                    xtype: 'proxmoxcheckbox', name: 'persistent', fieldLabel: gettext('Persistent'), checked: editDev ? !!editDev.persistent : false,
                     boxLabel: 'keep the device process running while the VM is stopped',
                 },
                 {
-                    xtype: 'displayfield', fieldLabel: ' ', labelSeparator: '', userCls: 'pmx-hint',
-                    hidden: !!info.port_in_args,
+                    xtype: 'displayfield', fieldLabel: ' ', labelSeparator: '', userCls: 'pmx-hint', itemId: 'qdevPortHint',
+                    hidden: !!info.port_in_args || !!editDev,
                     value: 'A PCIe root port (qdev-rp0) is added to the VM\'s <i>args</i> for hot-plug; '
                         + 'it exists after the next VM start, until then the device stays defined but not attached.',
                 },
@@ -187,8 +234,14 @@
             const args = [];
             me.formPanel.query('[qdevArg]').forEach((f) => {
                 const value = f.getValue();
+                if (f.xtype === 'proxmoxcheckbox' && !value && !me.qdevEditDev) {
+                    // a new device: an unticked box stays out unless the plugin's default is on
+                    const def = (me.qdevInfo.plugins || []).find((p) => p.name === field('plugin').getValue());
+                    const spec = def && (def.args || []).find((a) => a.name === f.qdevArg);
+                    if (!spec || !spec.default) { return; }
+                }
                 if (value === '' || value === null || value === undefined) { return; }
-                if (f.xtype === 'proxmoxcheckbox') { if (value) { args.push(`${f.qdevArg}=1`); } return; }
+                if (f.xtype === 'proxmoxcheckbox') { args.push(`${f.qdevArg}=${value ? 1 : 0}`); return; }
                 args.push(`${f.qdevArg}=${value}`);
             });
             const body = {
@@ -196,13 +249,18 @@
                 kms: field('kms').getValue() || null, display: !!field('display').getValue(),
                 persistent: !!field('persistent').getValue(),
             };
+            const edit = me.qdevEditDev;
+            if (edit) { delete body.id; delete body.plugin; }
             me.setLoading(gettext('Please wait...'));
-            request('POST', `/api/v1/vms/${me.qdevVmid}/devices`, body).then((result) => {
+            const call = edit
+                ? request('PUT', `/api/v1/vms/${me.qdevVmid}/devices/${encodeURIComponent(edit.id)}`, body)
+                : request('POST', `/api/v1/vms/${me.qdevVmid}/devices`, body);
+            call.then((result) => {
                 me.setLoading(false);
                 me.qdevResult = result;
                 me.close();
                 const messages = (result && result.messages) || [];
-                if (messages.some((m) => /next VM start|VM is stopped|not attached/.test(m))) {
+                if (messages.some((m) => /next VM start|VM is stopped|not attached|^note:|plugged again/.test(m))) {
                     Ext.Msg.alert('qdev-host', messages.map(Ext.htmlEncode).join('<br>'));
                 }
             }).catch((error) => {
@@ -241,7 +299,7 @@
                         me.rows[key] = {
                             group: GROUP, order: index, header: `qdev-host (${dev.id})`,
                             iconCls: dev.kms ? 'television' : 'microchip',
-                            never_delete: !mayEdit, editor: undefined,
+                            never_delete: !mayEdit, editor: mayEdit ? 'PVE.qdevHost.DeviceEdit' : undefined,
                             renderer: (value) => Ext.htmlEncode(value),
                         };
                         store.add({ key, value: describe(dev) });
@@ -264,6 +322,7 @@
                 if (inflight) { return inflight; }
                 inflight = request('GET', `/api/v1/vms/${vmid}`).then((info) => {
                     me.qdevInfo = info;
+                    latestInfo[vmid] = info;
                     me.qdevError = null;
                     me.qdevUnreachable = false;
                 }).catch((error) => {

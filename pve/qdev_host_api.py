@@ -13,6 +13,7 @@ reserves to root).  Nothing is registered inside pveproxy or pvedaemon.
   GET    /                                   plain page (open once to accept the certificate)
   GET    /api/v1/vms/VMID                    devices with live state, plugins, KMS outputs
   POST   /api/v1/vms/VMID/devices            {id, plugin, args, kms, display, persistent}
+  PUT    /api/v1/vms/VMID/devices/ID         {args, kms, display, persistent}: change a device
   DELETE /api/v1/vms/VMID/devices/ID[?purge_port=1&keep_process=1]
   POST   /api/v1/vms/VMID/devices/ID/attach  start the device process and hot-plug
   POST   /api/v1/vms/VMID/devices/ID/detach  hot-unplug and stop the process
@@ -132,6 +133,8 @@ class Service:
             if rest == "/devices" and method == "POST":
                 return self.add(vmid, body, confirmed)
             d = _DEV_PATH.match(rest)
+            if d and d.group("action") is None and method == "PUT":
+                return self.update(vmid, d.group("id"), body, confirmed)
             if d and d.group("action") is None and method == "DELETE":
                 flags = {k: query.get(k, ["0"])[0] in ("1", "true") for k in ("purge_port", "keep_process")}
                 log(f"{confirmed}: remove {d.group('id')} from VM {vmid} {flags}")
@@ -148,6 +151,22 @@ class Service:
                     return {"messages": [Q.attach(vmid, dev)]}
                 return {"messages": [Q.detach(vmid, dev, keep_process=False)]}
         raise ApiError(404, "not found")
+
+    def update(self, vmid: int, dev_id: str, body: dict[str, Any], confirmed: str) -> Any:
+        def opt_text(key: str) -> str | None:
+            if key not in body:
+                return None
+            v = body[key]
+            if v is None:
+                return ""
+            if not isinstance(v, str) or len(v) > 512:
+                raise ApiError(400, f"{key}: must be a string")
+            return v.strip()
+        def opt_bool(key: str) -> bool | None:
+            return None if key not in body else bool(body[key])
+        args, kms = opt_text("args"), opt_text("kms")
+        log(f"{confirmed}: update {dev_id} on VM {vmid} (args='{args}', kms={kms if kms is not None else 'unchanged'})")
+        return {"messages": Q.update_device(vmid, dev_id, args, kms, opt_bool("display"), opt_bool("persistent"))}
 
     def add(self, vmid: int, body: dict[str, Any], confirmed: str) -> Any:
         def text(key: str, default: str = "") -> str:
@@ -192,7 +211,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if _ORIGIN.match(origin):
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-QDev-User")
         self.send_header("Access-Control-Max-Age", "600")
 
@@ -260,6 +279,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         self._dispatch("POST")
+
+    def do_PUT(self) -> None:  # noqa: N802
+        self._dispatch("PUT")
 
     def do_DELETE(self) -> None:  # noqa: N802
         self._dispatch("DELETE")

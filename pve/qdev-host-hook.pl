@@ -14,6 +14,12 @@ my $rc = $? >> 8;
 if ($phase eq 'post-start' && $rc != 0) {
     print STDERR "qdev-host: device attach for VM $vmid reported errors (rc=$rc)\n";
 }
+# pre-start fails only when QEMU could not start anyway (a GPU process that does
+# not listen, a shared memory size that no longer matches): stop with the reason
+if ($phase eq 'pre-start' && $rc != 0) {
+    print STDERR "qdev-host: VM $vmid not started (rc=$rc)\n";
+    exit $rc;
+}
 
 my $conf = "/etc/qdev-host/vms/$vmid.json";
 if (-r $conf) {

@@ -6,10 +6,11 @@ monitor API (`PVE::QemuServer::Monitor::mon_cmd`), the standard guest hookscript
 and systemd.
 
 ```bash
-apt install ./pve-ui-overlays_0.1.0_all.deb ./qdev-host_0.4.0_amd64.deb ./qdev-host-pve_0.4.0_all.deb
+apt install ./pve-ui-overlays_0.1.0_all.deb ./qdev-host_0.5.0_amd64.deb ./qdev-host-pve_0.5.0_all.deb
 qdevctl add 128 tbvga0 --plugin tb-vga --args vram=16      # define + hookscript + root port in args
 qm stop 128 && qm start 128                                  # the root port appears at the next start
 qdevctl list 128                                             # tbvga0 ... attached
+qdevctl set 128 tbvga0 --args vram=32                       # change it (a running VM sees an unplug and a replug)
 qdevctl remove 128 tbvga0                                    # hot-unplug, stop the process, forget it
 ```
 
@@ -29,6 +30,55 @@ What `add` does:
 On every VM start the hookscript (post-start) starts the device processes and
 hot-plugs them; on post-stop it stops them (`--persistent` keeps a process, and
 its VRAM, across VM restarts).
+
+`set` (the panel's *Edit*) changes the plugin arguments, the KMS output, the
+Display1 export and persistence of a device; the device ID and plugin stay. A
+vfio-user device of a running VM gets a new process and is unplugged and plugged
+again; `set` without options applies a device's settings to the VM config again.
+
+## VirGL 3D GPU (`virgl-gpu`)
+
+A built-in plugin backed by QEMU's own out-of-process virtio-gpu, the
+`/usr/lib/kvm/vhost-user-gpu` that pve-qemu-kvm ships: VirGL 3D rendering runs in
+`qdev-host-vugpu@VMID-ID.service` on a render node of this node, not inside QEMU.
+Linux guests use it with their stock `virtio_gpu` driver and Mesa's virgl driver.
+
+```bash
+qdevctl add 990 gpu0 --plugin virgl-gpu --args render=/dev/dri/renderD128,vga=1
+qm stop 990 && qm start 990     # the GPU is on QEMU's command line from the next start
+```
+
+- **From the next VM start, never hot-plugged.** QEMU's D-Bus display exports only
+  the consoles that exist when it starts, and only those get its GL context. So
+  qdev-host writes `-chardev socket,... -device vhost-user-vga|vhost-user-gpu-pci,...`
+  into the VM's `args` (behind its root port), and the hookscript starts the GPU
+  process in pre-start, before QEMU connects. The process serves that one QEMU and
+  ends with it.
+- **Shared guest memory.** A vhost-user device reads guest memory directly, which
+  PVE shares only with hugepages or a virtiofs device. Otherwise qdev-host adds
+  `-object memory-backend-memfd,id=qdev-mem,size=<memory>M,share=on -machine
+  memory-backend=qdev-mem`. Its size must equal the VM's memory: after changing
+  the memory, save the GPU again (Edit, or `qdevctl set VMID ID`); the pre-start
+  hook stops a start whose sizes differ and says so. VMs with NUMA nodes or memory
+  hot-plug need hugepages or virtiofs instead.
+- **Primary display** (`vga=1`, the default): `vhost-user-vga`, the VM's first
+  display. qdev-host sets the VM's Display to none and takes the place of QSM
+  Direct's in-process VirGL GPU (`virtio-vga-gl,id=qsm-direct-gpu`); both come back
+  when the GPU is removed. With QSM Direct's Display1 VirGL profile (a D-Bus
+  display with `gl=on`, qsm-pve-direct 0.4.0+stock4.14~exp233 or later) the QSM console shows it
+  from boot. `vga=0` adds a `vhost-user-gpu-pci` next to the VM's display instead.
+- **Picture.** The GPU hands its frames to QEMU as dma-bufs, so only a GL display
+  shows them. Without one the guest still renders, and the panel says so.
+- Settings: `render` (default the first render node), `vga`, `outputs` (1-4),
+  `xres`, `yres`. Removing the GPU from a running VM changes its config only; the
+  VM keeps the GPU until it stops.
+
+Verified on PVE 9.2.21 with pve-qemu-kvm 11.0.3 and an AMD Raphael render node:
+a Debian 13 guest found `virtio-vga` with `+virgl +edid` and two virgl capability
+sets, and the QSM Direct console showed the GPU's output (the guest's console at
+1024x768, captured as dma-buf, encoded with VA-API). Adding and removing the GPU
+gave back the VM's config byte for byte. A 3D application in the guest was not
+run (the test guest has no Mesa).
 
 Sockets: `/run/qdev-host/VMID-ID/vfio.sock` (vfio-user) and `display.sock`
 (org.qemu.Display1 p2p). When QSM Direct runs the VM's Display1 bus

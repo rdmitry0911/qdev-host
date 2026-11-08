@@ -20,6 +20,51 @@ HOOK_SRC = SHARE_DIR / "pve" / "qdev-host-hook.pl"
 HOOK_NAME = "qdev-host-hook.pl"
 PORT_ID = "qdev-rp0"
 QSM_BUS = "/run/qsm-pve-direct/{vmid}/qemu-display1.bus"
+VUG_BINARY = Path("/usr/lib/kvm/vhost-user-gpu")   # QEMU's own out-of-process virtio-gpu, in pve-qemu-kvm
+SHARED_MEM_ID = "qdev-mem"
+QSM_GPU_ID = "qsm-direct-gpu"                     # the in-process GPU of QSM Direct's Display1 VirGL profile
+
+# Plugins that are not a qdev-host .so: their device process is another program.
+BUILTIN_PLUGINS: dict[str, dict] = {
+    "virgl-gpu": {
+        "kind": "vhost-user-gpu",
+        "title": "VirGL 3D GPU (QEMU vhost-user-gpu)",
+        "description": ("A virtio-gpu with VirGL 3D acceleration whose rendering runs in its own process, "
+                        "QEMU's vhost-user-gpu on a render node of this node. The VM's own D-Bus display "
+                        "shows it (QSM Direct). Present from the next VM start; needs shared guest memory, "
+                        "which qdev-host adds unless the VM has hugepages or a virtiofs device."),
+        "fields": {"kms": False, "display": False, "persistent": False},
+        "args": [
+            {"name": "render", "label": "Render node", "type": "render", "default": "",
+             "hint": "empty: the first render node of this node"},
+            {"name": "vga", "label": "Primary display", "type": "bool", "default": True,
+             "hint": "VGA-compatible (vhost-user-vga), the VM's first display; it replaces the VM's own "
+                     "display device and QSM's in-process VirGL GPU until it is removed"},
+            {"name": "outputs", "label": "Outputs", "type": "int", "default": 1, "min": 1, "max": 4},
+            {"name": "xres", "label": "Width", "type": "int", "default": 1280, "min": 640, "max": 7680},
+            {"name": "yres", "label": "Height", "type": "int", "default": 800, "min": 480, "max": 4320},
+        ],
+    },
+}
+
+def plugin_kind(plugin: str) -> str:
+    return BUILTIN_PLUGINS.get(plugin, {}).get("kind", "vfio-user")
+
+def dev_kind(dev: dict) -> str:
+    return plugin_kind(dev["plugin"])
+
+def plugin_available(plugin: str) -> bool:
+    if plugin in BUILTIN_PLUGINS:
+        return VUG_BINARY.exists()
+    return (PLUGIN_DIR / f"{plugin}.so").exists()
+
+def parse_args(args: str) -> dict[str, str]:
+    out = {}
+    for kv in (args or "").split(","):
+        if kv:
+            k, _, v = kv.partition("=")
+            out[k] = v
+    return out
 
 class QdevError(Exception):
     pass
@@ -223,8 +268,12 @@ def device_del(vmid: int, dev_id: str, timeout: float = 20.0) -> bool:
     return False
 
 # --------------------------------------------------------------- systemd
-def unit_name(vmid: int, dev_id: str) -> str:
-    return f"qdev-host-device@{vmid}-{dev_id}.service"
+def unit_name(vmid: int, dev_id: str, kind: str = "vfio-user") -> str:
+    template = "qdev-host-vugpu" if kind == "vhost-user-gpu" else "qdev-host-device"
+    return f"{template}@{vmid}-{dev_id}.service"
+
+def dev_unit(vmid: int, dev: dict) -> str:
+    return unit_name(vmid, dev["id"], dev_kind(dev))
 
 def unit_run_dir(vmid: int, dev_id: str) -> Path:
     return RUN_DIR / f"{vmid}-{dev_id}"
@@ -235,7 +284,14 @@ def device_socket(vmid: int, dev_id: str) -> Path:
 def device_display(vmid: int, dev_id: str) -> Path:
     return unit_run_dir(vmid, dev_id) / "display.sock"
 
+def gpu_socket(vmid: int, dev_id: str) -> Path:
+    return unit_run_dir(vmid, dev_id) / "gpu.sock"
+
 def build_args(vmid: int, dev: dict) -> list[str]:
+    if dev_kind(dev) == "vhost-user-gpu":
+        opts = vug_options(dev)
+        args = [f"--socket-path={gpu_socket(vmid, dev['id'])}", f"--render-node={opts['render']}"]
+        return args + (["--virgl"] if opts["virgl"] else [])
     plugin = PLUGIN_DIR / f"{dev['plugin']}.so"
     if not plugin.exists():
         raise QdevError(f"plugin not installed: {plugin}")
@@ -262,23 +318,32 @@ def write_unit_env(vmid: int, dev: dict) -> None:
 
 def start_process(vmid: int, dev: dict) -> None:
     write_unit_env(vmid, dev)
-    run(["systemctl", "start", unit_name(vmid, dev["id"])])
-    sock = device_socket(vmid, dev["id"])
+    unit = dev_unit(vmid, dev)
+    run(["systemctl", "reset-failed", unit], check=False)
+    run(["systemctl", "start", unit])
+    sock = gpu_socket(vmid, dev["id"]) if dev_kind(dev) == "vhost-user-gpu" else device_socket(vmid, dev["id"])
     for _ in range(50):
         if sock.exists():
             return
         time.sleep(0.1)
-    raise QdevError(f"{unit_name(vmid, dev['id'])} did not create {sock}; see journalctl -u {unit_name(vmid, dev['id'])}")
+    raise QdevError(f"{unit} did not create {sock}; see journalctl -u {unit}")
 
-def stop_process(vmid: int, dev_id: str) -> None:
-    run(["systemctl", "stop", unit_name(vmid, dev_id)], check=False)
+def stop_process(vmid: int, dev_id: str, kind: str = "vfio-user") -> None:
+    run(["systemctl", "stop", unit_name(vmid, dev_id, kind)], check=False)
+    run(["systemctl", "reset-failed", unit_name(vmid, dev_id, kind)], check=False)
 
-def process_active(vmid: int, dev_id: str) -> bool:
-    return run(["systemctl", "is-active", unit_name(vmid, dev_id)], check=False).stdout.strip() == "active"
+def process_active(vmid: int, dev_id: str, kind: str = "vfio-user") -> bool:
+    return run(["systemctl", "is-active", unit_name(vmid, dev_id, kind)], check=False).stdout.strip() == "active"
 
 # --------------------------------------------------------------- flows
 def attach(vmid: int, dev: dict) -> str:
     """Start the device process (if needed) and hot-plug it. Returns a status line."""
+    if dev_kind(dev) == "vhost-user-gpu":
+        # on the QEMU command line from the VM start: QEMU's D-Bus display exports only
+        # the consoles that exist when it starts, so this GPU is never hot-plugged
+        if vm_running(vmid) and device_present(vmid, dev["id"]):
+            return f"{dev['id']}: attached"
+        return f"{dev['id']}: present from the next VM start"
     if not process_active(vmid, dev["id"]):
         start_process(vmid, dev)
     if device_present(vmid, dev["id"]):
@@ -290,6 +355,11 @@ def attach(vmid: int, dev: dict) -> str:
     return f"{dev['id']}: attached to {dev['bus']} (plugin {dev['plugin']})"
 
 def detach(vmid: int, dev: dict, keep_process: bool) -> str:
+    if dev_kind(dev) == "vhost-user-gpu":
+        if vm_running(vmid):
+            return f"{dev['id']}: stays in the running VM until it stops"
+        stop_process(vmid, dev["id"], "vhost-user-gpu")
+        return f"{dev['id']}: process stopped"
     gone = True
     if vm_running(vmid):
         gone = device_del(vmid, dev["id"])
@@ -308,8 +378,9 @@ ADDR_RE = re.compile(r"^0x[0-9a-fA-F]{1,2}$")
 def validate_device(dev_id: str, plugin: str, args: str, bus: str, kms: str | None) -> None:
     if not ID_RE.match(dev_id or ""):
         raise QdevError("device id must be 1-32 characters: letters, digits, '-' or '_' (starting with a letter)")
-    if not (PLUGIN_DIR / f"{plugin}.so").exists():
-        raise QdevError(f"plugin not installed: {plugin} (looked for {PLUGIN_DIR / (plugin + '.so')})")
+    if not plugin_available(plugin):
+        where = VUG_BINARY if plugin in BUILTIN_PLUGINS else PLUGIN_DIR / (plugin + ".so")
+        raise QdevError(f"plugin not installed: {plugin} (looked for {where})")
     if args and (not ARGS_RE.match(args) or any("=" not in kv or not kv.split("=", 1)[0] for kv in args.split(","))):
         raise QdevError("plugin args must be a comma separated list of key=value pairs")
     if not BUS_RE.match(bus or ""):
@@ -320,6 +391,10 @@ def validate_device(dev_id: str, plugin: str, args: str, bus: str, kms: str | No
         card, conn = kms.split(":", 1)
         if not Path(card).exists() or not Path(f"/sys/class/drm/{Path(card).name}-{conn}").exists():
             raise QdevError(f"KMS output {kms} does not exist on this node")
+    if plugin_kind(plugin) == "vhost-user-gpu":
+        if kms:
+            raise QdevError(f"{plugin} has no KMS output: QEMU's display shows it")
+        vug_options({"plugin": plugin, "args": args})
 
 def is_q35(cfg: dict[str, str]) -> bool:
     first = cfg.get("machine", "").split(",")[0]
@@ -338,6 +413,169 @@ def vm_node(vmid: int) -> str | None:
     ent = ids.get(str(vmid))
     return ent.get("node") if ent else None
 
+# ------------------------------------------------- vhost-user-gpu devices
+RENDER_RE = re.compile(r"^/dev/dri/renderD[0-9]+$")
+
+def list_render_nodes() -> list[dict]:
+    out = []
+    for node in sorted(Path("/dev/dri").glob("renderD*")):
+        sysdev = Path("/sys/class/drm") / node.name / "device"
+        try:
+            driver = Path(os.readlink(sysdev / "driver")).name
+        except OSError:
+            driver = "?"
+        pci = sysdev.resolve().name if sysdev.exists() else ""
+        out.append({"path": str(node), "driver": driver, "pci": pci})
+    return out
+
+def vug_options(dev: dict) -> dict:
+    """Validated settings of a vhost-user-gpu device from its plugin args."""
+    a = parse_args(dev.get("args", ""))
+    unknown = set(a) - {"render", "vga", "outputs", "xres", "yres", "virgl"}
+    if unknown:
+        raise QdevError(f"{dev['plugin']}: unknown setting(s) {', '.join(sorted(unknown))}")
+    def number(key: str, default: int, low: int, high: int) -> int:
+        try:
+            v = int(a.get(key) or default)
+        except ValueError:
+            raise QdevError(f"{key} must be a number") from None
+        if not low <= v <= high:
+            raise QdevError(f"{key} must be {low}..{high}")
+        return v
+    def flag(key: str, default: bool) -> bool:
+        v = a.get(key, "")
+        if v == "":
+            return default
+        if v not in ("0", "1"):
+            raise QdevError(f"{key} must be 0 or 1")
+        return v == "1"
+    render = a.get("render") or ""
+    if not render:
+        nodes = list_render_nodes()
+        if not nodes:
+            raise QdevError("this node has no DRM render node (/dev/dri/renderD*)")
+        render = nodes[0]["path"]
+    if not RENDER_RE.match(render) or not Path(render).exists():
+        raise QdevError(f"render node {render} does not exist on this node")
+    return {"render": render, "vga": flag("vga", True), "virgl": flag("virgl", True),
+            "outputs": number("outputs", 1, 1, 4), "xres": number("xres", 1280, 640, 7680),
+            "yres": number("yres", 800, 480, 4320)}
+
+def _drop(args: str, pattern: str) -> str:
+    """args without the whitespace-free option groups matching PATTERN (an -option plus its value)."""
+    return re.sub(r"(?:^|\s+)" + pattern + r"(?=\s|$)", "", args).strip()
+
+def _find(args: str, pattern: str) -> str | None:
+    m = re.search(r"(?:^|\s)(" + pattern + r")(?=\s|$)", args)
+    return m.group(1) if m else None
+
+def vug_groups(vmid: int, dev: dict) -> str:
+    o = vug_options(dev)
+    chardev = f"qdev-{dev['id']}"
+    driver = "vhost-user-vga" if o["vga"] else "vhost-user-gpu-pci"
+    return (f"-chardev socket,id={chardev},path={gpu_socket(vmid, dev['id'])} "
+            f"-device {driver},id={dev['id']},chardev={chardev},bus={dev['bus']},"
+            f"max_outputs={o['outputs']},xres={o['xres']},yres={o['yres']}")
+
+def vug_patterns(dev_id: str) -> list[str]:
+    i = re.escape(dev_id)
+    return [rf"-chardev\s+socket,id=qdev-{i},\S*", rf"-device\s+vhost-user-(?:vga|gpu-pci),id={i},\S*"]
+
+SHARED_MEM_PATTERNS = [rf"-object\s+memory-backend-memfd,id={SHARED_MEM_ID},\S*",
+                       rf"-machine\s+memory-backend={SHARED_MEM_ID}"]
+QSM_GPU_PATTERN = rf"-device\s+virtio-vga-gl,id={QSM_GPU_ID}\S*"
+
+def vm_memory(cfg: dict[str, str]) -> int:
+    value = cfg.get("memory", "")
+    m = re.match(r"^(?:current=)?([0-9]+)", value)
+    if not m:
+        raise QdevError("set the VM's memory explicitly: the shared memory backend needs its size")
+    return int(m.group(1))
+
+def memory_is_shared(cfg: dict[str, str]) -> bool:
+    return bool(cfg.get("hugepages")) or any(re.match(r"^virtiofs\d+$", k) for k in cfg)
+
+def shared_memory_groups(cfg: dict[str, str]) -> str:
+    """The args that give the VM shared memory, or '' when PVE already does."""
+    if memory_is_shared(cfg):
+        return ""
+    if cfg.get("numa") == "1":
+        raise QdevError("the VM uses NUMA nodes; give it hugepages or a virtiofs device, which share its memory")
+    if "memory" in cfg.get("hotplug", "network,disk,usb").split(","):
+        raise QdevError("the VM hot-plugs memory; give it hugepages or a virtiofs device, which share its memory")
+    return (f"-object memory-backend-memfd,id={SHARED_MEM_ID},size={vm_memory(cfg)}M,share=on "
+            f"-machine memory-backend={SHARED_MEM_ID}")
+
+def shared_memory_mismatch(cfg: dict[str, str]) -> str | None:
+    """A reason the VM would not start with its shared memory args, or None."""
+    obj = _find(cfg.get("args", ""), SHARED_MEM_PATTERNS[0])
+    if not obj:
+        return None
+    if memory_is_shared(cfg):
+        return "the VM now has hugepages or a virtiofs device, and also qdev-host's memory backend"
+    m = re.search(r"size=([0-9]+)M", obj)
+    try:
+        want = vm_memory(cfg)
+    except QdevError as e:
+        return str(e)
+    if not m or int(m.group(1)) != want:
+        return f"the VM's memory is {want} MiB, qdev-host's shared memory backend {m.group(1) if m else '?'} MiB"
+    return None
+
+def apply_vug_args(vmid: int, conf: dict, cfg: dict[str, str]) -> list[str]:
+    """Rewrite the qdev-host parts of the VM's args (and vga) for its vhost-user-gpu devices.
+
+    Removes every group qdev-host owns, then puts back the current ones after the
+    root port, so a re-run gives the same result.  Returns notes for the user."""
+    notes = []
+    args = cfg.get("args", "")
+    for dev in conf["devices"]:
+        for pat in vug_patterns(dev["id"]):
+            args = _drop(args, pat)
+    for pat in SHARED_MEM_PATTERNS:
+        args = _drop(args, pat)
+    vugs = [d for d in conf["devices"] if dev_kind(d) == "vhost-user-gpu"]
+    primary = [d for d in vugs if vug_options(d)["vga"]]
+    if len(primary) > 1:
+        raise QdevError("only one qdev-host GPU can be the primary display")
+    # QSM's in-process VirGL GPU gives way to a primary qdev-host GPU and comes back without one
+    qsm_gpu = _find(args, QSM_GPU_PATTERN)
+    if primary and qsm_gpu:
+        conf["replaced_qsm_gpu"] = qsm_gpu
+        # remember the option group in front of it, to put it back in the same place
+        before = args[:args.find(qsm_gpu)].rstrip()
+        cut = before.rfind(" -")
+        conf["replaced_qsm_gpu_after"] = before[cut + 1:] if cut >= 0 else before
+        args = _drop(args, QSM_GPU_PATTERN)
+        notes.append("QSM Direct's in-process VirGL GPU gives way to this GPU while it exists "
+                     "(qsm-pve-direct 0.4.0+stock4.14~exp233 or later shows it and keeps it so)")
+    elif not primary and conf.get("replaced_qsm_gpu"):
+        gpu, after = conf.pop("replaced_qsm_gpu"), conf.pop("replaced_qsm_gpu_after", "")
+        if after and after in args:
+            args = args.replace(after, f"{after} {gpu}", 1)
+        else:
+            args = f"{gpu} {args}".strip()
+    if vugs:
+        mem = shared_memory_groups(cfg)
+        groups = " ".join(vug_groups(vmid, d) for d in vugs)
+        args = " ".join(x for x in (args, mem, groups) if x)
+        if mem:
+            notes.append(f"the VM's {vm_memory(cfg)} MiB of memory are shared with the GPU process "
+                         "(memory-backend-memfd in args; save the device again after changing the memory)")
+    qm_set(vmid, "args", args or None)
+    # the VM's own display device would come first, so QSM would not show the GPU
+    vga_now = cfg.get("vga")
+    if primary and "saved_vga" not in conf:
+        if vga_now != "none":
+            conf["saved_vga"] = vga_now
+            qm_set(vmid, "vga", "none")
+            notes.append(f"Display set to none (was {vga_now or 'default'}); it comes back when the GPU is removed")
+    elif not primary and "saved_vga" in conf:
+        qm_set(vmid, "vga", conf.pop("saved_vga"))
+    if vugs and not _find(args, r"-display\s+\S*gl=(?:on|core|es)\S*"):
+        notes.append("the VM has no OpenGL display (QSM Display1 VirGL): the GPU renders, but its picture is not shown")
+    return notes
+
 # ---------------------------------------------------------- inventories
 def list_plugins() -> list[dict]:
     """Installed plugins with their optional sidecar metadata (NAME.json next to NAME.so)."""
@@ -350,8 +588,13 @@ def list_plugins() -> list[dict]:
                 meta = json.loads(side.read_text())
             except ValueError:
                 meta = {}
-        out.append({"name": so.stem, "title": meta.get("title", so.stem), "description": meta.get("description", ""),
-                    "args": meta.get("args", [])})
+        out.append({"name": so.stem, "kind": "vfio-user", "title": meta.get("title", so.stem),
+                    "description": meta.get("description", ""), "args": meta.get("args", []),
+                    "fields": {"kms": True, "display": True, "persistent": True}})
+    for name, meta in BUILTIN_PLUGINS.items():  # after the .so plugins: tb-vga stays the dialog's default
+        if plugin_available(name):
+            out.append({"name": name, "kind": meta["kind"], "title": meta["title"],
+                        "description": meta["description"], "args": meta["args"], "fields": meta["fields"]})
     return out
 
 def list_kms_outputs() -> list[dict]:
@@ -390,6 +633,8 @@ def add_device(vmid: int, dev_id: str, plugin: str, args: str = "", bus: str = P
     # every check that can fail comes before the first change to the VM
     check_editable(vmid)
     snippets_dir()
+    if plugin_kind(plugin) == "vhost-user-gpu":
+        return add_vug_device(vmid, conf, cfg, dev)
     changed_port = False
     if bus == PORT_ID:
         changed_port = ensure_port_in_args(vmid, cfg, conf["port_addr"])
@@ -411,6 +656,78 @@ def add_device(vmid: int, dev_id: str, plugin: str, args: str = "", bus: str = P
         msgs.append("VM is stopped: the device will be started and attached by the hookscript at VM start")
     return msgs
 
+def add_vug_device(vmid: int, conf: dict, cfg: dict[str, str], dev: dict) -> list[str]:
+    dev.update(display=False, kms=None, persistent=False, extra=[])
+    shared_memory_groups(cfg)              # refuses NUMA/memory hot-plug without hugepages/virtiofs
+    had_devices = bool(conf["devices"])
+    changed_port = ensure_port_in_args(vmid, cfg, conf["port_addr"]) if dev["bus"] == PORT_ID else False
+    try:
+        ensure_hookscript(vmid, cfg, conf)
+        conf["devices"].append(dev)
+        notes = apply_vug_args(vmid, conf, vm_config(vmid))
+    except Exception:
+        conf["devices"] = [d for d in conf["devices"] if d["id"] != dev["id"]]
+        try:
+            fresh = vm_config(vmid)
+            for pat in vug_patterns(dev["id"]):
+                fresh["args"] = _drop(fresh.get("args", ""), pat)
+            apply_vug_args(vmid, conf, fresh)  # puts back what this call replaced
+            if changed_port:
+                remove_port_from_args(vmid, vm_config(vmid))
+            if not had_devices:
+                restore_hookscript(vmid, conf)
+        except Exception as e:  # report the first error, not the cleanup's
+            log(f"cleanup after a failed add: {e}")
+        raise
+    save_conf(conf)
+    write_unit_env(vmid, dev)
+    msgs = [f"VM {vmid}: GPU {dev['id']} ({dev['plugin']}) defined on bus {dev['bus']}"] + [f"note: {n}" for n in notes]
+    msgs.append("the GPU is present from the next VM start" + (": stop and start the VM" if vm_running(vmid) else ""))
+    return msgs
+
+def update_device(vmid: int, dev_id: str, args: str | None = None, kms: str | None = None,
+                  display: bool | None = None, persistent: bool | None = None) -> list[str]:
+    """Change a device's settings: kms '' removes the KMS output, None keeps a value."""
+    conf = load_conf(vmid)
+    dev = find_device(conf, dev_id)
+    if not dev:
+        raise QdevError(f"no device {dev_id} on VM {vmid}")
+    new = dict(dev)
+    if args is not None:
+        new["args"] = args
+    if kms is not None:
+        new["kms"] = kms or None
+    if display is not None:
+        new["display"] = bool(display)
+    if persistent is not None:
+        new["persistent"] = bool(persistent)
+    validate_device(dev_id, new["plugin"], new.get("args", ""), new["bus"], new.get("kms"))
+    replaced = lambda d: new if d["id"] == dev_id else d
+    if dev_kind(dev) == "vhost-user-gpu":
+        new.update(display=False, kms=None, persistent=False)
+        check_editable(vmid)
+        conf["devices"] = [replaced(d) for d in conf["devices"]]
+        notes = apply_vug_args(vmid, conf, vm_config(vmid))
+        save_conf(conf)
+        write_unit_env(vmid, new)
+        return ([f"VM {vmid}: GPU {dev_id} updated"] + [f"note: {n}" for n in notes] +
+                ["the change applies at the next VM start" + (": stop and start the VM" if vm_running(vmid) else "")])
+    # a vfio-user device gets a new process; a running VM sees an unplug and a replug
+    running = vm_running(vmid)
+    was_attached = running and device_present(vmid, dev_id)
+    msgs = []
+    if was_attached or process_active(vmid, dev_id):
+        msgs.append(detach(vmid, dev, keep_process=False))
+    conf["devices"] = [replaced(d) for d in conf["devices"]]
+    save_conf(conf)
+    write_unit_env(vmid, new)
+    if running:
+        msgs.append(attach(vmid, new))
+    elif new.get("persistent"):
+        start_process(vmid, new)
+        msgs.append(f"{dev_id}: process started with the new settings")
+    return [f"VM {vmid}: device {dev_id} updated" + (", unplugged and plugged again" if was_attached else "")] + msgs
+
 def remove_device(vmid: int, dev_id: str, keep_process: bool = False, purge_port: bool = False) -> list[str]:
     msgs = []
     conf = load_conf(vmid)
@@ -418,8 +735,21 @@ def remove_device(vmid: int, dev_id: str, keep_process: bool = False, purge_port
     if not dev:
         raise QdevError(f"no device {dev_id} on VM {vmid}")
     check_editable(vmid)
-    msgs.append(detach(vmid, dev, keep_process))
-    conf["devices"] = [d for d in conf["devices"] if d["id"] != dev_id]
+    if dev_kind(dev) == "vhost-user-gpu":
+        running = vm_running(vmid)
+        cfg = vm_config(vmid)
+        for pat in vug_patterns(dev_id):
+            cfg["args"] = _drop(cfg.get("args", ""), pat)
+        conf["devices"] = [d for d in conf["devices"] if d["id"] != dev_id]
+        apply_vug_args(vmid, conf, cfg)
+        if running:
+            msgs.append(f"{dev_id}: removed from the VM config; the running VM keeps the GPU until it stops")
+        else:
+            stop_process(vmid, dev_id, "vhost-user-gpu")
+            msgs.append(f"{dev_id}: removed")
+    else:
+        msgs.append(detach(vmid, dev, keep_process))
+        conf["devices"] = [d for d in conf["devices"] if d["id"] != dev_id]
     env = UNIT_DIR / f"{vmid}-{dev_id}.env"
     if env.exists() and not keep_process:
         env.unlink()
@@ -452,19 +782,23 @@ def describe_vm(vmid: int) -> dict:
                 present[d["qdev_id"]] = f"{d['bus']:02x}:{d['slot']:02x}.0"
                 buses.add(d["qdev_id"])
     devices = []
+    mismatch = shared_memory_mismatch(cfg)
     for d in conf["devices"]:
-        active = process_active(vmid, d["id"])
+        kind = dev_kind(d)
+        active = process_active(vmid, d["id"], kind)
         if d["id"] in present:
             state = "attached"
         elif active:
             state = "process"
         else:
             state = "stopped"
+        restart = (d["id"] not in present) if kind == "vhost-user-gpu" else (d["bus"] not in buses)
         devices.append({**{k: d.get(k) for k in ("id", "plugin", "args", "bus", "display", "kms", "persistent")},
-                        "state": state, "process_active": active, "pci": present.get(d["id"]),
-                        "needs_restart": bool(running and d["bus"] not in buses)})
+                        "kind": kind, "state": state, "process_active": active, "pci": present.get(d["id"]),
+                        "needs_restart": bool(running and restart),
+                        "warning": mismatch if kind == "vhost-user-gpu" else None})
     return {"vmid": vmid, "node": me, "local": True, "running": running, "q35": is_q35(cfg),
             "machine": cfg.get("machine", ""), "port_addr": conf.get("port_addr", "0x08"),
             "port_in_args": f"id={PORT_ID}" in cfg.get("args", ""), "port_in_vm": PORT_ID in buses,
             "hookscript": cfg.get("hookscript"), "devices": devices,
-            "plugins": list_plugins(), "kms_outputs": list_kms_outputs()}
+            "plugins": list_plugins(), "kms_outputs": list_kms_outputs(), "render_nodes": list_render_nodes()}

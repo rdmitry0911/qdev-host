@@ -297,7 +297,7 @@ Two Debian packages, built with `scripts/mkchroot.sh` + `scripts/build-deb-in-ch
   entry is an overlay descriptor for `pve-ui-overlays` (one script tag).
 
 ```bash
-apt install ./pve-ui-overlays_0.1.0_all.deb ./qdev-host_0.4.0_amd64.deb ./qdev-host-pve_0.4.0_all.deb
+apt install ./pve-ui-overlays_0.1.0_all.deb ./qdev-host_0.5.0_amd64.deb ./qdev-host-pve_0.5.0_all.deb
 qdevctl add 109 tbvga0 --plugin tb-vga --args vram=16     # q35 VM; adds hookscript + root port (args)
 qm start 109                                               # hookscript starts the process and hot-plugs
 qdevctl list                                               # VM 109  tbvga0  tb-vga  bus=qdev-rp0  attached (01:00.0)
@@ -310,7 +310,8 @@ as rows (`qdev-host (tbvga0)`: plugin, args, KMS output, live state such as
 `attached (01:00.0)` or `defined, attaches after the next VM start`), *Add* has a
 *qdev-host Device* entry (plugin, device ID, the plugin's arguments as form
 fields, KMS output picked from the node's connectors, Display1 export,
-persistent process) and *Remove* hot-unplugs the selected row. It follows QSM
+persistent process), *Edit* (button or double click) changes a row's settings and
+*Remove* hot-unplugs the selected row. It follows QSM
 Direct's structural pattern:
 
 - `qdev-host-hardware.js` is an ExtJS override of `PVE.qemu.HardwareView`
@@ -346,7 +347,12 @@ its Display1 socket (`/run/qdev-host/VMID-ID/display.sock`) is where a QSM Direc
 worker attaches, and when QSM's per-VM bus exists the device relays input,
 clipboard and audio to it automatically.
 
-Not yet: editing a device in place (remove and add again), VMs on another
+Built-in plugin `virgl-gpu`: a VirGL 3D GPU whose rendering runs in QEMU's own
+`vhost-user-gpu` process on a render node of the node, on the VM's command line
+from its next start, as the primary display or an additional GPU, and shown by the
+QSM Direct console ([details](pve/README.md#virgl-3d-gpu-virgl-gpu)).
+
+Not yet: VMs on another
 cluster node than the one serving the browser, several devices per process, a
 hookscript-free path for VMs whose firmware already reserves enough window space.
 

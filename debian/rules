@@ -28,6 +28,7 @@ override_dh_auto_install:
 	install -D -m 644 pve/qdev_pve.py debian/qdev-host-pve/usr/lib/qdev-host/pve/qdev_pve.py
 	install -D -m 755 pve/qdev-host-hook.pl debian/qdev-host-pve/usr/share/qdev-host/pve/qdev-host-hook.pl
 	install -D -m 644 pve/qdev-host-device@.service debian/qdev-host-pve/usr/lib/systemd/system/qdev-host-device@.service
+	install -D -m 644 pve/qdev-host-vugpu@.service debian/qdev-host-pve/usr/lib/systemd/system/qdev-host-vugpu@.service
 	install -D -m 644 pve/qdev-host-api.service debian/qdev-host-pve/usr/lib/systemd/system/qdev-host-api.service
 	install -D -m 644 pve/qdev_host_api.py debian/qdev-host-pve/usr/lib/qdev-host/pve/qdev_host_api.py
 	install -D -m 644 pve/qdev-host-hardware.js debian/qdev-host-pve/usr/share/pve-manager/js/qdev-host-hardware.js

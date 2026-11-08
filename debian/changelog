@@ -1,3 +1,22 @@
+qdev-host (0.5.0) unstable; urgency=medium
+
+  * Hardware panel: Edit (button or double click) on a qdev-host row changes
+    the device's plugin arguments, KMS output, Display1 export and
+    persistence; a vfio-user device of a running VM is unplugged and plugged
+    again with the new settings. API: PUT /api/v1/vms/VMID/devices/ID;
+    shell: qdevctl set VMID ID.
+  * New built-in plugin virgl-gpu: a virtio-gpu with VirGL 3D acceleration
+    whose rendering runs in QEMU's own vhost-user-gpu process
+    (qdev-host-vugpu@.service) on a chosen render node. It is on the QEMU
+    command line from the next VM start, because QEMU's D-Bus display only
+    exports consoles that exist at start. As the primary display
+    (vhost-user-vga) it replaces the VM's display device and QSM Direct's
+    in-process VirGL GPU until it is removed. qdev-host gives the VM shared
+    memory (memory-backend-memfd) unless it has hugepages or virtiofs; the
+    pre-start hook stops a start whose memory no longer matches.
+
+ -- Dmitry R <rdmitry0911@gmail.com>  Sun, 08 Nov 2026 17:30:00 +0200
+
 qdev-host (0.4.0) unstable; urgency=medium
 
   * Proxmox VE web UI behind QSM Direct's TCP 8006 gateway: qdev-host-pve

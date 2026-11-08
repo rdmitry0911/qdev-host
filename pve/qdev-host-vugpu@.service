@@ -1,0 +1,35 @@
+[Unit]
+Description=qdev-host VirGL GPU %i (QEMU vhost-user-gpu for a Proxmox VM)
+Documentation=https://github.com/rdmitry0911/qdev-host
+
+[Service]
+# Started by the VM's hookscript before QEMU; the process serves one QEMU
+# connection and ends when the VM stops.
+Type=simple
+EnvironmentFile=/etc/qdev-host/units/%i.env
+RuntimeDirectory=qdev-host/%i
+RuntimeDirectoryMode=0750
+CacheDirectory=qdev-host/%i
+Environment=MESA_SHADER_CACHE_DIR=/var/cache/qdev-host/%i
+ExecStart=/usr/lib/kvm/vhost-user-gpu $QDEV_ARGS
+Restart=no
+KillSignal=SIGTERM
+TimeoutStopSec=10
+# The guest drives this process through virtio-gpu commands: keep it away
+# from everything it does not need (the render node, its socket, its cache).
+NoNewPrivileges=true
+PrivateNetwork=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=true
+DevicePolicy=closed
+DeviceAllow=char-drm rw
