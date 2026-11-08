@@ -1461,6 +1461,28 @@ static void usage(void)
     exit(2);
 }
 
+/* The device process takes over QEMU's role for the device: raise the soft
+ * NOFILE limit to the hard one as QEMU does at startup (os-posix.c
+ * os_setup_limits). A GPU plugin keeps an fd per guest-RAM alias and per
+ * imported buffer; with a 1024 soft limit it runs out where the same device
+ * inside QEMU did not. */
+static void setup_limits(void)
+{
+    struct rlimit nofile;
+
+    if (getrlimit(RLIMIT_NOFILE, &nofile) < 0) {
+        LOG("unable to query NOFILE limit: %s", strerror(errno));
+        return;
+    }
+    if (nofile.rlim_cur == nofile.rlim_max) {
+        return;
+    }
+    nofile.rlim_cur = nofile.rlim_max;
+    if (setrlimit(RLIMIT_NOFILE, &nofile) < 0) {
+        LOG("unable to set NOFILE limit: %s", strerror(errno));
+    }
+}
+
 int main(int argc, char **argv)
 {
     static const struct option lopts[] = {
@@ -1473,6 +1495,7 @@ int main(int argc, char **argv)
         { "head-origin", 1, 0, 7 }, { "desktop", 1, 0, 8 }, { "kms-copy", 0, 0, 9 }, { "control", 1, 0, 10 },
         { "qemu-qmp", 1, 0, 11 }, { "help", 0, 0, 'h' }, { 0 }
     };
+    setup_limits();
     int c;
     while ((c = getopt_long(argc, argv, "p:s:a:P:B:N:V:D:f:K:Q:S:vh", lopts, NULL)) != -1) {
         switch (c) {
