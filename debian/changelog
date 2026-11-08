@@ -1,3 +1,14 @@
+qdev-host (0.4.0) unstable; urgency=medium
+
+  * Proxmox VE web UI behind QSM Direct's TCP 8006 gateway: qdev-host-pve
+    ships a route for qsm-pve-direct-gateway (/qdev-host/ -> 127.0.0.1:8017,
+    port from /etc/qdev-host/ui.json), and the Hardware panel uses the page's
+    own origin when the page reports the gateway, so a browser that reaches
+    only port 8006 needs no TCP 8017.  With an older gateway, or without one,
+    the panel uses port 8017 as before.
+
+ -- Dmitry R <rdmitry0911@gmail.com>  Sun, 08 Nov 2026 14:45:00 +0200
+
 qdev-host (0.3.0) unstable; urgency=medium
 
   * Proxmox VE web UI: the Hardware-panel overlay is now a pve-ui-overlays

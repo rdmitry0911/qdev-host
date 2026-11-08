@@ -70,6 +70,19 @@ def vm_config(vmid: int) -> dict[str, str]:
             out[k.strip()] = v.strip()
     return out
 
+_UNREADABLE = re.compile(r"unable to parse value of '([^']+)'")
+
+def check_editable(vmid: int) -> None:
+    """Refuse to save a config this node's qemu-server cannot fully read.
+
+    `qm set` writes back only the settings it parsed, so a key from another
+    qemu-server build (dbus-display of the QSM native preview, say) would be
+    dropped silently by any change qdev-host makes."""
+    keys = sorted(set(_UNREADABLE.findall(run(["qm", "config", str(vmid)]).stderr)))
+    if keys:
+        raise QdevError(f"VM {vmid} has settings this node's qemu-server cannot read ({', '.join(keys)}); "
+                        "saving its configuration would drop them, so qdev-host leaves the VM unchanged")
+
 def vm_running(vmid: int) -> bool:
     r = run(["qm", "status", str(vmid)])
     return "running" in r.stdout
@@ -107,7 +120,11 @@ def remove_port_from_args(vmid: int, cfg: dict[str, str]) -> None:
 # ------------------------------------------------------------- hookscript
 def snippets_dir() -> Path:
     """Directory of the first storage with `snippets` content (usually local)."""
-    text = Path("/etc/pve/storage.cfg").read_text()
+    try:
+        text = Path("/etc/pve/storage.cfg").read_text()
+    except FileNotFoundError:
+        # PVE's built-in default when the file was never written: no snippets content
+        text = "dir: local\n\tpath /var/lib/vz\n\tcontent iso,vztmpl,backup\n"
     name = path = None; content = ""
     for line in text.splitlines() + ["dir: __end__"]:
         if re.match(r"^\w+:", line):
@@ -366,10 +383,18 @@ def add_device(vmid: int, dev_id: str, plugin: str, args: str = "", bus: str = P
     dev = {"id": dev_id, "plugin": plugin, "args": args or "", "bus": bus, "display": bool(display),
            "kms": kms or None, "persistent": bool(persistent), "extra": extra or []}
     conf["port_addr"] = port_addr or conf.get("port_addr", "0x08")
+    # every check that can fail comes before the first change to the VM
+    check_editable(vmid)
+    snippets_dir()
     changed_port = False
     if bus == PORT_ID:
         changed_port = ensure_port_in_args(vmid, cfg, conf["port_addr"])
-    ensure_hookscript(vmid, cfg, conf)
+    try:
+        ensure_hookscript(vmid, cfg, conf)
+    except Exception:
+        if changed_port:
+            remove_port_from_args(vmid, vm_config(vmid))
+        raise
     conf["devices"].append(dev)
     save_conf(conf)
     write_unit_env(vmid, dev)
@@ -388,6 +413,7 @@ def remove_device(vmid: int, dev_id: str, keep_process: bool = False, purge_port
     dev = find_device(conf, dev_id)
     if not dev:
         raise QdevError(f"no device {dev_id} on VM {vmid}")
+    check_editable(vmid)
     msgs.append(detach(vmid, dev, keep_process))
     conf["devices"] = [d for d in conf["devices"] if d["id"] != dev_id]
     env = UNIT_DIR / f"{vmid}-{dev_id}.env"

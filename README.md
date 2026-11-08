@@ -297,7 +297,7 @@ Two Debian packages, built with `scripts/mkchroot.sh` + `scripts/build-deb-in-ch
   entry is an overlay descriptor for `pve-ui-overlays` (one script tag).
 
 ```bash
-apt install ./pve-ui-overlays_0.1.0_all.deb ./qdev-host_0.3.0_amd64.deb ./qdev-host-pve_0.3.0_all.deb
+apt install ./pve-ui-overlays_0.1.0_all.deb ./qdev-host_0.4.0_amd64.deb ./qdev-host-pve_0.4.0_all.deb
 qdevctl add 109 tbvga0 --plugin tb-vga --args vram=16     # q35 VM; adds hookscript + root port (args)
 qm start 109                                               # hookscript starts the process and hot-plugs
 qdevctl list                                               # VM 109  tbvga0  tb-vga  bus=qdev-rp0  attached (01:00.0)
@@ -329,6 +329,10 @@ Direct's structural pattern:
   because the operations edit the VM's `args`, which PVE reserves to root).
   The browser must trust the certificate on port 8017 once (the panel shows a
   link when the service is unreachable).
+- On a node behind QSM Direct's TCP 8006 gateway (exp230 or later) the
+  package's route publishes the service as `https://NODE:8006/qdev-host/`, and
+  the panel uses that same origin: a browser that reaches only port 8006 needs
+  no TCP 8017 ([details](pve/README.md)).
 
 Details in [pve/README.md](pve/README.md). Verified on a PVE 9.2.21 node
 (pve-qemu-kvm 11.0.3, qemu-server 9.2.11, qsm-pve-direct installed, in both

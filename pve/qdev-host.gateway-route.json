@@ -1,0 +1,6 @@
+{
+  "id": "qdev-host",
+  "prefix": "/qdev-host/",
+  "port": 8017,
+  "port_from": {"file": "/etc/qdev-host/ui.json", "key": "port"}
+}

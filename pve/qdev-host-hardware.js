@@ -17,27 +17,44 @@
     const ID_RE = /^[A-Za-z][A-Za-z0-9_-]{0,31}$/;
     const GROUP = 32; // after PCI devices (30), before serial ports (35)
 
-    const serviceOrigin = () => {
+    // Behind QSM Direct's TCP 8006 gateway (qsm-pve-direct-gateway from exp230) the
+    // node service is published under /qdev-host/ of the page's own origin, so a
+    // browser that reaches only port 8006 can use it.  An older gateway lacks the
+    // route: then pveproxy or HAProxy answers instead of the service, and the
+    // panel falls back to the service's own port for the rest of the page's life.
+    const GATEWAY_PREFIX = '/qdev-host';
+    let viaGateway = !!(typeof window !== 'undefined' && window.QSM_DIRECT_ENDPOINT && window.QSM_DIRECT_ENDPOINT.gateway);
+    const portOrigin = () => {
         const address = new URL(location.origin || `https://${location.hostname}`);
         address.port = String(ENDPOINT.port);
         return address.origin;
     };
+    const serviceOrigin = () => (viaGateway ? `${location.origin}${GATEWAY_PREFIX}` : portOrigin());
+    const fromService = (response) => !!response && /^qdev-host-api\b/.test(response.headers.get('Server') || '');
     const request = async (method, path, params) => {
         const cookieName = (Proxmox.Setup && Proxmox.Setup.auth_cookie_name) || 'PVEAuthCookie';
         const ticket = Ext.util.Cookies.get(cookieName);
         const user = Proxmox.UserName;
         if (!ticket || !user) { throw new Error('not authenticated'); }
         const headers = { 'Authorization': `Bearer ${ticket}`, 'X-QDev-User': user };
-        const options = { method, mode: 'cors', cache: 'no-store', credentials: 'omit', headers,
-            signal: AbortSignal.timeout(method === 'GET' ? 15000 : 90000) };
-        if (method !== 'GET' && params) {
-            headers['Content-Type'] = 'application/json';
-            options.body = JSON.stringify(params);
+        const options = () => {
+            const value = { method, mode: 'cors', cache: 'no-store', credentials: 'omit', headers,
+                signal: AbortSignal.timeout(method === 'GET' ? 15000 : 90000) };
+            if (method !== 'GET' && params) {
+                headers['Content-Type'] = 'application/json';
+                value.body = JSON.stringify(params);
+            }
+            return value;
+        };
+        const send = () => fetch(`${serviceOrigin()}${path}`, options()).catch(() => null);
+        let response = await send();
+        // Retry on the port only when the service cannot have seen the request:
+        // another server answered, or a read failed before any reply.
+        if (viaGateway && !fromService(response) && (response || method === 'GET')) {
+            viaGateway = false;
+            response = await send();
         }
-        let response;
-        try {
-            response = await fetch(`${serviceOrigin()}${path}`, options);
-        } catch (cause) {
+        if (!response) {
             const error = new Error(`qdev-host node service at ${serviceOrigin()} is unreachable`);
             error.unreachable = true;
             throw error;

@@ -6,7 +6,7 @@ monitor API (`PVE::QemuServer::Monitor::mon_cmd`), the standard guest hookscript
 and systemd.
 
 ```bash
-apt install ./pve-ui-overlays_0.1.0_all.deb ./qdev-host_0.3.0_amd64.deb ./qdev-host-pve_0.3.0_all.deb
+apt install ./pve-ui-overlays_0.1.0_all.deb ./qdev-host_0.4.0_amd64.deb ./qdev-host-pve_0.4.0_all.deb
 qdevctl add 128 tbvga0 --plugin tb-vga --args vram=16      # define + hookscript + root port in args
 qm stop 128 && qm start 128                                  # the root port appears at the next start
 qdevctl list 128                                             # tbvga0 ... attached
@@ -62,6 +62,17 @@ Device* and *Remove*. Two parts, modelled on QSM Direct's PVE integration:
    `path=/vms/VMID` and `privs=VM.Config.HWType`, then checks the confirmed user
    against the allow-list. Nothing is registered in pveproxy or pvedaemon.
 
+   **Behind QSM Direct's TCP 8006 gateway** (qsm-pve-direct-gateway from
+   0.4.0+stock4.14~exp230, enabled), the package's route file
+   `/usr/share/qsm-pve-direct-gateway/routes.d/qdev-host.json` publishes the
+   service as `https://NODE:8006/qdev-host/` (to `127.0.0.1:<port from ui.json>`),
+   applied by a dpkg trigger without a pveproxy restart. The panel sees the
+   gateway in `window.QSM_DIRECT_ENDPOINT` and uses that same-origin path, so a
+   browser that reaches only the forwarded port 8006 needs neither port 8017 nor
+   a certificate exception. When the reply does not come from the service (an
+   older gateway without the route), it falls back to port 8017.
+   `qsm-pve-direct-gateway routes` lists what is published.
+
    | Method | Path | Action |
    |---|---|---|
    | GET | `/api/v1/vms/VMID` | devices with state, plugins (+ argument schema), KMS outputs |
@@ -91,6 +102,9 @@ Troubleshooting:
 - The row says *node service unreachable*: the browser has not accepted the
   node certificate on port 8017 yet; the row links to `https://NODE:8017/`,
   open it once, then reload the UI. Also check `systemctl status qdev-host-api`.
+  On a node behind the QSM gateway the browser may not reach 8017 at all:
+  check `qsm-pve-direct-gateway routes` (empty = the gateway is older than
+  exp230 or the route was not applied: `qsm-pve-direct-gateway refresh`).
 - No qdev-host entries at all: `pve-ui-overlays status`;
   `disabled-unsupported-pve` after a PVE upgrade means the new `pve-manager`
   is not in the allow-list yet (review the template, add the row printed by

@@ -32,6 +32,7 @@ override_dh_auto_install:
 	install -D -m 644 pve/qdev_host_api.py debian/qdev-host-pve/usr/lib/qdev-host/pve/qdev_host_api.py
 	install -D -m 644 pve/qdev-host-hardware.js debian/qdev-host-pve/usr/share/pve-manager/js/qdev-host-hardware.js
 	install -D -m 644 pve/qdev-host.overlay.json debian/qdev-host-pve/usr/share/pve-ui-overlays/overlays.d/qdev-host.json
+	install -D -m 644 pve/qdev-host.gateway-route.json debian/qdev-host-pve/usr/share/qsm-pve-direct-gateway/routes.d/qdev-host.json
 	install -D -m 644 pve/README.md debian/qdev-host-pve/usr/share/doc/qdev-host-pve/README.md
 
 override_dh_auto_clean:
