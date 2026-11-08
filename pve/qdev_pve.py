@@ -70,7 +70,11 @@ def vm_config(vmid: int) -> dict[str, str]:
             out[k.strip()] = v.strip()
     return out
 
-_UNREADABLE = re.compile(r"unable to parse value of '([^']+)'")
+def unreadable_settings(vmid: int, stderr: str) -> list[str]:
+    """Keys `qm config` could not parse in this VM's own config.  Warnings about
+    other files (a storage plugin's storage.cfg properties, say) do not count."""
+    pattern = re.compile(rf"^vm {vmid} - unable to parse value of '([^']+)'", re.M)
+    return sorted(set(pattern.findall(stderr)))
 
 def check_editable(vmid: int) -> None:
     """Refuse to save a config this node's qemu-server cannot fully read.
@@ -78,7 +82,7 @@ def check_editable(vmid: int) -> None:
     `qm set` writes back only the settings it parsed, so a key from another
     qemu-server build (dbus-display of the QSM native preview, say) would be
     dropped silently by any change qdev-host makes."""
-    keys = sorted(set(_UNREADABLE.findall(run(["qm", "config", str(vmid)]).stderr)))
+    keys = unreadable_settings(vmid, run(["qm", "config", str(vmid)]).stderr)
     if keys:
         raise QdevError(f"VM {vmid} has settings this node's qemu-server cannot read ({', '.join(keys)}); "
                         "saving its configuration would drop them, so qdev-host leaves the VM unchanged")
