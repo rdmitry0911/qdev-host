@@ -22,9 +22,9 @@ GLIB_LIBS   := $(shell pkg-config --libs gio-unix-2.0 glib-2.0)
 DRM_CFLAGS  := $(shell pkg-config --cflags libdrm)
 DRM_LIBS    := $(shell pkg-config --libs libdrm)
 CFLAGS ?= -O2 -g -Wall -Wno-unused-parameter
-PLUGINS := plugins/tb-vga/tb-vga.so
+PLUGINS := plugins/tb-vga/tb-vga.so plugins/test-v2/test-v2.so
 
-all: qdev-host $(PLUGINS) tools/display1-input-bench
+all: qdev-host $(PLUGINS) tools/display1-input-bench tools/vfu-test-client
 
 vfu: $(VFU_LOCAL)/lib/libvfio-user.so.0
 $(VFU_LOCAL)/lib/libvfio-user.so.0: $(wildcard $(VFU_SRC)/lib/*.[ch] $(VFU_SRC)/include/*.h $(VFU_SRC)/include/*/*.h)
@@ -42,6 +42,10 @@ qdev-host: qdev-host.c kms-sink.c kms-sink.h dbus/dbus-display1.c dbus/dbus-disp
 tools/display1-input-bench: tools/display1-input-bench.c
 	$(CC) $(CFLAGS) $(GLIB_CFLAGS) -o $@ $< $(GLIB_LIBS)
 
+# test client for plugins without a VM: speaks vfio-user itself, needs only the protocol header
+tools/vfu-test-client: tools/vfu-test-client.c $(VFU_DEP)
+	$(CC) $(CFLAGS) $(VFU_CFLAGS) -o $@ $< -lpthread
+
 plugins/%.so: plugins/%.c qdp.h $(VFU_DEP)
 	$(CC) $(CFLAGS) -fPIC -shared -I. $(VFU_CFLAGS) -o $@ $< $(VFU_LIBS) -lpthread
 
@@ -52,7 +56,7 @@ install: all
 	install -D -m 644 plugins/tb-vga/edid-1280x800.bin $(DESTDIR)$(PREFIX)/share/qdev-host/edid-1280x800.bin
 
 clean:
-	rm -f qdev-host plugins/*/*.so tools/display1-input-bench dbus/dbus-display1.c dbus/dbus-display1.h
+	rm -f qdev-host plugins/*/*.so tools/display1-input-bench tools/vfu-test-client dbus/dbus-display1.c dbus/dbus-display1.h
 
 distclean: clean
 	rm -rf build

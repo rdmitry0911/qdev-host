@@ -17,3 +17,4 @@ debian/*.substvars
 debian/files
 debian/debhelper-build-stamp
 build/
+tools/vfu-test-client
