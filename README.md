@@ -129,7 +129,7 @@ make install PREFIX=/usr/local
 make distclean                # also removes build/
 ```
 
-The vendored libvfio-user (`VENDORED_COMMIT`) carries two patches the host and v2
+The vendored libvfio-user (`VENDORED_COMMIT`) carries three patches the host and v2
 plugins rely on; an upstream build does not compile with the host (`#error`):
 
 - `vfu_dma_info_t` has `int fd` and `uint64_t fd_offset` (appended): the region's
@@ -138,6 +138,9 @@ plugins rely on; an upstream build does not compile with the host (`#error`):
   of the same file, closed after the `dma_unregister` callback of the last of them.
 - `vfu_irq_trigger()` is thread-safe: a mutex serialises the eventfd lookup and
   write against `SET_IRQS` and context reset; it is never held across a callback.
+- On a lost connection the reset callback (`VFU_RESET_LOST_CONN`) runs before the
+  DMA regions are removed (upstream removed them first, although its documentation
+  says the context is cleaned up after the callback).
 
 `dbus/dbus-display1.xml` is QEMU's interface definition (Linux variant); the GDBus
 glue is generated at build time with `gdbus-codegen`.
@@ -480,6 +483,29 @@ reads the v2 fields of a v2 plugin only, so v1 plugins load unchanged.
   before a device reset or FLR and before it drops a lost client (so
   `dma_register()`, `dma_unregister()` and `reset()` run quiesced), and calls
   `resume()` once the request has been handled.
+- **Lost connection.** Order: `quiesce()`, `reset(VFU_RESET_LOST_CONN)` with the
+  guest RAM regions still mapped, `dma_unregister()` of each region, IRQ eventfds
+  closed, `resume()`, then the host waits for the next client with the plugin's
+  state kept. A device that cannot serve another client returns `QDP_RESET_EXIT`
+  from `reset(LOST_CONN)`: the host calls `teardown()` instead of `resume()` and
+  exits with status 0.
+- **Lifetime.** `teardown()` (on `SIGTERM`/`SIGINT` or after `QDP_RESET_EXIT`) is
+  the last call into the plugin. The host never `dlclose()`s a plugin (it is
+  opened `RTLD_NODELETE`) and leaves a v2 plugin's teardown with `_exit()`
+  after flushing stdio, so threads the plugin cannot join do not race library
+  destructors.
+- **Scanout.** The host calls `get_scanout()` once right after `setup()` (before
+  serving the client), then after each `frame_ready()` batch (or at the poll rate
+  without `QDP_F_PLUGIN_DAMAGE`), always on the main loop. It reads only the
+  buffer of its latest `get_scanout()` result, and all its reads (inline Display1
+  updates, PPM, the KMS copy path) are on the main loop, so it is done with the
+  previous buffer when it calls `get_scanout()` again. Not covered: Display1
+  listeners that took the memfd with `ScanoutMap` read it asynchronously until the
+  next `ScanoutMap`, and the zero-copy KMS sink scans the memfd out until it
+  switches; a plugin that reuses an older buffer may show torn frames there. A
+  buffer change (another fd or offset) is a mode change for the sinks (unmap/map,
+  a new `ScanoutMap` to each listener), so flipping between two buffers costs a
+  synchronous D-Bus call per listener and frame.
 - **Host services** (`env->host_ops`, callable from any plugin thread between
   `setup()` returning and `teardown()`):
   - `irq_trigger(host, subindex)`: raise MSI/MSI-X vector `subindex` (INTx with 0
@@ -487,7 +513,9 @@ reads the v2 fields of a v2 plugin only, so v1 plugins load unchanged.
     thread on the way), serialised only against `SET_IRQS`/reset inside
     libvfio-user, never against the main loop: a plugin thread does not wait for
     an MMIO request being handled, and a region handler or `quiesce()` may block
-    on a thread that raises IRQs. Returns `-EINVAL` when the guest has not enabled
+    on a thread that raises IRQs. The host never holds that lock while it calls
+    into the plugin, so a plugin may hold its own mutex across `irq_trigger()`
+    and take it in `quiesce()`, `resume()`, `reset()` or the DMA callbacks. Returns `-EINVAL` when the guest has not enabled
     the interrupt (the event is dropped, as on real PCI). Cost: about 1-2 µs per
     call (measured with test-v2, see below).
   - `frame_ready(host, {seq, x, y, w, h})`: a new frame is in the scanout
@@ -497,8 +525,10 @@ reads the v2 fields of a v2 plugin only, so v1 plugins load unchanged.
     (damage united, the last `seq` wins).
   - `cursor_changed(host)`: the host calls `get_cursor()` on its main loop soon
     after. `qdp_cursor.x/y` is the image's top-left corner (pointer minus hotspot).
-  - `log(host, level, fmt, ...)`: through the host's stderr, one line per call;
-    level 3 (debug) only with `-v`.
+  - `log(host, level, fmt, ...)`: through the host's stderr, one line per call,
+    `qdev-host: <name>: [error: |warning: |debug: ]<text>`; level 3 only with `-v`.
+    A plugin may also write to stderr itself: the host does not capture or rewrite
+    fd 2, so the plugin's own lines (and their prefixes) pass through unchanged.
 - `tick()` runs every `tick_ms` (0 = never) for v2 plugins.
 
 The scanout of a v2 plugin is still a memfd (`get_scanout()`); a GPU plugin copies
@@ -524,7 +554,9 @@ QEMU=/path/to/qemu-11/build/qemu-system-x86_64 tools/test-v2-qemu.sh /tmp/qdev-q
   the fd), vaddr == `mmap(fd, fd_offset)`, an identical re-map, a region without
   fd; IRQs from the plugin thread with latency through a DMA record; 200 eventfd
   replacements under IRQ load; 100 unmap/map cycles of the region the IRQ thread
-  writes into (quiesce); reset; Display1 listener (`Scanout`, `Update` per frame,
+  writes into (quiesce); reset; `reset(LOST_CONN)` with the regions still mapped;
+  the initial `get_scanout()` without any `frame_ready()`; `QDP_RESET_EXIT` (host
+  exits 0 by itself); Display1 listener (`Scanout`, `Update` per frame,
   `CursorDefine`, `MouseSet`); control socket `screendump` checked against the
   frame seq in the picture; tb-vga config space, EDID/DISPI/QEXT registers, mode
   set, VRAM write and PPM.
@@ -635,7 +667,7 @@ docs/              overhead report, Thunderbolt-on-stock notes (Russian), live-d
 pve/               qdevctl + qdev_pve.py (operations), qdev_host_api.py (node service), qdev-host-hardware.js +
                    qdev-host.overlay.json (Hardware panel overlay for pve-ui-overlays), hookscript, systemd units
 debian/, scripts/  Debian packaging; mkchroot.sh and build-deb-in-chroot.sh build the debs in a trixie chroot
-third_party/       vendored libvfio-user (BSD-3-Clause), with the two patches described under Build
+third_party/       vendored libvfio-user (BSD-3-Clause), with the three patches described under Build
 ```
 
 ## License
