@@ -1,3 +1,24 @@
+qdev-host (0.6.1) unstable; urgency=medium
+
+  * TB bus for macOS guests: macOS waits for the ports' own PCIe hot-plug
+    interrupts, but q35 hands bridge hot-plug to ACPI, and a root port's
+    power controller keeps a hot-plugged device unpowered until the guest
+    switches the slot on, which macOS does not do. For a VM with
+    isa-applesmc in its args the bus now adds
+    -global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off and gives its
+    ports power_controller_present=off. qdevctl tb --hotplug
+    native|acpi|auto and --power-controller on|off|default override it.
+    Checked with macOS 26.1: devices on TB ports at the start and hot-plugged
+    ones (qemu-xhci, tb-vga, virtio NIC) are configured, USB devices on the
+    TB controller plug and unplug; a PCIe unplug completes when the VM stops.
+  * A vfio-user device the guest has not released keeps its process until
+    the VM stops instead of disappearing under the guest; post-stop stops
+    such processes.
+  * Removing the last device keeps the VM's TB bus settings while the bus
+    stays in its args.
+
+ -- Dmitry R <rdmitry0911@gmail.com>  Mon, 09 Nov 2026 17:30:00 +0100
+
 qdev-host (0.6.0) unstable; urgency=medium
 
   * TB bus: hot-plug PCIe root ports qdev-tb0..3 (pcie.0 slot 0x09) whose

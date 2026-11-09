@@ -340,14 +340,34 @@ def xhci_check(args: str) -> int:
 def _opts(d: dict) -> str:
     return ",".join(f"{k}={v}" for k, v in d.items())
 
-def port_devices(conf: dict) -> list[tuple[str, dict]]:
+def macos_guest(vmcfg: dict) -> bool:
+    return "isa-applesmc" in (vmcfg or {}).get("args", "")
+
+def power_controller(conf: dict, vmcfg: dict | None) -> str | None:
+    """on/off for the ports' slot power controller, None for QEMU's default (on).
+    macOS never powers a slot on: with a power controller a hot-plugged device stays
+    unpowered and invisible to it.  Without one, plug works but the guest cannot
+    switch the slot off, so QEMU does not complete a PCIe unplug."""
+    value = conf.get("tb", {}).get("power-controller")
+    if value in ("on", "off"):
+        return value
+    if vmcfg is not None and macos_guest(vmcfg) and hotplug_mode(conf, vmcfg) == "native":
+        return "off"
+    return None
+
+def port_devices(conf: dict, vmcfg: dict | None = None) -> list[tuple[str, dict]]:
     out = []
+    pcp = power_controller(conf, vmcfg)
     for i in range(port_count(conf)):
         p = {"driver": "pcie-root-port", "bus": "pcie.0", "addr": f"{TB_SLOT:02x}.{i}",
              "multifunction": "on", "chassis": str(CHASSIS_BASE + i), "port": str(CHASSIS_BASE + i),
              "io-reserve": "0", "mem-reserve": "32M", "pref64-reserve": "1G"}
+        if pcp:
+            p["power_controller_present"] = pcp
         for key in ("io-reserve", "mem-reserve", "pref64-reserve"):
             v = conf.get("tb", {}).get(key)
+            if v is None and pcp == "off" and vmcfg is not None and macos_guest(vmcfg):
+                v = ""      # macOS sizes Thunderbolt port windows itself: QEMU's defaults, as checked
             if v == "":
                 p.pop(key)
             elif v:
@@ -438,7 +458,7 @@ def write_files(vmid: int, conf: dict, vmcfg: dict, starting: bool = False) -> l
     """Write VMID.cfg and VMID.aml (STARTING: at pre-start, with the taps' settings).
     PCI pass-through devices are not in VMID.cfg: post-start hot-plugs them."""
     notes = []
-    groups: list[tuple[str, str, dict]] = [("device", n, p) for n, p in port_devices(conf)]
+    groups: list[tuple[str, str, dict]] = [("device", n, p) for n, p in port_devices(conf, vmcfg)]
     for dev in tb_devices(conf):
         kind = dev["plugin"]
         if kind == "tb-net":
@@ -465,24 +485,49 @@ def write_files(vmid: int, conf: dict, vmcfg: dict, starting: bool = False) -> l
     return notes
 
 # -------------------------------------------------------------- VM args
-def arg_groups(vmid: int) -> str:
-    return f"-readconfig {cfg_path(vmid)} -acpitable file={aml_path(vmid)}"
+# QEMU's q35 hands every cold-plugged bridge's hot-plug to ACPI (since 6.1).  macOS
+# ignores those ACPI events on its Thunderbolt ports: it waits for the port's own
+# PCIe hot-plug interrupts ("linkInterrupts 1" in its IOPCIFamily log).
+NATIVE_HOTPLUG_GLOBAL = "-global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off"
+NATIVE_HOTPLUG_PATTERN = r"-global\s+ICH9-LPC\.acpi-pci-hotplug-with-bridge-support=off"
+HOTPLUG_MODES = ("auto", "native", "acpi")
+
+def hotplug_mode(conf: dict, vmcfg: dict) -> str:
+    """native or acpi; auto = native for a macOS guest (isa-applesmc in args) or
+    when the VM's args already switch ACPI PCI hot-plug off."""
+    mode = conf.get("tb", {}).get("hotplug", "auto")
+    if mode in ("native", "acpi"):
+        return mode
+    args = vmcfg.get("args", "")
+    return "native" if (macos_guest(vmcfg) or Q._find(args, NATIVE_HOTPLUG_PATTERN)) else "acpi"
+
+def arg_groups(vmid: int, conf: dict | None = None, vmcfg: dict | None = None) -> str:
+    groups = f"-readconfig {cfg_path(vmid)} -acpitable file={aml_path(vmid)}"
+    if conf is not None and vmcfg is not None and hotplug_mode(conf, vmcfg) == "native":
+        groups += " " + NATIVE_HOTPLUG_GLOBAL
+    return groups
 
 def arg_patterns(vmid: int) -> list[str]:
     return [rf"-readconfig\s+{re.escape(str(cfg_path(vmid)))}", rf"-acpitable\s+file={re.escape(str(aml_path(vmid)))}"]
 
-def in_args(vmid: int, vmcfg: dict) -> bool:
-    return all(Q._find(vmcfg.get("args", ""), p) for p in arg_patterns(vmid))
+def in_args(vmid: int, vmcfg: dict, conf: dict | None = None) -> bool:
+    args = vmcfg.get("args", "")
+    if not all(Q._find(args, p) for p in arg_patterns(vmid)):
+        return False
+    if conf is not None:
+        return (hotplug_mode(conf, vmcfg) == "native") == bool(Q._find(args, NATIVE_HOTPLUG_PATTERN))
+    return True
 
-def ensure_args(vmid: int, vmcfg: dict) -> bool:
+def ensure_args(vmid: int, vmcfg: dict, conf: dict | None = None) -> bool:
     """Put the TB bus in front of the VM's args: devices in args (a qdev-host GPU)
     may sit on its ports, and QEMU creates devices in command line order."""
-    if in_args(vmid, vmcfg):
+    if in_args(vmid, vmcfg, conf):
         return False
+    groups = arg_groups(vmid, conf, vmcfg)
     args = vmcfg.get("args", "")
-    for p in arg_patterns(vmid):
+    for p in arg_patterns(vmid) + [NATIVE_HOTPLUG_PATTERN]:
         args = Q._drop(args, p)
-    Q.qm_set(vmid, "args", (arg_groups(vmid) + " " + args).strip())
+    Q.qm_set(vmid, "args", (groups + " " + args).strip())
     return True
 
 def is_port(bus: str) -> bool:
@@ -492,12 +537,12 @@ def ensure_bus(vmid: int, conf: dict, vmcfg: dict) -> bool:
     """The VM's TB bus in its files and args. Returns True if args changed."""
     conf.setdefault("tb", {"ports": DEFAULT_PORTS})
     write_files(vmid, conf, vmcfg)
-    return ensure_args(vmid, vmcfg)
+    return ensure_args(vmid, vmcfg, conf)
 
 def remove_args(vmid: int, vmcfg: dict) -> None:
     args = vmcfg.get("args", "")
     new = args
-    for p in arg_patterns(vmid):
+    for p in arg_patterns(vmid) + [NATIVE_HOTPLUG_PATTERN]:
         new = Q._drop(new, p)
     if new != args:
         Q.qm_set(vmid, "args", new or None)
@@ -630,6 +675,10 @@ def unplug(vmid: int, dev: dict, timeout: float = 30.0) -> str:
     Q.mon_cmd(vmid, "device_del", id=dev["id"])
     gone = _wait_gone(vmid, ids, 3.0 if kind == "tb-usb" else timeout)
     if not gone:
+        conf = Q.load_conf(vmid)
+        if kind != "tb-usb" and power_controller(conf, Q.read_vm_config(vmid)) == "off":
+            return (f"{dev['id']}: device_del sent; the guest cannot switch off a port without a power "
+                    "controller (macOS guests), so QEMU removes the device when the VM stops")
         return f"{dev['id']}: device_del sent, the guest has not released it yet"
     if kind == "tb-net":
         try:
@@ -725,7 +774,7 @@ def add(vmid: int, conf: dict, vmcfg: dict, dev: dict) -> list[str]:
     conf["devices"].append(dev)
     try:
         write_files(vmid, conf, vmcfg)
-        changed = ensure_args(vmid, vmcfg)
+        changed = ensure_args(vmid, vmcfg, conf)
         Q.ensure_hookscript(vmid, vmcfg, conf)
     except Exception:
         conf["devices"].remove(dev)
@@ -785,9 +834,14 @@ def purge(vmid: int, conf: dict, vmcfg: dict) -> None:
     for p in (cfg_path(vmid), aml_path(vmid)):
         p.unlink(missing_ok=True)
 
-def set_ports(vmid: int, conf: dict, n: int, acpi: str | None = None) -> list[str]:
+def set_ports(vmid: int, conf: dict, n: int, acpi: str | None = None, hotplug: str | None = None,
+              power_controller: str | None = None) -> list[str]:
     if acpi is not None and acpi not in ACPI_MODES:
         raise Q.QdevError(f"ACPI properties: {', '.join(ACPI_MODES)}")
+    if hotplug is not None and hotplug not in HOTPLUG_MODES:
+        raise Q.QdevError(f"hot-plug: {', '.join(HOTPLUG_MODES)}")
+    if power_controller is not None and power_controller not in ("on", "off", "default"):
+        raise Q.QdevError("power controller: on, off or default")
     if not 1 <= n <= MAX_PORTS:
         raise Q.QdevError(f"the TB bus has 1..{MAX_PORTS} ports")
     used = [d for d in on_port(conf) if int(d["bus"][len(PORT_PREFIX):]) >= n]
@@ -797,12 +851,19 @@ def set_ports(vmid: int, conf: dict, n: int, acpi: str | None = None) -> list[st
     conf.setdefault("tb", {})["ports"] = n
     if acpi is not None:
         conf["tb"]["acpi"] = acpi
+    if hotplug is not None:
+        conf["tb"]["hotplug"] = hotplug
+    if power_controller == "default":
+        conf["tb"].pop("power-controller", None)
+    elif power_controller is not None:
+        conf["tb"]["power-controller"] = power_controller
     vmcfg = Q.vm_config(vmid)
     write_files(vmid, conf, vmcfg)
-    changed = ensure_args(vmid, vmcfg)
+    changed = ensure_args(vmid, vmcfg, conf)
     Q.ensure_hookscript(vmid, vmcfg, conf)
     Q.save_conf(conf)
-    return [f"VM {vmid}: TB bus with {n} port(s), ACPI properties {acpi_mode(conf)}" + (", added to args" if changed else "") +
+    return [f"VM {vmid}: TB bus with {n} port(s), ACPI properties {acpi_mode(conf)}, "
+            f"{hotplug_mode(conf, vmcfg)} hot-plug" + (", args updated" if changed else "") +
             (": the change applies at the next VM start" if Q.vm_running(vmid) else "")]
 
 # --------------------------------------------------------------- hooks
@@ -810,9 +871,9 @@ def pre_start(vmid: int, conf: dict) -> list[str]:
     if not conf.get("tb"):
         return []
     vmcfg = Q.vm_config(vmid)
-    if not in_args(vmid, vmcfg):
-        return [f"the TB bus is not in VM {vmid}'s args (edited by hand?); run: qdevctl tb {vmid}"]
-    return write_files(vmid, conf, vmcfg, starting=True)
+    notes = [] if in_args(vmid, vmcfg, conf) else [
+        f"VM {vmid}'s args do not match its TB bus settings (edited by hand?); run: qdevctl tb {vmid}"]
+    return notes + write_files(vmid, conf, vmcfg, starting=True)
 
 def post_start(vmid: int, conf: dict) -> list[str]:
     """Hot-plug the PCI pass-through devices; before qdev-host's vfio-user devices,
@@ -847,6 +908,7 @@ def describe(vmid: int, conf: dict, vmcfg: dict, running: bool) -> tuple[dict, d
         if d["id"] in present:
             where[d["id"]] = d["bus"]
     ports_in_vm = running and port_id(0) in (present or peripherals(vmid))
-    info = {"enabled": bool(conf.get("tb")), "ports": port_count(conf), "acpi": acpi_mode(conf), "in_args": in_args(vmid, vmcfg),
+    info = {"enabled": bool(conf.get("tb")), "ports": port_count(conf), "acpi": acpi_mode(conf), "in_args": in_args(vmid, vmcfg, conf), "hotplug": hotplug_mode(conf, vmcfg),
+            "power_controller": power_controller(conf, vmcfg) or "on",
             "in_vm": bool(ports_in_vm)}
     return info, where

@@ -100,5 +100,18 @@ with tempfile.TemporaryDirectory() as d:
     check("aml with qdev-rp0", b"S40_" in aml and b"S4B_" in aml and sum(aml) % 256 == 0)
     check("no notes", notes == [], str(notes))
 
+# macOS guests: native PCIe hot-plug for the VM, ports without a power controller
+mac = {"args": "-device isa-applesmc,osk=x -cpu host"}
+lin = {"args": "-cpu host"}
+c = {"tb": {"ports": 2}}
+check("macOS hot-plug native", T.hotplug_mode(c, mac) == "native" and T.hotplug_mode(c, lin) == "acpi")
+check("macOS args", T.NATIVE_HOTPLUG_GLOBAL in T.arg_groups(990, c, mac) and T.NATIVE_HOTPLUG_GLOBAL not in T.arg_groups(990, c, lin))
+check("macOS ports", all(p.get("power_controller_present") == "off" for _, p in T.port_devices(c, mac))
+      and all("power_controller_present" not in p for _, p in T.port_devices(c, lin)))
+check("macOS reserves", all("io-reserve" not in p and "pref64-reserve" not in p for _, p in T.port_devices(c, mac))
+      and all(p.get("io-reserve") == "0" for _, p in T.port_devices(c, lin)))
+check("explicit override", T.power_controller({"tb": {"power-controller": "on"}}, mac) == "on"
+      and T.hotplug_mode({"tb": {"hotplug": "acpi"}}, mac) == "acpi")
+
 print("PASS" if not failures else f"{failures} FAILED")
 sys.exit(1 if failures else 0)

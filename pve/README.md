@@ -240,15 +240,34 @@ with its device; on a second node an AMD USB 3 controller passed through
 (Add, Edit, Remove in the PCI, Network and USB dialogs) passes the headless
 test `tools/pve-tb-ui-test.mjs`.
 
-macOS (a Sequoia-era guest with OpenCore on PVE 9.2.21, machine q35): macOS reads
-the properties (with `thunderbolt` it spreads the ports' bus numbers 14/72/134/195
-as for Thunderbolt), but it configured no device behind any PCIe root port of
-that VM: not on the TB ports in any of the three modes, with or without an I/O
-window, and not on PVE's own `ich9-pcie-port-2` either (a control xHCI), while
-everything behind PVE's conventional `pci.N` bridges works. It also ignored hot-plug
-and the unplug requests on the TB ports. So that guest can use the TB bus only once
-it configures root-port devices at all; another macOS VM (Ventura, machine
-pc-q35-8.1, PCI pass-through on PVE's ports) does, and is the next one to try.
+**macOS** (checked with macOS 26.1 on OpenCore, SMBIOS iMacPro1,1, PVE 9.2.21): macOS reads
+the properties (`PCI-Thunderbolt`, `IOPCITunnelLinkChange` on the ports) and handles
+the ports as Thunderbolt hot-plug bridges that wait for the port's own PCIe hot-plug
+interrupts (its IOPCIFamily log: `supportsHotPlug 49, linkInterrupts 1`). Two QEMU
+defaults stand in the way, and qdev-host changes both for a macOS guest (`isa-applesmc`
+in its args; `qdevctl tb VMID --hotplug native|acpi|auto --power-controller on|off|default`):
+
+- q35 hands the hot-plug of every cold-plugged bridge to ACPI (since QEMU 6.1;
+  `hw/acpi/pcihp.c`), and macOS ignores those ACPI events on its Thunderbolt ports.
+  The TB bus adds `-global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off` to the
+  args (native PCIe hot-plug for the whole VM, as PVE does for VMs created before 6.1).
+- A `pcie-root-port` has a slot power controller, and an empty slot starts powered off:
+  a hot-plugged device stays unpowered until the guest switches the slot on, which
+  macOS does not do on a Thunderbolt port. The TB ports of a macOS VM therefore have
+  `power_controller_present=off`.
+
+With both, in that macOS VM: a USB controller and a virtio NIC on TB ports at the VM
+start are configured; a qemu-xhci, tb-vga and a virtio NIC hot-plugged into the
+running macOS are configured in about 6 s; USB devices of the node on the TB USB
+controller are plugged, unplugged and plugged again. Not possible with stock QEMU:
+the PCIe *unplug* on these ports. QEMU removes a device only after the guest switches
+the slot off, and without a power controller there is nothing to switch, so a removed
+PCIe device goes away when the VM stops (`--power-controller on` makes macOS release
+devices at once, but then a later hot-plug into that port stays unpowered).
+
+Linux guests keep QEMU's defaults (ACPI hot-plug, power controller): there both
+directions work. Switching an existing Linux VM to native hot-plug can change its
+PCI slot view and so the names of its network interfaces.
 
 ## Web UI (Hardware panel)
 

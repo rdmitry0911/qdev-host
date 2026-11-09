@@ -440,9 +440,13 @@ def detach(vmid: int, dev: dict, keep_process: bool) -> str:
     gone = True
     if vm_running(vmid):
         gone = device_del(vmid, dev["id"])
+    if not gone:
+        # the guest still has the device: its process stays until the VM stops (post-stop)
+        return (f"{dev['id']}: device_del sent, the guest has not released it yet; its process runs until "
+                "the device is gone or the VM stops")
     if not keep_process:
         stop_process(vmid, dev["id"])
-    return f"{dev['id']}: {'detached' if gone else 'device_del sent, guest has not released it yet'}" + ("" if keep_process else ", process stopped")
+    return f"{dev['id']}: detached" + ("" if keep_process else ", process stopped")
 
 # ------------------------------------------------------------ validation
 ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
@@ -895,7 +899,12 @@ def remove_device(vmid: int, dev_id: str, keep_process: bool = False, purge_port
             if conf.get("tb"):
                 import qdev_tb
                 qdev_tb.purge(vmid, conf, vm_config(vmid))
-        conf_path(vmid).unlink(missing_ok=True)
+        if conf.get("tb") and not purge_port:
+            # the bus stays in args: keep its settings for the files written at the next start
+            conf["previous_hookscript"] = None
+            save_conf(conf)
+        else:
+            conf_path(vmid).unlink(missing_ok=True)
         msgs.append(f"VM {vmid}: no devices left, hookscript restored" +
                     (", root port and TB bus removed from args" if purge_port else
                      " (root port and TB bus kept in args; --purge-port removes them)"))
