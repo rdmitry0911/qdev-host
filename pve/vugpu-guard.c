@@ -33,10 +33,32 @@
  *    dmabuf update); a request still unanswered when the new socket arrives
  *    is sent again on it.
  *
+ * 3. QEMU's side of a vhost-user-vga (hw/display/vhost-user-gpu.c, QEMU 11)
+ *    has two faults this process cannot reach.  After a device reset the
+ *    console stays in the GPU's dma-buf scanout, so the next refresh asked for
+ *    by a display client reads a NULL surface in vga_update_display() and QEMU
+ *    crashes.  And a display client's GL update acknowledged while the GPU
+ *    socket is closed makes it install a handler on descriptor -1, which QEMU's
+ *    io_uring main loop then runs forever ("failed to read msg header").  Both
+ *    need a display client attached while the GPU is stopped.  The library
+ *    therefore publishes the GPU's state next to its socket, in gpu-state:
+ *      state=running seq=N    the socket is up and the guest has a scanout
+ *      state=stopping seq=N   QEMU stops the device (pause, reset, shutdown)
+ *      state=stopped seq=N
+ *    On a stop it waits, while QEMU waits for this reply and cannot run its
+ *    main loop, up to 1.5 s for the display client named in gpu-state.client
+ *    (pid=P) to write seq=N to gpu-state.ack once it has closed its display
+ *    connection (qsm-pve-direct from 0.4.0+stock4.14~exp236 does).  A display
+ *    client attaches only in "running".  A scanout the guest switches off also
+ *    gets a blank surface (SCANOUT 0x0), as QEMU's own virtio-gpu does, so a
+ *    later reset finds a surface.
+ *
  * Not covered: commands still in flight when the guest resets the device are
  * completed later into its new queue, and virglrenderer keeps the contexts
  * and resources of the previous guest driver; vhost-user-gpu does not drop or
- * reset them, and neither does this library.
+ * reset them, and neither does this library.  A GL update of the display
+ * client that is still unanswered at the moment of a stop fails when the
+ * client disconnects and still triggers QEMU's second fault.
  *
  * Environment, for tests:
  *   QDEV_VUGPU_FENCE_HOLD=0             do not hold fences
@@ -44,6 +66,7 @@
  *                                       info/EDID reply is on its way;
  *                                       =edid or =info: only for that request
  *   QDEV_VUGPU_SOCKET_GUARD=0           leave the GPU socket alone
+ *   QDEV_VUGPU_DISPLAY_HANDSHAKE=0      publish the state, do not wait on a stop
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -53,24 +76,33 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/uio.h>
+#include <time.h>
 #include <unistd.h>
 #include <virgl/virglrenderer.h>
 
 enum {
     GPU_GET_PROTOCOL_FEATURES = 1,
     GPU_GET_DISPLAY_INFO = 3,
+    GPU_SCANOUT = 7,
+    GPU_DMABUF_SCANOUT = 9,
     GPU_DMABUF_UPDATE = 10,
+    GPU_DMABUF_SCANOUT2 = 12,
     GPU_GET_EDID = 11,
     GPU_HDR_SIZE = 12,
     GPU_FLAG_REPLY = 0x4,
     GPU_PROTOCOL_F_EDID = 0,
     GPU_PROTOCOL_F_DMABUF2 = 1,
 };
-enum { VHOST_USER_GPU_SET_SOCKET = 33, VHOST_USER_VERSION_MASK = 0x3, VHOST_USER_VERSION = 0x1 };
+enum { VHOST_USER_SET_VRING_BASE = 10, VHOST_USER_GET_VRING_BASE = 11, VHOST_USER_GPU_SET_SOCKET = 33,
+       VHOST_USER_VERSION_MASK = 0x3, VHOST_USER_VERSION = 0x1 };
 
 static int (*real_renderer_init)(void *, int, struct virgl_renderer_callbacks *);
 static ssize_t (*real_sendmsg)(int, const struct msghdr *, int);
@@ -95,6 +127,13 @@ static int pending;                /* request whose reply has not been read yet,
 static unsigned char pending_msg[64];
 static size_t pending_len;
 static unsigned long sockets_replaced;
+
+static char state_dir[PATH_MAX];   /* directory of the vhost-user socket: gpu-state lives there */
+static const char *gpu_state = "";
+static unsigned long state_seq;
+static int display_handshake = 1;
+static int scanout_active;         /* the guest has a scanout on, as far as QEMU was told */
+static int vring_base_fd = -1;     /* vhost-user socket whose SET_VRING_BASE payload comes next */
 
 static GArray *held;               /* fences that came in while a reply was awaited */
 static uint32_t last_fence;
@@ -129,6 +168,124 @@ static int env_is(const char *name, const char *value)
     return v && strcmp(v, value) == 0;
 }
 
+/* The directory of vhost-user-gpu's --socket-path (or -s): gpu-state is published there. */
+static void find_state_dir(void)
+{
+    char args[8192];
+    ssize_t n;
+    int fd = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
+    const char *path = NULL;
+
+    if (fd < 0) {
+        return;
+    }
+    n = real_read(fd, args, sizeof(args) - 1);
+    real_close(fd);
+    if (n <= 0) {
+        return;
+    }
+    args[n] = '\0';
+    for (char *a = args; a < args + n; a += strlen(a) + 1) {
+        if (strncmp(a, "--socket-path=", 14) == 0) {
+            path = a + 14;
+        } else if ((strcmp(a, "--socket-path") == 0 || strcmp(a, "-s") == 0) && a + strlen(a) + 1 < args + n) {
+            path = a + strlen(a) + 1;
+        }
+    }
+    if (path && strrchr(path, '/') && (size_t)(strrchr(path, '/') - path) < sizeof(state_dir)) {
+        memcpy(state_dir, path, (size_t)(strrchr(path, '/') - path));
+        state_dir[strrchr(path, '/') - path] = '\0';
+    }
+}
+
+static void write_state(const char *state)
+{
+    char path[PATH_MAX + 32], tmp[PATH_MAX + 32], line[64];
+    int fd, len;
+
+    gpu_state = state;
+    if (!state_dir[0]) {
+        return;
+    }
+    snprintf(path, sizeof(path), "%s/gpu-state", state_dir);
+    snprintf(tmp, sizeof(tmp), "%s/gpu-state.tmp", state_dir);
+    len = snprintf(line, sizeof(line), "state=%s seq=%lu\n", state, state_seq);
+    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);  /* readers accept root-only files */
+    if (fd >= 0) {
+        fchmod(fd, 0600);
+    }
+    if (fd < 0) {
+        return;
+    }
+    if (write(fd, line, (size_t)len) != len || rename(tmp, path) < 0) {
+        log_line("could not publish the GPU state in %s: %s", state_dir, strerror(errno));
+    }
+    real_close(fd);
+}
+
+/* A small key=value file of the display client: the value of key, or -1. */
+static long read_number(const char *name, const char *key)
+{
+    char path[PATH_MAX + 32], buf[128], *at;
+    ssize_t n;
+    int fd;
+
+    snprintf(path, sizeof(path), "%s/%s", state_dir, name);
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return -1;
+    }
+    n = real_read(fd, buf, sizeof(buf) - 1);
+    real_close(fd);
+    if (n <= 0) {
+        return -1;
+    }
+    buf[n] = '\0';
+    at = strstr(buf, key);
+    return at ? strtol(at + strlen(key), NULL, 10) : -1;
+}
+
+static long now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+/*
+ * QEMU stops the device (VHOST_USER_GET_VRING_BASE) and waits for this backend:
+ * let the display client disconnect before QEMU's main loop runs again.
+ */
+static void display_stop(void)
+{
+    long client, start = now_ms(), acked = -1;
+
+    if (strcmp(gpu_state, "running") != 0) {
+        return;
+    }
+    state_seq++;
+    write_state("stopping");
+    client = read_number("gpu-state.client", "pid=");
+    if (display_handshake && client > 0 && kill((pid_t)client, 0) == 0) {
+        while (now_ms() - start < 1500) {
+            if (read_number("gpu-state.ack", "seq=") == (long)state_seq) {
+                acked = now_ms() - start;
+                break;
+            }
+            usleep(5000);
+        }
+        usleep(30000);  /* QEMU's D-Bus thread sees the closed connection meanwhile */
+    }
+    write_state("stopped");
+    if (client > 0) {
+        if (acked >= 0) {
+            log_line("QEMU stops the GPU; the display client disconnected in %ld ms", acked);
+        } else {
+            log_line("QEMU stops the GPU; the display client (pid %ld) did not confirm in 1.5 s", client);
+        }
+    }
+}
+
 __attribute__((constructor)) static void setup(void)
 {
     resolve();
@@ -139,9 +296,14 @@ __attribute__((constructor)) static void setup(void)
                           env_is("QDEV_VUGPU_TEST_FENCE_IN_REPLY", "info");
     test_request = env_is("QDEV_VUGPU_TEST_FENCE_IN_REPLY", "edid") ? GPU_GET_EDID :
                    env_is("QDEV_VUGPU_TEST_FENCE_IN_REPLY", "info") ? GPU_GET_DISPLAY_INFO : 0;
+    display_handshake = !env_is("QDEV_VUGPU_DISPLAY_HANDSHAKE", "0");
     held = g_array_new(FALSE, FALSE, sizeof(uint32_t));
-    log_line("loaded (fence hold %s, socket guard %s%s)", hold_enabled ? "on" : "OFF",
-             socket_guard ? "on" : "OFF", test_fence_in_reply ? ", test fences" : "");
+    find_state_dir();
+    write_state("stopped");
+    log_line("loaded (fence hold %s, socket guard %s, display handshake %s%s%s%s)",
+             hold_enabled ? "on" : "OFF", socket_guard ? "on" : "OFF",
+             display_handshake && state_dir[0] ? "on" : "OFF",
+             state_dir[0] ? ", state in " : "", state_dir, test_fence_in_reply ? ", test fences" : "");
 }
 
 static const char *request_name(int request)
@@ -347,8 +509,18 @@ ssize_t recvmsg(int fd, struct msghdr *msg, int flags)
         return ret;
     }
     memcpy(hdr, msg->msg_iov[0].iov_base, sizeof(hdr));
-    if (hdr[0] != VHOST_USER_GPU_SET_SOCKET ||
-        (hdr[1] & VHOST_USER_VERSION_MASK) != VHOST_USER_VERSION) {
+    if ((hdr[1] & VHOST_USER_VERSION_MASK) != VHOST_USER_VERSION) {
+        return ret;
+    }
+    if (hdr[0] == VHOST_USER_GET_VRING_BASE) {
+        display_stop();
+        return ret;
+    }
+    if (hdr[0] == VHOST_USER_SET_VRING_BASE && hdr[2] >= 8) {
+        vring_base_fd = fd;  /* its {index, num} payload is read next */
+        return ret;
+    }
+    if (hdr[0] != VHOST_USER_GPU_SET_SOCKET) {
         return ret;
     }
     for (cmsg = CMSG_FIRSTHDR(msg); cmsg; cmsg = CMSG_NXTHDR(msg, cmsg)) {
@@ -406,6 +578,27 @@ ssize_t sendmsg(int fd, const struct msghdr *msg, int flags)
         }
         return ret;
     }
+    if (ret >= GPU_HDR_SIZE && hdr[1] == 0) {
+        int scanout = hdr[0] == GPU_DMABUF_SCANOUT || hdr[0] == GPU_DMABUF_SCANOUT2;
+        int has_fd = msg->msg_controllen > 0;
+
+        if ((scanout && has_fd) || (hdr[0] == GPU_SCANOUT && msg->msg_iov[0].iov_len >= GPU_HDR_SIZE + 12 &&
+             ((const uint32_t *)msg->msg_iov[0].iov_base)[4] > 0)) {
+            scanout_active = 1;
+            if (strcmp(gpu_state, "running") != 0) {
+                write_state("running");
+            }
+        } else if (scanout) {
+            scanout_active = 0;
+        }
+        if (scanout && !has_fd && msg->msg_iov[0].iov_len >= GPU_HDR_SIZE + 4) {
+            /* the guest switched the scanout off: give the console a blank surface */
+            uint32_t blank[6] = { GPU_SCANOUT, 0, 12, ((const uint32_t *)msg->msg_iov[0].iov_base)[3], 0, 0 };
+            if (send(fd, blank, sizeof(blank), MSG_NOSIGNAL) < 0) {
+                log_line("could not blank the switched-off scanout: %s", strerror(errno));
+            }
+        }
+    }
     if (ret >= GPU_HDR_SIZE && request) {
         remember_request(msg, hdr[0]);
         if (test_fence_in_reply && waits_on_fence_queue(request) &&
@@ -417,12 +610,34 @@ ssize_t sendmsg(int fd, const struct msghdr *msg, int flags)
     return ret;
 }
 
+/*
+ * The device starts again.  Ring 0 resumes at its old index after a pause (the
+ * guest's scanout is still on, QEMU kept it), and starts at 0 after a reset (wait
+ * for the guest's next scanout).
+ */
+static void display_start(uint32_t index, uint32_t num)
+{
+    if (index == 0 && num != 0 && scanout_active && strcmp(gpu_state, "stopped") == 0) {
+        write_state("running");
+    }
+}
+
 ssize_t read(int fd, void *buf, size_t count)
 {
     ssize_t ret;
     int request;
 
     resolve();
+    if (fd >= 0 && fd == vring_base_fd) {
+        ret = real_read(fd, buf, count);
+        vring_base_fd = -1;
+        if (ret >= 8) {
+            uint32_t state[2];
+            memcpy(state, buf, sizeof(state));
+            display_start(state[0], state[1]);
+        }
+        return ret;
+    }
     if (fd < 0 || fd != LOAD(gpu_fd)) {
         return real_read(fd, buf, count);
     }

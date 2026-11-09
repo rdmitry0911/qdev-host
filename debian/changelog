@@ -1,3 +1,26 @@
+qdev-host (0.5.5) unstable; urgency=medium
+
+  * virgl-gpu: the vhost-user-gpu guard publishes the GPU's state in
+    gpu-state next to its socket (running, stopping, stopped) and, when QEMU
+    stops the device, waits up to 1.5 s for the display client named in
+    gpu-state.client to confirm in gpu-state.ack that it left the display.
+    QEMU 11's side of a vhost-user-vga crashes when a display client
+    refreshes the console after a device reset (vga_update_display), and
+    loops for good on descriptor -1 when a client's GL update is
+    acknowledged while the GPU socket is closed; both need a client attached
+    while the GPU is stopped. qsm-pve-direct from 0.4.0+stock4.14~exp236
+    attaches only while the GPU runs and leaves within the handshake.
+  * A scanout the guest switches off gets a blank surface, as in QEMU's own
+    virtio-gpu, so a later reset does not find the console without one.
+  * Checked with qsm-pve-direct exp236 on a test VM with a GL D-Bus display
+    and the console open: a VM start (the console waits for the GPU, then
+    shows it) and a pause and resume (the client leaves within the handshake)
+    no longer hit QEMU's faults. A reboot inside the guest still crashes QEMU
+    in vga_update_display(): its D-Bus listener outlives the client while a
+    GL update is in flight. Not fixable outside QEMU; reported upstream.
+
+ -- Dmitry R <rdmitry0911@gmail.com>  Mon, 09 Nov 2026 14:30:00 +0200
+
 qdev-host (0.5.4) unstable; urgency=medium
 
   * virgl-gpu: the GPU process (QEMU's vhost-user-gpu) runs with
