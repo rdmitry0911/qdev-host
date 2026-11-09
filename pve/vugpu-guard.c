@@ -53,6 +53,16 @@
  *    gets a blank surface (SCANOUT 0x0), as QEMU's own virtio-gpu does, so a
  *    later reset finds a surface.
  *
+ * 4. 2D buffers through GBM.  Without VirGL (the firmware, OVMF's virtio-gpu
+ *    driver, before the guest's own driver) vhost-user-gpu allocates 2D
+ *    resources as linear GBM buffers on the render node.  NVIDIA's GBM refuses
+ *    them and libgbm then dereferences NULL, so the process dies at the first
+ *    firmware frame.  vhost-user-gpu's own fallback keeps 2D resources in
+ *    shared memory and sends their pixels as SCANOUT/UPDATE messages; it is
+ *    taken when its gbm_create_device() call returns NULL, which this library
+ *    does for calls from the vhost-user-gpu binary itself.  virglrenderer's
+ *    own GBM device, which renders 3D, is left alone.
+ *
  * Not covered: commands still in flight when the guest resets the device are
  * completed later into its new queue, and virglrenderer keeps the contexts
  * and resources of the previous guest driver; vhost-user-gpu does not drop or
@@ -67,10 +77,12 @@
  *                                       =edid or =info: only for that request
  *   QDEV_VUGPU_SOCKET_GUARD=0           leave the GPU socket alone
  *   QDEV_VUGPU_DISPLAY_HANDSHAKE=0      publish the state, do not wait on a stop
+ *   QDEV_VUGPU_2D_GBM=1                 keep GBM buffers for 2D resources
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
+#include <link.h>
 #include <glib.h>
 #include <linux/virtio_gpu.h>
 #include <stdarg.h>
@@ -114,7 +126,7 @@ static struct virgl_renderer_callbacks callbacks;   /* the caller's, with our wr
 static void (*real_write_fence)(void *, uint32_t);
 static void *renderer_cookie;
 
-static int hold_enabled = 1, socket_guard = 1;
+static int hold_enabled = 1, socket_guard = 1, two_d_gbm;
 static int test_fence_in_reply, test_request;
 
 /*
@@ -297,6 +309,7 @@ __attribute__((constructor)) static void setup(void)
     test_request = env_is("QDEV_VUGPU_TEST_FENCE_IN_REPLY", "edid") ? GPU_GET_EDID :
                    env_is("QDEV_VUGPU_TEST_FENCE_IN_REPLY", "info") ? GPU_GET_DISPLAY_INFO : 0;
     display_handshake = !env_is("QDEV_VUGPU_DISPLAY_HANDSHAKE", "0");
+    two_d_gbm = env_is("QDEV_VUGPU_2D_GBM", "1");
     held = g_array_new(FALSE, FALSE, sizeof(uint32_t));
     find_state_dir();
     write_state("stopped");
@@ -673,4 +686,46 @@ int close(int fd)
         }
     }
     return real_close(fd);
+}
+
+/* ------------------------------------------------- 4. 2D buffers without GBM */
+
+struct gbm_device;
+static struct gbm_device *(*real_gbm_create_device)(int);
+
+struct main_range {
+    uintptr_t addr;
+    int inside;
+};
+
+static int find_in_main_program(struct dl_phdr_info *info, size_t size, void *data)
+{
+    struct main_range *range = data;
+    (void)size;
+    /* the first object reported is the program itself */
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+        uintptr_t start = info->dlpi_addr + ph->p_vaddr;
+        if (ph->p_type == PT_LOAD && range->addr >= start && range->addr < start + ph->p_memsz) {
+            range->inside = 1;
+        }
+    }
+    return 1;  /* stop after the program */
+}
+
+struct gbm_device *gbm_create_device(int fd)
+{
+    struct main_range range = { (uintptr_t)__builtin_return_address(0), 0 };
+
+    if (!real_gbm_create_device) {
+        real_gbm_create_device = dlsym(RTLD_NEXT, "gbm_create_device");
+    }
+    if (!two_d_gbm) {
+        dl_iterate_phdr(find_in_main_program, &range);
+        if (range.inside) {
+            log_line("2D resources use shared memory, not GBM buffers");
+            return NULL;  /* vhost-user-gpu falls back to its memory buffers */
+        }
+    }
+    return real_gbm_create_device(fd);
 }

@@ -7,6 +7,10 @@ qdev-host (0.5.5) unstable; urgency=medium
     draws the firmware screen. vga is the former vhost-user-vga, secondary
     the former vga=0. Devices saved with vga=1|0 keep their mode; the
     Hardware panel offers the three as a list.
+  * The guard keeps vhost-user-gpu's 2D resources (OVMF's virtio-gpu driver,
+    before the guest's VirGL driver) in shared memory instead of GBM buffers:
+    NVIDIA's GBM refused the linear buffer and libgbm crashed the process at
+    the first firmware frame. virglrenderer's own GBM device is untouched.
   * virgl-gpu: the vhost-user-gpu guard publishes the GPU's state in
     gpu-state next to its socket (running, stopping, stopped) and, when QEMU
     stops the device, waits up to 1.5 s for the display client named in
