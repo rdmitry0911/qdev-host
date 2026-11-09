@@ -708,11 +708,16 @@ def list_kms_outputs() -> list[dict]:
     return out
 
 # ------------------------------------------------------------- operations
-def add_device(vmid: int, dev_id: str, plugin: str, args: str = "", bus: str = PORT_ID, display: bool = True,
+def add_device(vmid: int, dev_id: str, plugin: str, args: str = "", bus: str = "", display: bool = True,
                kms: str | None = None, persistent: bool = False, port_addr: str | None = None,
                extra: list[str] | None = None) -> list[str]:
-    """Define a device for VMID (and hot-plug it if the VM runs). Returns status lines."""
+    """Define a device for VMID (and hot-plug it if the VM runs). Returns status lines.
+
+    BUS "" or "tb" puts the device on a free port of the VM's TB bus (from 0.6.0);
+    qdev-rp0 (the root port of earlier versions) and PVE's ports stay possible."""
+    import qdev_tb
     msgs = []
+    bus = bus or "tb"
     validate_device(dev_id, plugin, args or "", bus, kms)
     if port_addr and not ADDR_RE.match(port_addr):
         raise QdevError("port address must be like 0x08")
@@ -725,11 +730,14 @@ def add_device(vmid: int, dev_id: str, plugin: str, args: str = "", bus: str = P
     dev = {"id": dev_id, "plugin": plugin, "args": args or "", "bus": bus, "display": bool(display),
            "kms": kms or None, "persistent": bool(persistent), "extra": extra or []}
     if plugin_kind(plugin) == "tb":
-        import qdev_tb
         if kms:
             raise QdevError(f"{plugin} has no KMS output")
         dev.update(display=False, kms=None, persistent=False, extra=[])
         return qdev_tb.add(vmid, conf, cfg, dev)
+    had_tb = bool(conf.get("tb"))
+    if bus == "tb":
+        conf.setdefault("tb", {"ports": qdev_tb.DEFAULT_PORTS})
+        bus = dev["bus"] = qdev_tb.free_port(conf)
     taken = next((d["id"] for d in conf["devices"] if d["bus"] == bus), None)
     if taken and bus != "pcie.0":
         raise QdevError(f"bus {bus} already holds device {taken}: a PCIe root port has one slot "
@@ -739,15 +747,19 @@ def add_device(vmid: int, dev_id: str, plugin: str, args: str = "", bus: str = P
     check_editable(vmid)
     snippets_dir()
     if plugin_kind(plugin) == "vhost-user-gpu":
-        return add_vug_device(vmid, conf, cfg, dev)
+        return add_vug_device(vmid, conf, cfg, dev, had_tb)
     changed_port = False
-    if bus == PORT_ID:
-        changed_port = ensure_port_in_args(vmid, cfg, conf["port_addr"])
     try:
+        if bus == PORT_ID:
+            changed_port = ensure_port_in_args(vmid, cfg, conf["port_addr"])
+        elif qdev_tb.is_port(bus):
+            changed_port = qdev_tb.ensure_bus(vmid, conf, cfg)
         ensure_hookscript(vmid, cfg, conf)
     except Exception:
-        if changed_port:
+        if bus == PORT_ID and changed_port:
             remove_port_from_args(vmid, vm_config(vmid))
+        elif not had_tb:
+            qdev_tb.purge(vmid, conf, vm_config(vmid))
         raise
     conf["devices"].append(dev)
     save_conf(conf)
@@ -756,17 +768,24 @@ def add_device(vmid: int, dev_id: str, plugin: str, args: str = "", bus: str = P
     if vm_running(vmid):
         msgs.append(attach(vmid, dev))
         if changed_port:
-            msgs.append(f"note: root port {PORT_ID} was added to args; it appears at the next VM start")
+            msgs.append(f"note: root port {PORT_ID} was added to args; it appears at the next VM start" if bus == PORT_ID
+                        else "note: the TB bus was added to the VM's args; it appears at the next VM start")
     else:
         msgs.append("VM is stopped: the device will be started and attached by the hookscript at VM start")
     return msgs
 
-def add_vug_device(vmid: int, conf: dict, cfg: dict[str, str], dev: dict) -> list[str]:
+def add_vug_device(vmid: int, conf: dict, cfg: dict[str, str], dev: dict, had_tb: bool = True) -> list[str]:
+    import qdev_tb
     dev.update(display=False, kms=None, persistent=False, extra=[])
     shared_memory_groups(cfg)              # refuses NUMA/memory hot-plug without hugepages/virtiofs
     had_devices = bool(conf["devices"])
-    changed_port = ensure_port_in_args(vmid, cfg, conf["port_addr"]) if dev["bus"] == PORT_ID else False
+    changed_port = False
     try:
+        # the TB bus goes in front of args: its ports must exist before the GPU's -device
+        if dev["bus"] == PORT_ID:
+            changed_port = ensure_port_in_args(vmid, cfg, conf["port_addr"])
+        elif qdev_tb.is_port(dev["bus"]):
+            qdev_tb.ensure_bus(vmid, conf, cfg)
         ensure_hookscript(vmid, cfg, conf)
         conf["devices"].append(dev)
         notes = apply_vug_args(vmid, conf, vm_config(vmid))
@@ -779,6 +798,8 @@ def add_vug_device(vmid: int, conf: dict, cfg: dict[str, str], dev: dict) -> lis
             apply_vug_args(vmid, conf, fresh)  # puts back what this call replaced
             if changed_port:
                 remove_port_from_args(vmid, vm_config(vmid))
+            if not had_tb:
+                qdev_tb.purge(vmid, conf, vm_config(vmid))
             if not had_devices:
                 restore_hookscript(vmid, conf)
         except Exception as e:  # report the first error, not the cleanup's

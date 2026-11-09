@@ -177,7 +177,7 @@ class Service:
                 raise ApiError(400, f"{key}: must be a string")
             return v.strip()
         dev_id, plugin, args, kms = text("id"), text("plugin"), text("args"), text("kms")
-        bus = text("bus", Q.PORT_ID) or Q.PORT_ID
+        bus = text("bus", "")    # "": a free port of the VM's TB bus
         display = bool(body.get("display", True))
         persistent = bool(body.get("persistent", False))
         log(f"{confirmed}: add {dev_id} ({plugin}, args='{args}', kms={kms or '-'}) to VM {vmid}")

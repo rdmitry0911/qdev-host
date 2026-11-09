@@ -15,6 +15,11 @@ The bus is a set of pcie-root-ports qdev-tb0..N-1 at pcie.0 slot 0x09
 /var/lib/qdev-host/tb/VMID.aml (-acpitable); both are written again at every
 VM start by the hookscript, so the VM's args only name the two files.  While
 the VM runs, devices are hot-plugged and unplugged over QMP.
+
+PCI pass-through devices are hot-plugged right after the start (post-start)
+instead: QEMU pins all of the VM's memory for the first one before it
+daemonizes, and qemu-server's start timeout grows only for its own hostpciN,
+so a 32 GiB VM with one in -readconfig was killed after 32 s.
 """
 from __future__ import annotations
 import json, os, random, re, subprocess, time, uuid
@@ -38,7 +43,17 @@ PORT_KINDS = ("tb-pci", "tb-net", "tb-xhci")
 # no IO window on TB ports (the q35 IO space is small); these models work without port IO
 NET_MODELS = {"virtio": "virtio-net-pci", "e1000e": "e1000e", "vmxnet3": "vmxnet3"}
 NET_KEYS = {"bridge", "tag", "rate", "mtu", "queues", "firewall"}
-TB_PROPS = [("PCI-Thunderbolt", 1), ("pci-supports-link-change", 1)]
+# ACPI properties of the ports, per VM (conf["tb"]["acpi"]):
+#   thunderbolt  the qemu-thunderbolt fork's: macOS treats the port as a Thunderbolt tunnel root
+#   hotplug      a native PCIe hot-plug port for macOS (PCIHotplugCapable)
+#   none         plain ports
+ACPI_MODES = {
+    "thunderbolt": [("PCI-Thunderbolt", 1), ("pci-supports-link-change", 1)],
+    "hotplug": [("PCIHotplugCapable", 1), ("pci-supports-link-change", 1)],
+    "none": [],
+}
+DEFAULT_ACPI = "thunderbolt"
+TB_PROPS = ACPI_MODES[DEFAULT_ACPI]
 DSD_UUID = "daffd814-6eba-4d8c-8a91-bc9bbf4aa301"     # ACPI device properties
 APPLE_DSM_UUID = "a0b5b7c6-1318-441c-b0c9-fe695eaf949b"  # macOS device properties (_DSM)
 
@@ -50,6 +65,10 @@ def tb_devices(conf: dict) -> list[dict]:
 
 def port_id(i: int) -> str:
     return f"{PORT_PREFIX}{i}"
+
+def acpi_mode(conf: dict) -> str:
+    mode = conf.get("tb", {}).get("acpi", DEFAULT_ACPI)
+    return mode if mode in ACPI_MODES else DEFAULT_ACPI
 
 def port_count(conf: dict) -> int:
     return int(conf.get("tb", {}).get("ports", DEFAULT_PORTS))
@@ -135,10 +154,11 @@ def _method(name: str, nargs: int, *terms: bytes) -> bytes:
     body = _seg(name) + bytes([nargs & 7]) + b"".join(terms)
     return b"\x14" + _pkglen(len(body)) + body
 
-def port_properties() -> list[bytes]:
-    """_DSD (ACPI device properties) and macOS's _DSM with the Thunderbolt port properties."""
-    dsd = _name("_DSD", _pkg(_uuid(DSD_UUID), _pkg(*[_pkg(_str(k), _int(v)) for k, v in TB_PROPS])))
-    flat = [x for k, v in TB_PROPS for x in (_str(k), _int(v))]
+def port_properties(props: list[tuple[str, int]] | None = None) -> list[bytes]:
+    """_DSD (ACPI device properties) and macOS's _DSM with the port properties."""
+    props = TB_PROPS if props is None else props
+    dsd = _name("_DSD", _pkg(_uuid(DSD_UUID), _pkg(*[_pkg(_str(k), _int(v)) for k, v in props])))
+    flat = [x for k, v in props for x in (_str(k), _int(v))]
     dsm = _method("_DSM", 4,
                   _if(_lequal(ARG0, _uuid(APPLE_DSM_UUID)),
                       _if(_lequal(ARG2, _int(0)), _ret(_buf(b"\x03"))),
@@ -146,9 +166,10 @@ def port_properties() -> list[bytes]:
                   _ret(_buf(b"\x00")))
     return [dsd, dsm]
 
-def ssdt(scopes: list[str], oem_table: str = "QDEVTB") -> bytes:
-    """An SSDT that gives every ACPI path in SCOPES the Thunderbolt port properties."""
-    body = b"".join(_scope(s, *port_properties()) for s in scopes)
+def ssdt(scopes: list[str], oem_table: str = "QDEVTB", props: list[tuple[str, int]] | None = None) -> bytes:
+    """An SSDT that gives every ACPI path in SCOPES the port properties (default: Thunderbolt)."""
+    props = TB_PROPS if props is None else props
+    body = b"".join(_scope(s, *port_properties(props)) for s in scopes) if props else b""
     head = bytearray(b"SSDT" + (36 + len(body)).to_bytes(4, "little") + b"\x02\x00" + b"QDEVHT" +
                      oem_table.encode().ljust(8, b" ") + (1).to_bytes(4, "little") + b"QDEV" +
                      (1).to_bytes(4, "little"))
@@ -322,9 +343,16 @@ def _opts(d: dict) -> str:
 def port_devices(conf: dict) -> list[tuple[str, dict]]:
     out = []
     for i in range(port_count(conf)):
-        out.append((port_id(i), {"driver": "pcie-root-port", "bus": "pcie.0", "addr": f"{TB_SLOT:02x}.{i}",
-                                 "multifunction": "on", "chassis": str(CHASSIS_BASE + i), "port": str(CHASSIS_BASE + i),
-                                 "io-reserve": "0", "mem-reserve": "32M", "pref64-reserve": "1G"}))
+        p = {"driver": "pcie-root-port", "bus": "pcie.0", "addr": f"{TB_SLOT:02x}.{i}",
+             "multifunction": "on", "chassis": str(CHASSIS_BASE + i), "port": str(CHASSIS_BASE + i),
+             "io-reserve": "0", "mem-reserve": "32M", "pref64-reserve": "1G"}
+        for key in ("io-reserve", "mem-reserve", "pref64-reserve"):
+            v = conf.get("tb", {}).get(key)
+            if v == "":
+                p.pop(key)
+            elif v:
+                p[key] = v
+        out.append((port_id(i), p))
     return out
 
 def pci_functions(dev: dict, info: dict) -> list[tuple[str, dict]]:
@@ -406,21 +434,18 @@ def ssdt_scopes(conf: dict, vmcfg: dict) -> list[str]:
             pass
     return scopes
 
-def write_files(vmid: int, conf: dict, vmcfg: dict, prepared: dict[str, dict] | None = None) -> list[str]:
-    """Write VMID.cfg and VMID.aml.  PREPARED maps tb-pci ids to their bound host
-    functions (pre-start); without it the functions are resolved without changes."""
+def write_files(vmid: int, conf: dict, vmcfg: dict, starting: bool = False) -> list[str]:
+    """Write VMID.cfg and VMID.aml (STARTING: at pre-start, with the taps' settings).
+    PCI pass-through devices are not in VMID.cfg: post-start hot-plugs them."""
     notes = []
     groups: list[tuple[str, str, dict]] = [("device", n, p) for n, p in port_devices(conf)]
     for dev in tb_devices(conf):
         kind = dev["plugin"]
-        if kind == "tb-pci":
-            info = (prepared or {}).get(dev["id"]) or perl("pci-resolve", vmid, dev["args"])
-            groups += [("device", n, p) for n, p in pci_functions(dev, info)]
-        elif kind == "tb-net":
+        if kind == "tb-net":
             spec = net_spec(dev["args"])
             groups.append(("netdev", dev["id"], net_netdev(vmid, dev, spec)))
             groups.append(("device", dev["id"], net_device(dev, spec)))
-            if prepared is not None:
+            if starting:
                 write_net_settings(vmid, dev, spec)
         elif kind == "tb-xhci":
             groups.append(("device", dev["id"], xhci_device(dev)))
@@ -431,7 +456,9 @@ def write_files(vmid: int, conf: dict, vmcfg: dict, prepared: dict[str, dict] | 
             except Q.QdevError as e:
                 notes.append(f"{dev['id']}: {e}; left out")
     TB_DIR.mkdir(parents=True, exist_ok=True)
-    for path, data in ((cfg_path(vmid), _config_file(groups).encode()), (aml_path(vmid), ssdt(ssdt_scopes(conf, vmcfg)))):
+    props = ACPI_MODES[acpi_mode(conf)]
+    for path, data in ((cfg_path(vmid), _config_file(groups).encode()),
+                       (aml_path(vmid), ssdt(ssdt_scopes(conf, vmcfg), props=props))):
         tmp = path.with_suffix(".tmp")
         tmp.write_bytes(data); tmp.chmod(0o644)
         os.replace(tmp, path)
@@ -448,13 +475,24 @@ def in_args(vmid: int, vmcfg: dict) -> bool:
     return all(Q._find(vmcfg.get("args", ""), p) for p in arg_patterns(vmid))
 
 def ensure_args(vmid: int, vmcfg: dict) -> bool:
+    """Put the TB bus in front of the VM's args: devices in args (a qdev-host GPU)
+    may sit on its ports, and QEMU creates devices in command line order."""
     if in_args(vmid, vmcfg):
         return False
     args = vmcfg.get("args", "")
     for p in arg_patterns(vmid):
         args = Q._drop(args, p)
-    Q.qm_set(vmid, "args", (args + " " + arg_groups(vmid)).strip())
+    Q.qm_set(vmid, "args", (arg_groups(vmid) + " " + args).strip())
     return True
+
+def is_port(bus: str) -> bool:
+    return bool(re.match(rf"^{PORT_PREFIX}[0-9]$", bus or ""))
+
+def ensure_bus(vmid: int, conf: dict, vmcfg: dict) -> bool:
+    """The VM's TB bus in its files and args. Returns True if args changed."""
+    conf.setdefault("tb", {"ports": DEFAULT_PORTS})
+    write_files(vmid, conf, vmcfg)
+    return ensure_args(vmid, vmcfg)
 
 def remove_args(vmid: int, vmcfg: dict) -> None:
     args = vmcfg.get("args", "")
@@ -494,7 +532,10 @@ def qmp_typed(props: dict) -> dict:
     return out
 
 def _device_add(vmid: int, qid: str, props: dict) -> None:
-    Q.mon_cmd(vmid, "device_add", id=qid, **qmp_typed(props))
+    extra = {}
+    if props.get("driver") == "vfio-pci":
+        extra["timeout"] = 600          # the first one pins all of the VM's memory
+    Q.mon_cmd(vmid, "device_add", id=qid, **qmp_typed(props), **extra)
 
 def _wait_gone(vmid: int, ids: list[str], timeout: float) -> bool:
     end = time.time() + timeout
@@ -517,6 +558,14 @@ def plug(vmid: int, conf: dict, dev: dict) -> str:
         return f"{dev['id']}: {what} {dev['bus']} is not in the running VM; present from the next VM start"
     kind = dev["plugin"]
     if kind == "tb-pci":
+        # QEMU 11 (hw/vfio/container-legacy.c) casts every VFIO container of the address
+        # space to a legacy one when a vfio-pci device connects, and aborts on the
+        # container of a vfio-user device.  At VM start vfio-pci comes first: no problem.
+        users = [d["id"] for d in conf["devices"] if Q.dev_kind(d) == "vfio-user" and d["id"] in present]
+        if users:
+            raise Q.QdevError(f"QEMU 11 aborts when a PCI pass-through device is hot-plugged while a vfio-user "
+                              f"device is attached ({', '.join(users)}): {dev['id']} is present from the next VM "
+                              f"start (or unplug {users[0]} first: qdevctl stop {vmid} {users[0]})")
         info = perl("pci-prepare", vmid, dev["args"], "60")
         funcs = pci_functions(dev, info)
         try:
@@ -597,8 +646,12 @@ def unplug(vmid: int, dev: dict, timeout: float = 30.0) -> str:
     return f"{dev['id']}: detached"
 
 # ------------------------------------------------------------ operations
+def on_port(conf: dict) -> list[dict]:
+    """Devices that take a TB port: QEMU's own and qdev-host's (tb-vga, virgl-gpu)."""
+    return [d for d in conf["devices"] if d.get("plugin") != "tb-usb" and is_port(d.get("bus", ""))]
+
 def free_port(conf: dict) -> str:
-    used = {d["bus"] for d in tb_devices(conf) if d["plugin"] in PORT_KINDS}
+    used = {d["bus"] for d in on_port(conf)}
     for i in range(port_count(conf)):
         if port_id(i) not in used:
             return port_id(i)
@@ -640,7 +693,7 @@ def normalize(vmid: int, conf: dict, dev: dict, notes: list[str]) -> None:
         usb_check(dev["args"])
         perl("usb-resolve", vmid, usb_value(dev["args"]))
         ctrls = [d["id"] for d in tb_devices(conf) if d["plugin"] == "tb-xhci"]
-        if dev["bus"] in ("", Q.PORT_ID, None):
+        if dev["bus"] in ("", "tb", Q.PORT_ID, None):
             if len(ctrls) != 1:
                 raise Q.QdevError("give the USB controller (--bus ID of a tb-xhci device)" if ctrls else
                                   "the VM has no USB controller on the TB bus: add a tb-xhci device first")
@@ -648,13 +701,12 @@ def normalize(vmid: int, conf: dict, dev: dict, notes: list[str]) -> None:
         elif dev["bus"] not in ctrls:
             raise Q.QdevError(f"{dev['bus']} is not a TB USB controller of VM {vmid}")
     if kind in PORT_KINDS:
-        if dev["bus"] in ("", Q.PORT_ID, None):
+        if dev["bus"] in ("", "tb", Q.PORT_ID, None):
             dev["bus"] = free_port(conf)
-        elif not re.match(rf"^{PORT_PREFIX}[0-9]$", dev["bus"]) or int(dev["bus"][len(PORT_PREFIX):]) >= port_count(conf):
+        elif not is_port(dev["bus"]) or int(dev["bus"][len(PORT_PREFIX):]) >= port_count(conf):
             raise Q.QdevError(f"{dev['bus']} is not a TB port of VM {vmid} (qdev-tb0..qdev-tb{port_count(conf) - 1})")
         else:
-            taken = next((d["id"] for d in tb_devices(conf) if d["bus"] == dev["bus"] and d["id"] != dev["id"]
-                          and d["plugin"] in PORT_KINDS), None)
+            taken = next((d["id"] for d in on_port(conf) if d["bus"] == dev["bus"] and d["id"] != dev["id"]), None)
             if taken:
                 raise Q.QdevError(f"{dev['bus']} already holds {taken}")
 
@@ -733,20 +785,24 @@ def purge(vmid: int, conf: dict, vmcfg: dict) -> None:
     for p in (cfg_path(vmid), aml_path(vmid)):
         p.unlink(missing_ok=True)
 
-def set_ports(vmid: int, conf: dict, n: int) -> list[str]:
+def set_ports(vmid: int, conf: dict, n: int, acpi: str | None = None) -> list[str]:
+    if acpi is not None and acpi not in ACPI_MODES:
+        raise Q.QdevError(f"ACPI properties: {', '.join(ACPI_MODES)}")
     if not 1 <= n <= MAX_PORTS:
         raise Q.QdevError(f"the TB bus has 1..{MAX_PORTS} ports")
-    used = [d for d in tb_devices(conf) if d["plugin"] in PORT_KINDS and int(d["bus"][len(PORT_PREFIX):]) >= n]
+    used = [d for d in on_port(conf) if int(d["bus"][len(PORT_PREFIX):]) >= n]
     if used:
         raise Q.QdevError(f"{', '.join(d['id'] for d in used)} use ports beyond {n}")
     Q.check_editable(vmid)
     conf.setdefault("tb", {})["ports"] = n
+    if acpi is not None:
+        conf["tb"]["acpi"] = acpi
     vmcfg = Q.vm_config(vmid)
     write_files(vmid, conf, vmcfg)
     changed = ensure_args(vmid, vmcfg)
     Q.ensure_hookscript(vmid, vmcfg, conf)
     Q.save_conf(conf)
-    return [f"VM {vmid}: TB bus with {n} port(s)" + (", added to args" if changed else "") +
+    return [f"VM {vmid}: TB bus with {n} port(s), ACPI properties {acpi_mode(conf)}" + (", added to args" if changed else "") +
             (": the change applies at the next VM start" if Q.vm_running(vmid) else "")]
 
 # --------------------------------------------------------------- hooks
@@ -756,31 +812,19 @@ def pre_start(vmid: int, conf: dict) -> list[str]:
     vmcfg = Q.vm_config(vmid)
     if not in_args(vmid, vmcfg):
         return [f"the TB bus is not in VM {vmid}'s args (edited by hand?); run: qdevctl tb {vmid}"]
-    prepared: dict[str, dict] = {}
-    try:
-        for dev in tb_devices(conf):
-            if dev["plugin"] == "tb-pci":
-                prepared[dev["id"]] = perl("pci-prepare", vmid, dev["args"], "120")
-        notes = write_files(vmid, conf, vmcfg, prepared)
-    except Q.QdevError:
-        for info in prepared.values():
-            try:
-                perl("pci-release", vmid, json.dumps(info["ids"]))
-            except Q.QdevError:
-                pass
-        raise
-    return notes
+    return write_files(vmid, conf, vmcfg, starting=True)
 
-def post_start(vmid: int, conf: dict) -> None:
-    ids = []
+def post_start(vmid: int, conf: dict) -> list[str]:
+    """Hot-plug the PCI pass-through devices; before qdev-host's vfio-user devices,
+    which QEMU 11 must not have when a vfio-pci device connects."""
+    msgs = []
     for dev in tb_devices(conf):
         if dev["plugin"] == "tb-pci":
             try:
-                ids += perl("pci-resolve", vmid, dev["args"])["ids"]
-            except Q.QdevError:
-                pass
-    if ids:
-        perl("pci-own", vmid, json.dumps(ids), vm_pid(vmid))
+                msgs.append(plug(vmid, conf, dev))
+            except Q.QdevError as e:
+                msgs.append(f"{dev['id']}: {e}")
+    return msgs
 
 def post_stop(vmid: int, conf: dict) -> None:
     ids = []
@@ -803,6 +847,6 @@ def describe(vmid: int, conf: dict, vmcfg: dict, running: bool) -> tuple[dict, d
         if d["id"] in present:
             where[d["id"]] = d["bus"]
     ports_in_vm = running and port_id(0) in (present or peripherals(vmid))
-    info = {"enabled": bool(conf.get("tb")), "ports": port_count(conf), "in_args": in_args(vmid, vmcfg),
+    info = {"enabled": bool(conf.get("tb")), "ports": port_count(conf), "acpi": acpi_mode(conf), "in_args": in_args(vmid, vmcfg),
             "in_vm": bool(ports_in_vm)}
     return info, where

@@ -13,10 +13,27 @@ qdev-host (0.6.0) unstable; urgency=medium
     qemu-server's tap_plug), tb-xhci (qemu-xhci) and tb-usb (a USB device of
     the node on a tb-xhci controller, also for guests such as macOS that do
     not take PVE's own USB hot-plug).
+  * qdev-host's own devices go to the TB bus as well: a new tb-vga (or other
+    plugin device) is hot-plugged on a free TB port, a new virgl-gpu sits on
+    one from the VM start; the bus goes in front of the VM's args so its
+    ports exist before the GPU's -device. Devices of earlier versions keep
+    their root port qdev-rp0, and --bus qdev-rp0 still adds one.
   * Web UI: PVE's own PCI Device, Network Device and USB Device dialogs get a
     Bus field (Standard or TB bus); TB devices are rows of the Hardware panel
     whose Edit opens the same dialog with their settings. The USB controller
     is a qdev-host Device. qdevctl tb VMID --ports N sets the number of ports.
+  * PCI pass-through devices on the TB bus are hot-plugged at post-start:
+    QEMU pins the VM's memory for them before it daemonizes, and
+    qemu-server's start timeout grows only for its own hostpciN (a 32 GiB VM
+    was killed). They go in before vfio-user devices, and are not hot-plugged
+    while one is attached: QEMU 11's legacy VFIO container code casts every
+    container of the address space and aborts on a vfio-user one.
+  * qdevctl tb VMID --acpi thunderbolt|hotplug|none chooses the ports' ACPI
+    properties (default thunderbolt); --io-reserve, --mem-reserve and
+    --pref64-reserve change the windows the firmware reserves per port.
+  * macOS: in a Sequoia-era OpenCore guest no device behind any PCIe root
+    port was configured (TB ports in all three modes, PVE's own port too),
+    hot-plug and unplug requests were ignored; Linux guests are unaffected.
   * tools/test-tb-bus.py checks the AML encoder and the generated files
     offline; tools/pve-tb-ui-test.mjs drives the dialogs on a node.
 

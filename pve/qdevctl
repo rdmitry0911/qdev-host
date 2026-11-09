@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """qdevctl: qdev-host devices for Proxmox VE VMs (stock PVE, no patches).
 
-  qdevctl add VMID ID --plugin tb-vga [--args 'vram=16,edid=/path'] [--bus qdev-rp0|ich9-pcie-port-N]
+  qdevctl add VMID ID --plugin tb-vga [--args 'vram=16,edid=/path'] [--bus qdev-tbN|qdev-rp0|ich9-pcie-port-N]
                       [--kms /dev/dri/cardN:CONNECTOR] [--no-display] [--persistent] [--port-addr 0x08]
   qdevctl remove VMID ID [--keep-process]
   qdevctl list [VMID]
@@ -17,10 +17,11 @@ syntax), tb-net (--args 'virtio,bridge=vmbr0[,tag=N]', PVE's netN syntax), tb-xh
 controller) and tb-usb (--args 'host=VENDOR:PRODUCT|BUS-PORT' --bus ID-of-a-tb-xhci).
 
 Device definitions live in /etc/qdev-host/vms/VMID.json. `add` also sets the VM's
-hookscript (chaining an existing one) and, for --bus qdev-rp0 (default), adds a
-PCIe root port with reserved windows to the VM's `args` (needs a VM restart once).
+hookscript (chaining an existing one) and puts the device on a free port of the
+VM's TB bus: hot-plug PCIe root ports with Thunderbolt ACPI properties, added to
+the VM's `args` with the first device (needs a VM restart once).
 """
-import argparse, json, sys
+import argparse, json, re, sys
 sys.path.insert(0, "/usr/lib/qdev-host/pve")
 import qdev_pve as Q
 import qdev_tb as TB
@@ -61,15 +62,18 @@ def cmd_status(a):
           f"port addr {info['port_addr']} (in args: {info['port_in_args']}, in running VM: {info['port_in_vm']})")
     tb = info["tb"]
     if tb["enabled"]:
-        print(f"  TB bus: {tb['ports']} port(s) qdev-tb0..{tb['ports'] - 1} (in args: {tb['in_args']}, "
+        print(f"  TB bus: {tb['ports']} port(s) qdev-tb0..{tb['ports'] - 1}, ACPI {tb['acpi']} (in args: {tb['in_args']}, "
               f"in running VM: {tb['in_vm']}), {TB.cfg_path(a.vmid)}, {TB.aml_path(a.vmid)}")
     for d in info["devices"]:
         if d["kind"] == "tb":
             print(f"  {d['id']}: plugin={d['plugin']} args='{d['args']}' bus={d['bus']} {_state_text(d)}")
             continue
-        u = Q.unit_name(a.vmid, d["id"])
+        u = Q.unit_name(a.vmid, d["id"], d["kind"])
         print(f"  {d['id']}: plugin={d['plugin']} args='{d['args']}' bus={d['bus']} unit={u} "
               f"({'active' if d['process_active'] else 'inactive'}) {_state_text(d)}")
+        if d["kind"] == "vhost-user-gpu":
+            print(f"      GPU socket {Q.gpu_socket(a.vmid, d['id'])}")
+            continue
         print(f"      vfio socket {Q.device_socket(a.vmid, d['id'])}" +
               (f", Display1 p2p {Q.device_display(a.vmid, d['id'])}" if d.get('display', True) else "") +
               (f", KMS {d['kms']}" if d.get("kms") else ""))
@@ -104,7 +108,13 @@ def cmd_tb(a):
     conf = Q.load_conf(a.vmid)
     if not Q.is_q35(Q.vm_config(a.vmid)):
         raise Q.QdevError(f"VM {a.vmid} is not a q35 machine")
-    for m in TB.set_ports(a.vmid, conf, a.ports or TB.port_count(conf)):
+    for key in ("io_reserve", "mem_reserve", "pref64_reserve"):
+        value = getattr(a, key)
+        if value is not None:
+            if value and not re.match(r"^[0-9]+[KMG]?$", value):
+                raise Q.QdevError(f"--{key.replace('_', '-')} takes a size such as 32M (empty: QEMU's default)")
+            conf.setdefault("tb", {})[key.replace("_", "-")] = value
+    for m in TB.set_ports(a.vmid, conf, a.ports or TB.port_count(conf), a.acpi):
         print(m)
 
 def cmd_hook(a):
@@ -138,10 +148,8 @@ def cmd_hook(a):
                     print(f"qdev-host: {d['id']}: {e}", file=sys.stderr)
                     return 2
     elif a.phase == "post-start":
-        try:
-            TB.post_start(a.vmid, conf)
-        except Q.QdevError as e:
-            print(f"qdev-host: TB bus: {e}", file=sys.stderr); rc = 1
+        for m in TB.post_start(a.vmid, conf):
+            print(m)
         for d in conf["devices"]:
             if Q.dev_kind(d) in ("vhost-user-gpu", "tb"):
                 continue
@@ -167,7 +175,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("add"); s.add_argument("vmid", type=int); s.add_argument("id")
-    s.add_argument("--plugin", required=True); s.add_argument("--args"); s.add_argument("--bus", default=Q.PORT_ID)
+    s.add_argument("--plugin", required=True); s.add_argument("--args"); s.add_argument("--bus", default="",
+        help="a TB port qdev-tbN (default: a free one), qdev-rp0 (before 0.6.0) or a PVE port")
     s.add_argument("--kms"); s.add_argument("--no-display", action="store_true"); s.add_argument("--persistent", action="store_true")
     s.add_argument("--port-addr"); s.add_argument("--extra", action="append", help="extra qdev-host option (repeatable)")
     s.set_defaults(fn=cmd_add)
@@ -185,7 +194,11 @@ def main():
     s = sub.add_parser("stop"); s.add_argument("vmid", type=int); s.add_argument("id", nargs="?"); s.set_defaults(fn=cmd_stop)
     s = sub.add_parser("hook"); s.add_argument("vmid", type=int); s.add_argument("phase"); s.set_defaults(fn=cmd_hook)
     s = sub.add_parser("tb", help="add the TB bus to the VM, or change its number of ports")
-    s.add_argument("vmid", type=int); s.add_argument("--ports", type=int); s.set_defaults(fn=cmd_tb)
+    s.add_argument("vmid", type=int); s.add_argument("--ports", type=int)
+    s.add_argument("--acpi", choices=sorted(TB.ACPI_MODES), help="ACPI properties of the ports (default thunderbolt)")
+    for key, default in (("io-reserve", "0"), ("mem-reserve", "32M"), ("pref64-reserve", "1G")):
+        s.add_argument(f"--{key}", help=f"window the firmware reserves per port (default {default}; '' = QEMU's default)")
+    s.set_defaults(fn=cmd_tb)
     a = p.parse_args()
     try:
         rc = a.fn(a)

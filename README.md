@@ -365,9 +365,9 @@ Two Debian packages, built with `scripts/mkchroot.sh` + `scripts/build-deb-in-ch
 
 ```bash
 apt install ./pve-ui-overlays_0.1.0_all.deb ./qdev-host_0.5.0_amd64.deb ./qdev-host-pve_0.5.0_all.deb
-qdevctl add 109 tbvga0 --plugin tb-vga --args vram=16     # q35 VM; adds hookscript + root port (args)
+qdevctl add 109 tbvga0 --plugin tb-vga --args vram=16     # q35 VM; adds hookscript + TB bus (args)
 qm start 109                                               # hookscript starts the process and hot-plugs
-qdevctl list                                               # VM 109  tbvga0  tb-vga  bus=qdev-rp0  attached (01:00.0)
+qdevctl list                                               # VM 109  tbvga0  tb-vga  bus=qdev-tb0  attached (01:00.0)
 qdevctl stop 109 tbvga0; qdevctl start 109                 # hot-unplug / hot-plug on the running VM
 qdevctl remove 109 tbvga0 --purge-port                     # forget it, restore hookscript and args
 ```
@@ -427,7 +427,8 @@ reboot inside the guest.
 **TB bus** (0.6.0): hot-plug PCIe root ports with the Thunderbolt ACPI
 properties of the fork, generated per VM, for QEMU's own devices: PCI
 pass-through, network cards, a USB controller and USB devices of the node on it,
-added to and removed from the running VM. PVE's own *PCI Device*, *Network
+added to and removed from the running VM. qdev-host's own devices (tb-vga,
+virgl-gpu) take its ports as well. PVE's own *PCI Device*, *Network
 Device* and *USB Device* dialogs get a *Bus* field (*Standard* or *TB bus*)
 ([details](pve/README.md#tb-bus-hot-plug-ports-with-thunderbolt-properties)).
 

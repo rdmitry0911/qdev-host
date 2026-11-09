@@ -87,10 +87,13 @@ with tempfile.TemporaryDirectory() as d:
     notes = T.write_files(990, conf, {"args": "-device pcie-root-port,id=qdev-rp0,bus=pcie.0,addr=0x08"})
     cfg = (Path(d) / "990.cfg").read_text()
     order = [l.split('"')[1] for l in cfg.splitlines() if l.startswith("[")]
-    check("cfg order", order == ["qdev-tb0", "qdev-tb1", "qdev-tb2", "qdev-tb3", "tbpci0", "tbpci0-f1", "tbnet0",
+    # PCI pass-through is hot-plugged at post-start, not in the file
+    check("cfg order", order == ["qdev-tb0", "qdev-tb1", "qdev-tb2", "qdev-tb3", "tbnet0",
                                  "tbnet0", "tbxhci0", "tbusb0"], str(order))
     check("cfg ports", 'addr = "09.3"' in cfg and 'io-reserve = "0"' in cfg and 'pref64-reserve = "1G"' in cfg)
-    check("cfg multifunction", cfg.count('multifunction = "on"') == 4 + 2 and 'rombar = "0"' in cfg)
+    funcs = T.pci_functions(conf["devices"][0], fake_perl("pci-resolve", 990, ""))
+    check("pci functions", [q for q, _ in funcs] == ["tbpci0", "tbpci0-f1"] and funcs[0][1]["rombar"] == "0"
+          and all(p["multifunction"] == "on" for _, p in funcs), str(funcs))
     check("cfg tap", 'ifname = "tap990i32"' in cfg and f'script = "{T.IFUP}"' in cfg)
     check("cfg usb", 'bus = "tbxhci0.0"' in cfg and 'vendorid = "0x1a86"' in cfg)
     aml = (Path(d) / "990.aml").read_bytes()

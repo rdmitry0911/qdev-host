@@ -147,6 +147,7 @@
             return `${where}${dev.args ? `, ${dev.args}` : ''} — ${stateText(dev, info)}`;
         }
         let text = dev.plugin;
+        if (/^qdev-tb\d$/.test(dev.bus || '')) { text += `, TB port ${dev.bus}`; }
         if (dev.args) { text += `, ${dev.args}`; }
         if (dev.kms) { text += `, kms=${dev.kms}`; }
         if (dev.display === false && dev.kind !== 'vhost-user-gpu') { text += ', no Display1'; }
@@ -155,10 +156,9 @@
         return dev.warning ? `${text} — ${dev.warning}: open and save it before the next start` : text;
     };
 
-    const PORT_HINT = 'A PCIe root port (qdev-rp0) is added to the VM\'s <i>args</i> for hot-plug; '
-        + 'it exists after the next VM start, until then the device stays defined but not attached.';
-    const TB_HINT = 'The VM\'s TB bus (4 hot-plug PCIe ports with Thunderbolt ACPI properties) is added to its '
-        + '<i>args</i>; it exists after the next VM start, until then the device is present from the next start.';
+    const TB_HINT = 'The device goes to a free port of the VM\'s TB bus (hot-plug PCIe ports with Thunderbolt ACPI '
+        + 'properties). The bus is added to the VM\'s <i>args</i> and exists after the next VM start; until then '
+        + 'the device stays defined.';
     const showMessages = (result) => {
         const messages = (result && result.messages) || [];
         if (messages.some((m) => /next VM start|VM is stopped|not attached|^note:|plugged again|failed|not released/.test(m))) {
@@ -259,11 +259,7 @@
                     if (field) { field.setHidden(!fields[name]); field.setDisabled(!fields[name]); }
                 });
                 const portHint = me.down('#qdevPortHint');
-                const tb = def && def.kind === 'tb';
-                if (portHint) {
-                    portHint.setHidden(!!editDev || (tb ? !!(info.tb && info.tb.in_args) : !!info.port_in_args));
-                    portHint.setValue(tb ? TB_HINT : PORT_HINT);
-                }
+                if (portHint) { portHint.setHidden(!!editDev || !!(info.tb && info.tb.in_args)); }
             };
             const first = editDev ? editDev.plugin : (plugins.length ? plugins[0].name : '');
             me.items = [
@@ -305,7 +301,7 @@
                 },
                 {
                     xtype: 'displayfield', fieldLabel: ' ', labelSeparator: '', userCls: 'pmx-hint', itemId: 'qdevPortHint',
-                    hidden: !!info.port_in_args || !!editDev, value: PORT_HINT,
+                    hidden: !!(info.tb && info.tb.in_args) || !!editDev, value: TB_HINT,
                 },
             ];
             me.callParent();

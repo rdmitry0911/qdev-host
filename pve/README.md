@@ -7,8 +7,8 @@ and systemd.
 
 ```bash
 apt install ./pve-ui-overlays_0.1.0_all.deb ./qdev-host_0.5.0_amd64.deb ./qdev-host-pve_0.5.0_all.deb
-qdevctl add 128 tbvga0 --plugin tb-vga --args vram=16      # define + hookscript + root port in args
-qm stop 128 && qm start 128                                  # the root port appears at the next start
+qdevctl add 128 tbvga0 --plugin tb-vga --args vram=16      # define + hookscript + TB bus in args
+qm stop 128 && qm start 128                                  # the TB bus appears at the next start
 qdevctl list 128                                             # tbvga0 ... attached
 qdevctl set 128 tbvga0 --args vram=32                       # change it (a running VM sees an unplug and a replug)
 qdevctl remove 128 tbvga0                                    # hot-unplug, stop the process, forget it
@@ -19,10 +19,13 @@ What `add` does:
 1. writes `/etc/qdev-host/vms/VMID.json` and `/etc/qdev-host/units/VMID-ID.env`;
 2. sets the VM's `hookscript` to `local:snippets/qdev-host-hook.pl` (a VM's own
    hookscript is remembered and chained);
-3. for the default bus `qdev-rp0` appends a `pcie-root-port` with reserved windows
-   (`pref64-reserve=256M,mem-reserve=16M`) to the VM's `args` (root@pam only, like
-   any `args` change). `--bus ich9-pcie-port-N` uses one of PVE's own q35 ports
-   instead (no restart, but the firmware reserves only small windows there);
+3. puts the device on a free port of the VM's [TB bus](#tb-bus-hot-plug-ports-with-thunderbolt-properties)
+   (from 0.6.0), whose two option groups go in front of the VM's `args` with the
+   first device (root@pam only, like any `args` change). Devices of earlier
+   versions keep their own root port `qdev-rp0` (0x08,
+   `pref64-reserve=256M,mem-reserve=16M`), which `--bus qdev-rp0` still adds;
+   `--bus ich9-pcie-port-N` uses one of PVE's own q35 ports instead (no restart,
+   but the firmware reserves only small windows there);
 4. if the VM is running and the bus exists: starts
    `qdev-host-device@VMID-ID.service` and hot-plugs the device (`device_add
    vfio-user-pci`).
@@ -146,8 +149,12 @@ Logs: `journalctl -u qdev-host-device@VMID-ID`. Requirements: q35 machine type,
 A VM can get a **TB bus**: hot-plug PCIe root ports `qdev-tb0..3` (`pcie.0` slot
 0x09, functions 0..3) whose ACPI nodes carry the Thunderbolt properties of the
 qemu-thunderbolt fork (`PCI-Thunderbolt`, `pci-supports-link-change`), as `_DSD`
-device properties and as the `_DSM` macOS reads device properties from. QEMU's
-own devices are put on it and can be added to and removed from the running VM:
+device properties and as the `_DSM` macOS reads device properties from.
+qdev-host's own devices take its ports (from 0.6.0): a plugin device such as
+`tb-vga` is hot-plugged there, the `virgl-gpu` GPU sits on one from the VM
+start (its `-device` stays in `args`, after the bus, where QSM Direct finds it).
+QEMU's own devices are put on it too and can be added to and removed from the
+running VM:
 
 | Plugin | Device | Arguments (PVE's own syntax) | Added in the web UI |
 |---|---|---|---|
@@ -163,6 +170,7 @@ qdevctl add 990 tbusb0 --plugin tb-usb --args host=1a86:7523 --bus tbxhci0    # 
 qdevctl add 990 tbpci0 --plugin tb-pci --args host=0000:08:00.3               # bound to vfio-pci like a hostpciN
 qdevctl stop 990 tbusb0; qdevctl start 990 tbusb0                              # unplug / plug again
 qdevctl tb 990 --ports 6                                                       # more ports, from the next VM start
+qdevctl tb 990 --acpi hotplug                                                  # ACPI properties: thunderbolt|hotplug|none
 qdevctl status 990
 ```
 
@@ -181,7 +189,8 @@ How it works:
   runs, the bus exists from its next start). The hookscript writes both files
   again at every VM start (pre-start): the root ports and the devices present at
   the start go to `VMID.cfg`, the SSDT for the ports (and for `qdev-rp0` when it
-  is in the args) to `VMID.aml`, built by qdev-host's own small AML encoder.
+  is in the args) to `VMID.aml`, built by qdev-host's own small AML encoder
+  (PCI pass-through devices excepted, see below).
   So adding or removing a device never changes `args` again.
 - While the VM runs, devices are added with QMP `device_add`/`netdev_add` through
   the node's `mon_cmd`, removed with `device_del` (the guest releases a PCIe
@@ -190,7 +199,17 @@ How it works:
   qemu-server's own functions (`parse_hostpci`, `prepare_pci_device`,
   `reserve_pci_usage`), so a device another running VM uses is refused, and a
   mapping works as for `hostpciN`. Mediated devices, *Primary GPU* (`x-vga`)
-  and `legacy-igd` need the standard bus.
+  and `legacy-igd` need the standard bus. They are not in `VMID.cfg`: the
+  hookscript hot-plugs them right after the start (post-start), because QEMU
+  pins all of the VM's memory for the first one before it daemonizes and
+  qemu-server lengthens its start timeout only for its own `hostpciN` (a 32 GiB
+  VM was killed after 32 s; hot-plugged, the pinning took about 100 s inside
+  `qm start`'s hookscript step).
+- QEMU 11 aborts when a vfio-pci device connects while a vfio-user device
+  (`tb-vga`, ...) is attached: `hw/vfio/container-legacy.c` casts every VFIO
+  container of the address space to a legacy one. qdev-host therefore plugs PCI
+  devices before its vfio-user devices at the start and refuses to hot-plug one
+  while a vfio-user device is attached (it is then present from the next start).
 - A network device's tap is `tapVMIDi32` and up (PVE's own NICs are 0..31), so
   the VM's traffic counters include it. QEMU's `script` is
   `/usr/lib/qdev-host/qdev-tb-ifup`, which plugs the tap into the bridge with
@@ -202,7 +221,12 @@ How it works:
   bridges with one, and `e1000`/`rtl8139` need port I/O.
 - Ports reserve 32 MiB of 32-bit and 1 GiB of 64-bit prefetchable memory each
   (`mem-reserve=32M,pref64-reserve=1G`), enough for a NIC, a USB controller or a
-  GPU with a 256 MiB BAR.
+  GPU with a 256 MiB BAR; `qdevctl tb VMID --io-reserve/--mem-reserve/--pref64-reserve
+  SIZE` changes them for a VM (`''` = QEMU's default), from its next start.
+- `qdevctl tb VMID --acpi MODE` chooses the ports' ACPI properties: `thunderbolt`
+  (default, the fork's `PCI-Thunderbolt` + `pci-supports-link-change`),
+  `hotplug` (`PCIHotplugCapable` + `pci-supports-link-change`, macOS's native
+  hot-plug port) or `none`.
 - `qdevctl remove ... --purge-port` of the VM's last qdev-host device also
   removes the TB bus from `args` and deletes its two files.
 
@@ -214,7 +238,17 @@ node (the node gets it back on unplug), unplug and replug of the controller
 with its device; on a second node an AMD USB 3 controller passed through
 (cold, hot-unplug, hot-plug, PVE's reservation following). The web UI flow
 (Add, Edit, Remove in the PCI, Network and USB dialogs) passes the headless
-test `tools/pve-tb-ui-test.mjs`. Not yet checked: a macOS guest.
+test `tools/pve-tb-ui-test.mjs`.
+
+macOS (a Sequoia-era guest with OpenCore on PVE 9.2.21, machine q35): macOS reads
+the properties (with `thunderbolt` it spreads the ports' bus numbers 14/72/134/195
+as for Thunderbolt), but it configured no device behind any PCIe root port of
+that VM: not on the TB ports in any of the three modes, with or without an I/O
+window, and not on PVE's own `ich9-pcie-port-2` either (a control xHCI), while
+everything behind PVE's conventional `pci.N` bridges works. It also ignored hot-plug
+and the unplug requests on the TB ports. So that guest can use the TB bus only once
+it configures root-port devices at all; another macOS VM (Ventura, machine
+pc-q35-8.1, PCI pass-through on PVE's ports) does, and is the next one to try.
 
 ## Web UI (Hardware panel)
 
