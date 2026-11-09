@@ -512,7 +512,9 @@ static void t2_teardown(void *priv)
 }
 
 static const qdp_device_ops ops = {
-    .abi_version = QDP_ABI_VERSION,
+    /* Stays an ABI 2 plugin (no v3 operation): the v2 compatibility check of
+     * newer hosts (tools/test-abi-v2.sh). */
+    .abi_version = 2,
     .name = "test-v2",
     .version = "0.1",
     .setup = t2_setup,

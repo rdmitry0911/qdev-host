@@ -172,7 +172,7 @@ qdev-host --plugin plugins/tb-vga/tb-vga.so --socket /run/qdev/tbvga0.sock \
 | `--on-connect CMD`, `--on-disconnect CMD` | run when that connector's status changes (e.g. `tbctl.py … plug/unplug`) |
 | `--qemu-display ADDR`, `--qemu-display-dest NAME`, `--qemu-console N` | forward keyboard/mouse to the VM's own Display1 console (see below) |
 | `--qemu-qmp PATH` | forward keyboard/mouse with QMP `input-send-event`, for VMs without a graphic console (see below) |
-| `--control PATH` | control socket for automation: `screendump FILE`, `frame`, `stats` (see below) |
+| `--control PATH` | control socket for automation: `screendump FILE`, `frame`, `stats`, `uiinfo W H [WMM HMM]` (see below) |
 | `--stats-interval S` | print damage-detection and KMS statistics every S seconds (`SIGUSR2` prints once) |
 | `--kms-copy` | force the dumb-buffer copy path instead of zero-copy |
 | `--head-origin X,Y`, `--desktop WxH` | guest desktop layout for the pointer on this head (see below) |
@@ -336,6 +336,7 @@ per line and one reply line per command, answered in order.
 | `screendump FILE` | waits for the next presented frame, at most 1 s, then writes the current scanout to `FILE` as binary PPM (`P6`, written as `FILE.tmp` and renamed) and replies `ok <seq> <w>x<h>` |
 | `frame` | `ok <seq> <w>x<h> stride <bytes> format 0x<pixman>`, or `ok <seq> off` |
 | `stats` | `ok key=value ...`: `seq`, `mode`, `frames`, `frame_calls`, `ticks`, `damaged`, `idle_s`, `irqs`, `irqs_dropped`, `dma_regions`, `dma_mib`, `dma_maps`, `dma_unmaps`, `quiesce`, `cursor_calls`, `cursor_sent`, `listeners`, `attached`, `cpu_s` |
+| `uiinfo W H [WMM HMM]` | asks for a `W`x`H` display (pixels; optional physical size in mm), as a Display1 `SetUIInfo` does: handed to an ABI v3 plugin's `ui_info()`. Replies `ok queued WxH`, `ok unchanged WxH` (same as the last accepted request) or `err ...` (no `ui_info` in the plugin, or refused). The scanout, and `frame`, change only when the guest presents at the new size |
 
 Errors are `err <reason>` (`err scanout off`, `err unknown command ...`). `<seq>`
 is the plugin's frame sequence number for `QDP_F_PLUGIN_DAMAGE` plugins; for
@@ -440,7 +441,7 @@ hookscript-free path for VMs whose firmware already reserves enough window space
 
 ## Plugin ABI
 
-`qdp.h`, versions 1 and 2 (`QDP_ABI_VERSION_MIN` .. `QDP_ABI_VERSION`). A plugin
+`qdp.h`, versions 1 to 3 (`QDP_ABI_VERSION_MIN` .. `QDP_ABI_VERSION`). A plugin
 is a shared object exporting one symbol (the name stays `qdp_plugin_v1` for every
 version):
 
@@ -462,8 +463,18 @@ typedef struct qdp_device_ops {
     void (*dma_register)(void *priv, const qdp_dma_region *r);      /* guest RAM regions with fd + offset */
     void (*dma_unregister)(void *priv, const qdp_dma_region *r);
     bool (*get_cursor)(void *priv, qdp_cursor *out);                /* optional cursor plane */
+    /* v3 */
+    int  (*ui_info)(void *priv, const qdp_ui_info *info);           /* optional: a UI asks for a size */
 } qdp_device_ops;
 ```
+
+Version 3 adds only the optional `ui_info()`: Display1 `SetUIInfo` and the
+control command `uiinfo` hand it the size a UI asks for (window resized,
+fullscreen entered or left) in device pixels, with the physical size when known
+(`0` = unknown). It runs on the main loop and returns `0` (accepted),
+`QDP_UI_INFO_UNCHANGED` or `-errno`. The plugin decides what the guest is offered;
+the scanout follows when the guest presents at the new size. A v1 or v2 plugin
+loads as before; `SetUIInfo` is then accepted and ignored.
 
 Version 1:
 

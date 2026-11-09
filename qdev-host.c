@@ -83,6 +83,10 @@ static struct {
     bool (*get_cursor)(void *, qdp_cursor *);
 } v2;
 #define PLUGIN_DAMAGE (v2.flags & QDP_F_PLUGIN_DAMAGE)
+/* v3 fields, likewise zero for an older plugin */
+static struct {
+    int  (*ui_info)(void *, const qdp_ui_info *);
+} v3;
 
 /* counters shown by SIGUSR2/--stats-interval and the control socket "stats";
  * the irq ones are bumped from plugin threads (atomics) */
@@ -269,6 +273,7 @@ static void load_plugin(void)
         v2.flags = ops->flags; v2.quiesce = ops->quiesce; v2.resume = ops->resume;
         v2.dma_register = ops->dma_register; v2.dma_unregister = ops->dma_unregister; v2.get_cursor = ops->get_cursor;
     }
+    if (abi >= 3) v3.ui_info = ops->ui_info;
     LOG("plugin %s %s (ABI %u%s)", ops->name, ops->version, abi, PLUGIN_DAMAGE ? ", plugin damage" : "");
 }
 
@@ -573,6 +578,23 @@ static gboolean on_sigusr1(gpointer data)
     return G_SOURCE_CONTINUE;
 }
 
+/* ------------------------------------------------------- UI size requests
+ * A UI asks for a display size (Display1 SetUIInfo, control "uiinfo"): handed
+ * to a v3 plugin's ui_info(). Returns its result, or -ENOTSUP when the plugin
+ * has none. The scanout follows only when the guest presents at a new size. */
+static int host_ui_info(uint32_t w, uint32_t h, uint16_t wmm, uint16_t hmm, const char *from)
+{
+    if (!v3.ui_info) {
+        DBG("ui_info %ux%u from %s ignored: plugin ABI %u has no ui_info", w, h, from, abi);
+        return -ENOTSUP;
+    }
+    qdp_ui_info info = { .size = sizeof(info), .width = w, .height = h, .width_mm = wmm, .height_mm = hmm };
+    int r = v3.ui_info(priv, &info);
+    LOG("ui_info %ux%u %ux%umm from %s: %s", w, h, wmm, hmm, from,
+        r == 0 ? "queued" : r == QDP_UI_INFO_UNCHANGED ? "unchanged" : strerror(r < 0 ? -r : EINVAL));
+    return r;
+}
+
 /* ------------------------------------------------- control socket (--control)
  * Line protocol on a unix stream socket, one reply line per command, for test
  * harnesses (QMP screendump cannot see the display of an external device):
@@ -580,6 +602,10 @@ static gboolean on_sigusr1(gpointer data)
  *                    scanout as PPM P6 -> "ok <seq> <w>x<h>"
  *   frame            -> "ok <seq> <w>x<h> stride <n> format 0x<pixman>" or "ok <seq> off"
  *   stats            -> "ok key=value ..."
+ *   uiinfo W H [WMM HMM]  ask for a W x H display (pixels; optional physical
+ *                    size in mm) -> "ok queued WxH", "ok unchanged WxH" (same as
+ *                    the last accepted request) or "err <reason>"; "frame"
+ *                    shows the size once the guest presents at it
  * Errors: "err <reason>". A client's commands are answered in order: while its
  * screendump waits, its later lines stay queued. */
 typedef struct { int fd; guint watch; GString *in; char *shot; guint shot_timer; } ctl_t;
@@ -652,8 +678,25 @@ static void ctl_command(ctl_t *c, char *line)
                   dma_map ? g_hash_table_size(dma_map) : 0, dma_bytes >> 20, hstat.dma_maps, hstat.dma_unmaps, hstat.quiesce,
                   __atomic_load_n(&hstat.cursor_calls, __ATOMIC_RELAXED), hstat.cursor_sent, listeners->len, attached,
                   ru.ru_utime.tv_sec + ru.ru_stime.tv_sec + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1e6);
+    } else if (!strncmp(line, "uiinfo", 6) && (line[6] == ' ' || line[6] == 0)) {
+        uint32_t v[4] = { 0, 0, 0, 0 };
+        int n = 0;
+        bool ok = true;
+        char *save = NULL;
+        for (char *t = strtok_r(line + 6, " \t", &save); t; t = strtok_r(NULL, " \t", &save)) {
+            char *end; unsigned long x;
+            errno = 0; x = strtoul(t, &end, 10);
+            if (n >= 4 || errno || end == t || *end || x > (n < 2 ? 0xffffffffUL : 0xffffUL)) { ok = false; break; }
+            v[n++] = (uint32_t)x;
+        }
+        if (!ok || (n != 2 && n != 4)) { ctl_reply(c, "err usage: uiinfo W H [WMM HMM]"); return; }
+        int r = host_ui_info(v[0], v[1], (uint16_t)v[2], (uint16_t)v[3], "control");
+        if (r == 0) ctl_reply(c, "ok queued %ux%u", v[0], v[1]);
+        else if (r == QDP_UI_INFO_UNCHANGED) ctl_reply(c, "ok unchanged %ux%u", v[0], v[1]);
+        else if (r == -ENOTSUP && !v3.ui_info) ctl_reply(c, "err plugin has no ui_info (ABI %u)", abi);
+        else ctl_reply(c, "err %ux%u refused: %s", v[0], v[1], strerror(r < 0 ? -r : EINVAL));
     } else {
-        ctl_reply(c, "err unknown command (screendump FILE | frame | stats)");
+        ctl_reply(c, "err unknown command (screendump FILE | frame | stats | uiinfo W H [WMM HMM])");
     }
 }
 static void ctl_process(ctl_t *c)
@@ -919,7 +962,11 @@ static gboolean handle_register_listener(QemuDBusDisplay1Console *object, GDBusM
 static gboolean handle_set_uiinfo(QemuDBusDisplay1Console *o, GDBusMethodInvocation *inv, guint16 wmm, guint16 hmm,
                                   gint xoff, gint yoff, guint w, guint h, gpointer data)
 {
-    DBG("SetUIInfo %ux%u (ignored: the guest chooses the mode)", w, h);
+    /* Forwarded to a v3 plugin (it may offer the guest this size); without
+     * one the guest keeps choosing its mode, as before. Display1 has no
+     * error for a refused size: the call completes either way. */
+    if (w && h) host_ui_info(w, h, wmm, hmm, "Display1");
+    else DBG("SetUIInfo %ux%u ignored (no size)", w, h);
     qemu_dbus_display1_console_complete_set_uiinfo(o, inv);
     return TRUE;
 }
@@ -1454,7 +1501,8 @@ static void usage(void)
         "  --desktop WxH|auto       guest desktop size for pointer mapping (default: VM console + this display)\n"
         "  --qemu-qmp PATH          the VM's QMP socket: forward keyboard/mouse with input-send-event\n"
         "                           (for VMs without a graphic console; --qemu-display wins if both are given)\n"
-        "  --control PATH           control socket for automation: screendump FILE | frame | stats\n"
+        "  --control PATH           control socket for automation: screendump FILE | frame | stats |\n"
+        "                           uiinfo W H [WMM HMM]\n"
         "  --kms-copy               force the copy path (no udmabuf zero-copy)\n"
         "  --stats-interval S       print stats every S seconds (SIGUSR2 prints them once)\n"
         "  -v                       verbose\n");
