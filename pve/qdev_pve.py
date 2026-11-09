@@ -54,6 +54,24 @@ BUILTIN_PLUGINS: dict[str, dict] = {
             {"name": "yres", "label": "Height", "type": "int", "default": 800, "min": 480, "max": 4320},
         ],
     },
+    # QEMU's own devices on the TB bus (pve/qdev_tb.py); "dialog" names the PVE dialog that adds them
+    "tb-xhci": {
+        "kind": "tb",
+        "title": "USB controller on the TB bus (qemu-xhci)",
+        "description": ("QEMU's USB 3 controller on a hot-plug port of the VM's TB bus, a PCIe root port with "
+                        "Thunderbolt ACPI properties. USB devices of this node are then added to it "
+                        "(Add > USB Device, Bus) and removed while the VM runs, also for guests such as "
+                        "macOS that do not take PVE's own USB hot-plug."),
+        "fields": {"kms": False, "display": False, "persistent": False},
+        "args": [{"name": "ports", "label": "Ports", "type": "int", "default": 8, "min": 1, "max": 15,
+                  "hint": "USB 2 and USB 3 ports, each"}],
+    },
+    "tb-pci": {"kind": "tb", "dialog": "pci", "title": "PCI Device on the TB bus", "description": "",
+               "fields": {"kms": False, "display": False, "persistent": False}, "args": []},
+    "tb-net": {"kind": "tb", "dialog": "net", "title": "Network Device on the TB bus", "description": "",
+               "fields": {"kms": False, "display": False, "persistent": False}, "args": []},
+    "tb-usb": {"kind": "tb", "dialog": "usb", "title": "USB Device on the TB bus", "description": "",
+               "fields": {"kms": False, "display": False, "persistent": False}, "args": []},
 }
 
 def plugin_kind(plugin: str) -> str:
@@ -63,6 +81,8 @@ def dev_kind(dev: dict) -> str:
     return plugin_kind(dev["plugin"])
 
 def plugin_available(plugin: str) -> bool:
+    if plugin_kind(plugin) == "tb":
+        return True
     if plugin in BUILTIN_PLUGINS:
         return VUG_BINARY.exists()
     return (PLUGIN_DIR / f"{plugin}.so").exists()
@@ -387,6 +407,11 @@ def process_active(vmid: int, dev_id: str, kind: str = "vfio-user") -> bool:
 # --------------------------------------------------------------- flows
 def attach(vmid: int, dev: dict) -> str:
     """Start the device process (if needed) and hot-plug it. Returns a status line."""
+    if dev_kind(dev) == "tb":
+        import qdev_tb
+        if not vm_running(vmid):
+            return f"{dev['id']}: present from the next VM start"
+        return qdev_tb.plug(vmid, load_conf(vmid), dev)
     if dev_kind(dev) == "vhost-user-gpu":
         # on the QEMU command line from the VM start: QEMU's D-Bus display exports only
         # the consoles that exist when it starts, so this GPU is never hot-plugged
@@ -404,6 +429,9 @@ def attach(vmid: int, dev: dict) -> str:
     return f"{dev['id']}: attached to {dev['bus']} (plugin {dev['plugin']})"
 
 def detach(vmid: int, dev: dict, keep_process: bool) -> str:
+    if dev_kind(dev) == "tb":
+        import qdev_tb
+        return qdev_tb.unplug(vmid, dev) if vm_running(vmid) else f"{dev['id']}: VM not running"
     if dev_kind(dev) == "vhost-user-gpu":
         if vm_running(vmid):
             return f"{dev['id']}: stays in the running VM until it stops"
@@ -430,7 +458,10 @@ def validate_device(dev_id: str, plugin: str, args: str, bus: str, kms: str | No
     if not plugin_available(plugin):
         where = VUG_BINARY if plugin in BUILTIN_PLUGINS else PLUGIN_DIR / (plugin + ".so")
         raise QdevError(f"plugin not installed: {plugin} (looked for {where})")
-    if args and (not ARGS_RE.match(args) or any("=" not in kv or not kv.split("=", 1)[0] for kv in args.split(","))):
+    # PVE's netN syntax of a TB network device starts with a bare model ("virtio,bridge=vmbr0")
+    bare_ok = plugin_kind(plugin) == "tb"
+    if args and (not ARGS_RE.match(args) or
+                 any(not kv.split("=", 1)[0] or ("=" not in kv and not bare_ok) for kv in args.split(","))):
         raise QdevError("plugin args must be a comma separated list of key=value pairs")
     if not BUS_RE.match(bus or ""):
         raise QdevError("invalid bus id")
@@ -693,6 +724,12 @@ def add_device(vmid: int, dev_id: str, plugin: str, args: str = "", bus: str = P
         raise QdevError(f"VM {vmid} is not a q35 machine (machine: {cfg.get('machine', 'i440fx')}); PCIe hot-plug needs q35")
     dev = {"id": dev_id, "plugin": plugin, "args": args or "", "bus": bus, "display": bool(display),
            "kms": kms or None, "persistent": bool(persistent), "extra": extra or []}
+    if plugin_kind(plugin) == "tb":
+        import qdev_tb
+        if kms:
+            raise QdevError(f"{plugin} has no KMS output")
+        dev.update(display=False, kms=None, persistent=False, extra=[])
+        return qdev_tb.add(vmid, conf, cfg, dev)
     taken = next((d["id"] for d in conf["devices"] if d["bus"] == bus), None)
     if taken and bus != "pcie.0":
         raise QdevError(f"bus {bus} already holds device {taken}: a PCIe root port has one slot "
@@ -770,6 +807,11 @@ def update_device(vmid: int, dev_id: str, args: str | None = None, kms: str | No
     if persistent is not None:
         new["persistent"] = bool(persistent)
     validate_device(dev_id, new["plugin"], new.get("args", ""), new["bus"], new.get("kms"))
+    if dev_kind(dev) == "tb":
+        import qdev_tb
+        if kms:
+            raise QdevError(f"{dev['plugin']} has no KMS output")
+        return qdev_tb.update(vmid, conf, dev, new["args"])
     replaced = lambda d: new if d["id"] == dev_id else d
     if dev_kind(dev) == "vhost-user-gpu":
         new.update(display=False, kms=None, persistent=False)
@@ -803,7 +845,10 @@ def remove_device(vmid: int, dev_id: str, keep_process: bool = False, purge_port
     if not dev:
         raise QdevError(f"no device {dev_id} on VM {vmid}")
     check_editable(vmid)
-    if dev_kind(dev) == "vhost-user-gpu":
+    if dev_kind(dev) == "tb":
+        import qdev_tb
+        msgs += qdev_tb.remove(vmid, conf, dev)
+    elif dev_kind(dev) == "vhost-user-gpu":
         running = vm_running(vmid)
         cfg = vm_config(vmid)
         for pat in vug_patterns(dev_id):
@@ -825,10 +870,14 @@ def remove_device(vmid: int, dev_id: str, keep_process: bool = False, purge_port
         cfg = vm_config(vmid)
         restore_hookscript(vmid, conf)
         if purge_port:
-            remove_port_from_args(vmid, cfg)
+            remove_port_from_args(vmid, vm_config(vmid))
+            if conf.get("tb"):
+                import qdev_tb
+                qdev_tb.purge(vmid, conf, vm_config(vmid))
         conf_path(vmid).unlink(missing_ok=True)
         msgs.append(f"VM {vmid}: no devices left, hookscript restored" +
-                    (", root port removed from args" if purge_port else " (root port kept in args; --purge-port removes it)"))
+                    (", root port and TB bus removed from args" if purge_port else
+                     " (root port and TB bus kept in args; --purge-port removes them)"))
     else:
         save_conf(conf)
     return msgs
@@ -851,8 +900,18 @@ def describe_vm(vmid: int) -> dict:
                 buses.add(d["qdev_id"])
     devices = []
     mismatch = shared_memory_mismatch(cfg)
+    import qdev_tb
+    tb_info, tb_where = qdev_tb.describe(vmid, conf, cfg, running)
     for d in conf["devices"]:
         kind = dev_kind(d)
+        if kind == "tb":
+            attached = d["id"] in tb_where
+            target = d["bus"] in present or d["bus"] in tb_where
+            devices.append({**{k: d.get(k) for k in ("id", "plugin", "args", "bus", "display", "kms", "persistent")},
+                            "kind": kind, "state": "attached" if attached else "stopped", "process_active": False,
+                            "pci": present.get(d["id"]), "needs_restart": bool(running and not attached and not target),
+                            "warning": None})
+            continue
         active = process_active(vmid, d["id"], kind)
         if d["id"] in present:
             state = "attached"
@@ -868,5 +927,5 @@ def describe_vm(vmid: int) -> dict:
     return {"vmid": vmid, "node": me, "local": True, "running": running, "q35": is_q35(cfg),
             "machine": cfg.get("machine", ""), "port_addr": conf.get("port_addr", "0x08"),
             "port_in_args": f"id={PORT_ID}" in cfg.get("args", ""), "port_in_vm": PORT_ID in buses,
-            "hookscript": cfg.get("hookscript"), "devices": devices,
+            "hookscript": cfg.get("hookscript"), "devices": devices, "tb": tb_info,
             "plugins": list_plugins(), "kms_outputs": list_kms_outputs(), "render_nodes": list_render_nodes()}

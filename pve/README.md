@@ -141,6 +141,81 @@ mouse, clipboard and audio to it automatically. A real monitor: `--kms
 Logs: `journalctl -u qdev-host-device@VMID-ID`. Requirements: q35 machine type,
 `pve-qemu-kvm` ≥ 10.1 (vfio-user-pci), a storage with `snippets` content.
 
+## TB bus (hot-plug ports with Thunderbolt properties)
+
+A VM can get a **TB bus**: hot-plug PCIe root ports `qdev-tb0..3` (`pcie.0` slot
+0x09, functions 0..3) whose ACPI nodes carry the Thunderbolt properties of the
+qemu-thunderbolt fork (`PCI-Thunderbolt`, `pci-supports-link-change`), as `_DSD`
+device properties and as the `_DSM` macOS reads device properties from. QEMU's
+own devices are put on it and can be added to and removed from the running VM:
+
+| Plugin | Device | Arguments (PVE's own syntax) | Added in the web UI |
+|---|---|---|---|
+| `tb-pci` | PCI pass-through (`vfio-pci`), all functions of a device when the function is left out | `host=0000:06:00.0` or `mapping=NAME`, `rombar`, `romfile`, `vendor-id`... | *Add > PCI Device*, Bus *TB bus* |
+| `tb-net` | network card on a tap of a node bridge | `virtio[=MAC],bridge=vmbr0[,tag=N][,rate=MB/s][,mtu=N][,queues=N]` | *Add > Network Device*, Bus *TB bus* |
+| `tb-xhci` | QEMU's USB 3 controller (`qemu-xhci`) | `ports=N` (USB 2 and USB 3 ports each, default 8) | *Add > qdev-host Device* |
+| `tb-usb` | USB device of the node on a `tb-xhci` controller (its bus) | `host=VENDOR:PRODUCT`, `host=BUS-PORT` or `mapping=NAME` | *Add > USB Device*, Bus *TB bus, USB controller ...* |
+
+```bash
+qdevctl add 990 tbnet0 --plugin tb-net --args 'virtio,bridge=vmbr0'          # MAC from the datacenter prefix
+qdevctl add 990 tbxhci0 --plugin tb-xhci
+qdevctl add 990 tbusb0 --plugin tb-usb --args host=1a86:7523 --bus tbxhci0    # hot-plugged when the VM runs
+qdevctl add 990 tbpci0 --plugin tb-pci --args host=0000:08:00.3               # bound to vfio-pci like a hostpciN
+qdevctl stop 990 tbusb0; qdevctl start 990 tbusb0                              # unplug / plug again
+qdevctl tb 990 --ports 6                                                       # more ports, from the next VM start
+qdevctl status 990
+```
+
+In the web UI the dialogs of PVE's own *PCI Device*, *Network Device* and *USB
+Device* get a **Bus** field: *Standard (PVE)* keeps PVE's behaviour, *TB bus*
+hands the device to qdev-host. The USB dialog lists the VM's TB USB
+controllers, or offers a new one (created with the device). TB devices are rows
+of the Hardware panel (`Network Device (tbnet0)`, value `TB port qdev-tb1, ...`);
+*Edit* opens the same PVE dialog filled with the device's settings, *Remove*
+unplugs it.
+
+How it works:
+
+- The VM's `args` get `-readconfig /var/lib/qdev-host/tb/VMID.cfg -acpitable
+  file=/var/lib/qdev-host/tb/VMID.aml` once (the first TB device; if the VM
+  runs, the bus exists from its next start). The hookscript writes both files
+  again at every VM start (pre-start): the root ports and the devices present at
+  the start go to `VMID.cfg`, the SSDT for the ports (and for `qdev-rp0` when it
+  is in the args) to `VMID.aml`, built by qdev-host's own small AML encoder.
+  So adding or removing a device never changes `args` again.
+- While the VM runs, devices are added with QMP `device_add`/`netdev_add` through
+  the node's `mon_cmd`, removed with `device_del` (the guest releases a PCIe
+  device in about five seconds) and `netdev_del`.
+- PCI devices are resolved, bound to `vfio-pci` and reserved for the VM with
+  qemu-server's own functions (`parse_hostpci`, `prepare_pci_device`,
+  `reserve_pci_usage`), so a device another running VM uses is refused, and a
+  mapping works as for `hostpciN`. Mediated devices, *Primary GPU* (`x-vga`)
+  and `legacy-igd` need the standard bus.
+- A network device's tap is `tapVMIDi32` and up (PVE's own NICs are 0..31), so
+  the VM's traffic counters include it. QEMU's `script` is
+  `/usr/lib/qdev-host/qdev-tb-ifup`, which plugs the tap into the bridge with
+  qemu-server's `tap_plug` (VLAN tag, rate) from the settings in
+  `/run/qdev-host/tb-net/IFACE.json`. The PVE firewall does not filter these
+  devices (its rules come from the VM's `netN` entries; the dialog's Firewall
+  box is off on the TB bus). Models: `virtio`, `e1000e`, `vmxnet3`: the ports
+  have no I/O window (`io-reserve=0`), the q35 I/O space is too small for more
+  bridges with one, and `e1000`/`rtl8139` need port I/O.
+- Ports reserve 32 MiB of 32-bit and 1 GiB of 64-bit prefetchable memory each
+  (`mem-reserve=32M,pref64-reserve=1G`), enough for a NIC, a USB controller or a
+  GPU with a 256 MiB BAR.
+- `qdevctl remove ... --purge-port` of the VM's last qdev-host device also
+  removes the TB bus from `args` and deletes its two files.
+
+Checked on PVE 9.2.21 (pve-qemu-kvm 11.0.3) with a Debian 13 guest: the ports
+at `00:09.0-3` with ACPI paths `\_SB.PCI0.S48..S4B`, the SSDT loaded without
+ACPI errors; at VM start and hot-plugged into the running VM: virtio and
+e1000e NICs on a bridge, the xHCI controller with a USB serial adapter of the
+node (the node gets it back on unplug), unplug and replug of the controller
+with its device; on a second node an AMD USB 3 controller passed through
+(cold, hot-unplug, hot-plug, PVE's reservation following). The web UI flow
+(Add, Edit, Remove in the PCI, Network and USB dialogs) passes the headless
+test `tools/pve-tb-ui-test.mjs`. Not yet checked: a macOS guest.
+
 ## Web UI (Hardware panel)
 
 Installing `qdev-host-pve` adds qdev-host devices to the VM *Hardware* panel of
@@ -193,7 +268,8 @@ Device* and *Remove*. Two parts, modelled on QSM Direct's PVE integration:
    | Method | Path | Action |
    |---|---|---|
    | GET | `/api/v1/vms/VMID` | devices with state, plugins (+ argument schema), KMS outputs |
-   | POST | `/api/v1/vms/VMID/devices` | `{id, plugin, args, kms, display, persistent}` = `qdevctl add` |
+   | POST | `/api/v1/vms/VMID/devices` | `{id, plugin, args, bus, kms, display, persistent}` = `qdevctl add` |
+   | PUT | `/api/v1/vms/VMID/devices/ID` | `{args, kms, display, persistent}` = `qdevctl set` |
    | DELETE | `/api/v1/vms/VMID/devices/ID[?purge_port=1]` | = `qdevctl remove` |
    | POST | `/api/v1/vms/VMID/devices/ID/attach` / `detach` | = `qdevctl start` / `stop` |
 

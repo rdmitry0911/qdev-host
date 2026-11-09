@@ -1,3 +1,27 @@
+qdev-host (0.6.0) unstable; urgency=medium
+
+  * TB bus: hot-plug PCIe root ports qdev-tb0..3 (pcie.0 slot 0x09) whose
+    ACPI nodes carry the Thunderbolt properties of the qemu-thunderbolt fork
+    (PCI-Thunderbolt, pci-supports-link-change) as _DSD and as the _DSM macOS
+    reads. The SSDT is built per VM by qdev-host's own AML encoder; ports and
+    the devices present at VM start come from a -readconfig file that the
+    hookscript writes at every start, so args change only once.
+  * QEMU's own devices on the TB bus, added to and removed from the running
+    VM over QMP: tb-pci (PCI pass-through, bound and reserved with
+    qemu-server's own functions, mappings included), tb-net (virtio, e1000e
+    or vmxnet3 on a tap of a node bridge, VLAN tag and rate through
+    qemu-server's tap_plug), tb-xhci (qemu-xhci) and tb-usb (a USB device of
+    the node on a tb-xhci controller, also for guests such as macOS that do
+    not take PVE's own USB hot-plug).
+  * Web UI: PVE's own PCI Device, Network Device and USB Device dialogs get a
+    Bus field (Standard or TB bus); TB devices are rows of the Hardware panel
+    whose Edit opens the same dialog with their settings. The USB controller
+    is a qdev-host Device. qdevctl tb VMID --ports N sets the number of ports.
+  * tools/test-tb-bus.py checks the AML encoder and the generated files
+    offline; tools/pve-tb-ui-test.mjs drives the dialogs on a node.
+
+ -- Dmitry R <rdmitry0911@gmail.com>  Mon, 09 Nov 2026 16:30:00 +0100
+
 qdev-host (0.5.5) unstable; urgency=medium
 
   * virgl-gpu: new setting display=primary|vga|secondary, replacing vga=1|0.

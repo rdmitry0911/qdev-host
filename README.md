@@ -424,6 +424,13 @@ preloaded library works around two faults of `vhost-user-gpu`: a crash when a vi
 fence comes during an EDID reply, and a GPU socket refused after a VM pause or a
 reboot inside the guest.
 
+**TB bus** (0.6.0): hot-plug PCIe root ports with the Thunderbolt ACPI
+properties of the fork, generated per VM, for QEMU's own devices: PCI
+pass-through, network cards, a USB controller and USB devices of the node on it,
+added to and removed from the running VM. PVE's own *PCI Device*, *Network
+Device* and *USB Device* dialogs get a *Bus* field (*Standard* or *TB bus*)
+([details](pve/README.md#tb-bus-hot-plug-ports-with-thunderbolt-properties)).
+
 Not yet: VMs on another
 cluster node than the one serving the browser, several devices per process, a
 hookscript-free path for VMs whose firmware already reserves enough window space.
@@ -619,7 +626,10 @@ Bridges cannot leave the QEMU process (`vfio-user-pci` presents endpoints only),
 but everything Thunderbolt-specific in them is ACPI data and a presence toggle.
 QEMU names PCI devices in ACPI `S<devfn hex>` (`addr=0x05` → `\_SB.PCI0.S28`);
 check `/sys/bus/pci/devices/<bdf>/firmware_node/path` and adjust the SSDT scopes.
-On macOS the SSDT can also be injected through OpenCore (`ACPI/Add`).
+On macOS the SSDT can also be injected through OpenCore (`ACPI/Add`). On Proxmox VE
+the TB bus of `qdev-host-pve` generates this SSDT per VM, with the properties as
+`_DSD` and as the `_DSM` macOS reads, for its own ports
+([TB bus](pve/README.md#tb-bus-hot-plug-ports-with-thunderbolt-properties)).
 
 ## Performance
 

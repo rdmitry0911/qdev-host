@@ -1,0 +1,33 @@
+#!/usr/bin/perl
+# SPDX-License-Identifier: GPL-2.0-or-later
+# QEMU's netdev script for a network device on qdev-host's TB bus: plugs the
+# tap into its bridge like PVE's own pve-bridge, with the settings qdev-host
+# wrote to /run/qdev-host/tb-net/IFACE.json (the VM config has no netN for it).
+use strict;
+use warnings;
+use JSON::PP;
+use PVE::Network::SDN::Zones;
+use PVE::QemuServer::Network;
+
+my $iface = shift;
+die "no interface specified\n" if !$iface;
+die "got strange interface name '$iface'\n" if $iface !~ m/^tap(\d+)i(\d+)$/;
+
+my $file = "/run/qdev-host/tb-net/$iface.json";
+open(my $fh, '<', $file) or die "no qdev-host settings for $iface ($file): $!\n";
+my $net = decode_json(do { local $/; <$fh> });
+close($fh);
+die "no bridge for $iface\n" if !$net->{bridge};
+
+eval {
+    PVE::Network::SDN::Zones::tap_create($iface, $net->{bridge});
+    # no firewall bridge: PVE's firewall rules are generated from the VM's netN entries
+    PVE::QemuServer::Network::tap_plug($iface, $net->{bridge}, $net->{tag}, 0, undef, $net->{rate});
+};
+if (my $err = $@) {
+    # QEMU reports only the exit status: leave the reason for qdevctl
+    if (open(my $out, '>', "/run/qdev-host/tb-net/$iface.err")) { print $out $err; close($out); }
+    die $err;
+}
+
+exit 0;

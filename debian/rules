@@ -27,6 +27,9 @@ override_dh_auto_install:
 	install -D -m 644 pve/libqdev-vugpu-guard.so debian/qdev-host/usr/lib/qdev-host/libqdev-vugpu-guard.so
 	install -D -m 755 pve/qdevctl debian/qdev-host-pve/usr/sbin/qdevctl
 	install -D -m 644 pve/qdev_pve.py debian/qdev-host-pve/usr/lib/qdev-host/pve/qdev_pve.py
+	install -D -m 644 pve/qdev_tb.py debian/qdev-host-pve/usr/lib/qdev-host/pve/qdev_tb.py
+	install -D -m 755 pve/qdev-tb-ifup debian/qdev-host-pve/usr/lib/qdev-host/qdev-tb-ifup
+	install -D -m 755 pve/qdev-tb-ifdown debian/qdev-host-pve/usr/lib/qdev-host/qdev-tb-ifdown
 	install -D -m 755 pve/qdev-host-hook.pl debian/qdev-host-pve/usr/share/qdev-host/pve/qdev-host-hook.pl
 	install -D -m 644 pve/qdev-host-device@.service debian/qdev-host-pve/usr/lib/systemd/system/qdev-host-device@.service
 	install -D -m 644 pve/qdev-host-vugpu@.service debian/qdev-host-pve/usr/lib/systemd/system/qdev-host-vugpu@.service

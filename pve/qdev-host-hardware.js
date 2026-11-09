@@ -115,8 +115,22 @@
     const showError = (error) => Ext.Msg.alert(gettext('Error'), errorText(error));
     // The latest node service answer per VM, for the Edit dialog that PVE opens itself.
     const latestInfo = {};
-    const stateText = (dev) => {
+    // QEMU's own devices on the VM's TB bus (hot-plug PCIe root ports with Thunderbolt
+    // ACPI properties): added in PVE's own PCI, Network and USB dialogs (Bus), the USB
+    // controller as a qdev-host Device
+    const TB_KINDS = {
+        'tb-pci': { label: 'PCI Device', editor: 'PVE.qemu.PCIEdit', icon: 'cube', prefix: 'tbpci' },
+        'tb-net': { label: 'Network Device', editor: 'PVE.qemu.NetworkEdit', icon: 'exchange', prefix: 'tbnet' },
+        'tb-xhci': { label: 'USB Controller', editor: 'PVE.qdevHost.DeviceEdit', icon: 'usb', prefix: 'tbxhci' },
+        'tb-usb': { label: 'USB Device', editor: 'PVE.qemu.USBEdit', icon: 'usb', prefix: 'tbusb' },
+    };
+    const TB_ORDER = ['tb-xhci', 'tb-usb', 'tb-pci', 'tb-net'];
+    const stateText = (dev, info) => {
         if (dev.state === 'attached') { return gettext('attached') + (dev.pci ? ` (${dev.pci})` : ''); }
+        if (dev.kind === 'tb') {
+            if (info && !info.running) { return 'present from the VM start'; }
+            return dev.needs_restart ? 'defined, the TB bus appears after the next VM start' : 'not attached';
+        }
         if (dev.kind === 'vhost-user-gpu') {
             if (dev.needs_restart) { return 'defined, present from the next VM start'; }
             return dev.state === 'process' ? 'GPU process running' : 'starts with the VM';
@@ -127,14 +141,29 @@
         }
         return dev.needs_restart ? 'defined, attaches after the next VM start' : gettext('stopped');
     };
-    const describe = (dev) => {
+    const describe = (dev, info) => {
+        if (dev.kind === 'tb') {
+            const where = dev.plugin === 'tb-usb' ? `on ${dev.bus}` : `TB port ${dev.bus}`;
+            return `${where}${dev.args ? `, ${dev.args}` : ''} — ${stateText(dev, info)}`;
+        }
         let text = dev.plugin;
         if (dev.args) { text += `, ${dev.args}`; }
         if (dev.kms) { text += `, kms=${dev.kms}`; }
         if (dev.display === false && dev.kind !== 'vhost-user-gpu') { text += ', no Display1'; }
         if (dev.persistent) { text += ', persistent'; }
-        text = `${text} — ${stateText(dev)}`;
+        text = `${text} — ${stateText(dev, info)}`;
         return dev.warning ? `${text} — ${dev.warning}: open and save it before the next start` : text;
+    };
+
+    const PORT_HINT = 'A PCIe root port (qdev-rp0) is added to the VM\'s <i>args</i> for hot-plug; '
+        + 'it exists after the next VM start, until then the device stays defined but not attached.';
+    const TB_HINT = 'The VM\'s TB bus (4 hot-plug PCIe ports with Thunderbolt ACPI properties) is added to its '
+        + '<i>args</i>; it exists after the next VM start, until then the device is present from the next start.';
+    const showMessages = (result) => {
+        const messages = (result && result.messages) || [];
+        if (messages.some((m) => /next VM start|VM is stopped|not attached|^note:|plugged again|failed|not released/.test(m))) {
+            Ext.Msg.alert('qdev-host', messages.map(Ext.htmlEncode).join('<br>'));
+        }
     };
 
     // ---- Add dialog ------------------------------------------------------
@@ -174,7 +203,7 @@
             if (editDev && editDev.args) {
                 editDev.args.split(',').forEach((kv) => { const i = kv.indexOf('='); if (i > 0) { editArgs[kv.slice(0, i)] = kv.slice(i + 1); } });
             }
-            const plugins = info.plugins || [];
+            const plugins = (info.plugins || []).filter((p) => !p.dialog);
             const used = new Set((info.devices || []).map((d) => d.id));
             const freeId = (plugin) => {
                 const base = String(plugin || 'qdev').replace(/[^A-Za-z0-9]/g, '').toLowerCase() || 'qdev';
@@ -230,7 +259,11 @@
                     if (field) { field.setHidden(!fields[name]); field.setDisabled(!fields[name]); }
                 });
                 const portHint = me.down('#qdevPortHint');
-                if (portHint) { portHint.setHidden(!!info.port_in_args || !!editDev); }
+                const tb = def && def.kind === 'tb';
+                if (portHint) {
+                    portHint.setHidden(!!editDev || (tb ? !!(info.tb && info.tb.in_args) : !!info.port_in_args));
+                    portHint.setValue(tb ? TB_HINT : PORT_HINT);
+                }
             };
             const first = editDev ? editDev.plugin : (plugins.length ? plugins[0].name : '');
             me.items = [
@@ -272,9 +305,7 @@
                 },
                 {
                     xtype: 'displayfield', fieldLabel: ' ', labelSeparator: '', userCls: 'pmx-hint', itemId: 'qdevPortHint',
-                    hidden: !!info.port_in_args || !!editDev,
-                    value: 'A PCIe root port (qdev-rp0) is added to the VM\'s <i>args</i> for hot-plug; '
-                        + 'it exists after the next VM start, until then the device stays defined but not attached.',
+                    hidden: !!info.port_in_args || !!editDev, value: PORT_HINT,
                 },
             ];
             me.callParent();
@@ -314,10 +345,7 @@
                 me.setLoading(false);
                 me.qdevResult = result;
                 me.close();
-                const messages = (result && result.messages) || [];
-                if (messages.some((m) => /next VM start|VM is stopped|not attached|^note:|plugged again/.test(m))) {
-                    Ext.Msg.alert('qdev-host', messages.map(Ext.htmlEncode).join('<br>'));
-                }
+                showMessages(result);
             }).catch((error) => {
                 me.setLoading(false);
                 showError(error);
@@ -351,13 +379,16 @@
                 if (me.qdevInfo && Array.isArray(me.qdevInfo.devices)) {
                     me.qdevInfo.devices.forEach((dev, index) => {
                         const key = ROW_PREFIX + dev.id;
+                        const tb = TB_KINDS[dev.plugin];
                         me.rows[key] = {
-                            group: GROUP, order: index, header: `qdev-host (${dev.id})`,
-                            iconCls: dev.kms ? 'television' : 'microchip',
-                            never_delete: !mayEdit, editor: mayEdit ? 'PVE.qdevHost.DeviceEdit' : undefined,
+                            group: GROUP, order: tb ? 100 + TB_ORDER.indexOf(dev.plugin) * 50 + index : index,
+                            header: tb ? `${tb.label} (${dev.id})` : `qdev-host (${dev.id})`,
+                            iconCls: tb ? tb.icon : (dev.kms ? 'television' : 'microchip'),
+                            never_delete: !mayEdit,
+                            editor: mayEdit ? (tb ? tb.editor : 'PVE.qdevHost.DeviceEdit') : undefined,
                             renderer: (value) => Ext.htmlEncode(value),
                         };
-                        store.add({ key, value: describe(dev) });
+                        store.add({ key, value: describe(dev, me.qdevInfo) });
                     });
                 } else if (me.qdevError) {
                     me.rows[ERROR_KEY] = {
@@ -421,12 +452,16 @@
                     Ext.MessageBox.defaultButton = 2;
                     Ext.Msg.show({
                         title: gettext('Confirm'), icon: Ext.Msg.WARNING, buttons: Ext.Msg.YESNO, defaultFocus: 'no',
-                        message: Ext.String.format(gettext('Are you sure you want to remove entry {0}'), `'qdev-host (${Ext.htmlEncode(id)})'`)
-                            + '<br>The device is hot-unplugged and its process stopped.',
+                        message: Ext.String.format(gettext('Are you sure you want to remove entry {0}'),
+                            `'${Ext.htmlEncode(record.get('key') && me.rows[key] ? me.rows[key].header : `qdev-host (${id})`)}'`)
+                            + (/^tb-/.test(((me.qdevInfo && me.qdevInfo.devices) || []).filter((d) => d.id === id).map((d) => d.plugin)[0] || '')
+                                ? '<br>The device is hot-unplugged from the running VM.'
+                                : '<br>The device is hot-unplugged and its process stopped.'),
                         callback: (answer) => {
                             if (answer !== 'yes') { return; }
                             me.setLoading(gettext('Please wait...'));
                             request('DELETE', `/api/v1/vms/${vmid}/devices/${encodeURIComponent(id)}`)
+                                .then(showMessages)
                                 .catch(showError)
                                 .finally(() => { me.setLoading(false); shown = ''; refresh(); });
                         },
@@ -454,4 +489,169 @@
             }
         },
     });
+    // ---- Bus selector in PVE's own PCI, Network and USB dialogs ---------------
+    // "Standard" keeps PVE's behaviour.  "TB bus" sends the device to qdev-host, which puts
+    // it on a hot-plug port of the VM's TB bus.  The TB rows of the panel open the same
+    // dialogs: their settings are handed to the dialog as if they were in the VM config.
+    const tbVmid = (win) => Number(win.pveSelNode && win.pveSelNode.data && win.pveSelNode.data.vmid);
+    const tbFreeId = (info, prefix, taken) => {
+        const used = new Set((info.devices || []).map((d) => d.id).concat(taken || []));
+        let n = 0;
+        while (used.has(`${prefix}${n}`)) { n++; }
+        return `${prefix}${n}`;
+    };
+    const TB_TEXT = {
+        pci: 'Passed through on a hot-plug port of the VM\'s TB bus (qdev-host): added to and removed from the '
+            + 'running VM, Thunderbolt ACPI properties for macOS. Primary GPU and the PCI-Express flag do not apply.',
+        net: 'On a hot-plug port of the VM\'s TB bus (qdev-host): added to and removed from the running VM, '
+            + 'Thunderbolt ACPI properties for macOS. Models: VirtIO, Intel E1000E, VMware vmxnet3. The PVE '
+            + 'firewall does not filter it.',
+        usb: 'On a USB controller of the VM\'s TB bus (qdev-host): added to and removed from the running VM, '
+            + 'also for guests such as macOS that do not take PVE\'s own USB hot-plug.',
+    };
+    const tbBusChoices = (kind, info) => {
+        if (kind !== 'usb') { return [['tb', 'TB bus (qdev-host, hot-plug)']]; }
+        const ctrls = (info.devices || []).filter((d) => d.plugin === 'tb-xhci');
+        if (!ctrls.length) { return [['tb:', 'TB bus, new USB controller (qdev-host, hot-plug)']]; }
+        return ctrls.map((c) => [`tb:${c.id}`, `TB bus, USB controller ${c.id} (qdev-host, hot-plug)`]);
+    };
+    const tbEditDev = (win) => {
+        const key = String(win.confid || '');
+        if (!key.startsWith(ROW_PREFIX)) { return null; }
+        const info = latestInfo[tbVmid(win)] || {};
+        return (info.devices || []).find((d) => d.id === key.slice(ROW_PREFIX.length)) || { id: key.slice(ROW_PREFIX.length), missing: true };
+    };
+    // a TB device's args in the syntax of the dialog's VM config key
+    const tbConfigValue = (kind, dev) => (kind === 'pci' ? `${dev.args},pcie=1` : dev.args);
+    const tbFieldsFor = (win, kind, on) => {
+        const names = { pci: ['x-vga', 'pcie'], net: ['firewall', 'disconnect'], usb: [] }[kind];
+        names.forEach((name) => {
+            const field = win.down(`[name=${name}]`);
+            if (field) { field.setDisabled(on); }
+        });
+    };
+    const tbAddSelector = (win, kind) => {
+        const vmid = tbVmid(win);
+        const info = latestInfo[vmid];
+        const edit = win.qdevTbDev;
+        if (!edit && !(info && info.local && info.q35)) { return; }
+        const choices = edit
+            ? [['tb', edit.plugin === 'tb-usb' ? `TB bus, USB controller ${edit.bus}` : `TB bus, port ${edit.bus}`]]
+            : [['pve', gettext('Standard') + ' (PVE)']].concat(tbBusChoices(kind, info));
+        const hint = Ext.create('Ext.form.field.Display', {
+            itemId: 'qdevBusHint', userCls: 'pmx-hint', hidden: !edit, value: TB_TEXT[kind], padding: '0 0 6 0',
+        });
+        const combo = Ext.create('Ext.form.field.ComboBox', {
+            itemId: 'qdevBus', fieldLabel: 'Bus', labelWidth: 100, submitValue: false, editable: false,
+            queryMode: 'local', displayField: 'label', valueField: 'value', disabled: !!edit,
+            value: choices[0][0], padding: '0 0 6 0',
+            store: { fields: ['value', 'label'], data: choices.map((c) => ({ value: c[0], label: c[1] })) },
+            listeners: {
+                change: (field, value) => {
+                    const on = value !== 'pve';
+                    hint.setHidden(!on);
+                    tbFieldsFor(win, kind, on);
+                    if (on && info && info.tb && !info.tb.in_args) {
+                        hint.setValue(`${TB_TEXT[kind]}<br>${TB_HINT}`);
+                    }
+                },
+            },
+        });
+        win.formPanel.insert(0, [combo, hint]);
+        if (edit) { tbFieldsFor(win, kind, true); }
+    };
+    const tbSubmit = (win, kind) => {
+        const form = win.formPanel.getForm();
+        if (!form.isValid()) { return; }
+        const vmid = tbVmid(win);
+        const info = latestInfo[vmid] || {};
+        const values = win.getValues();
+        const key = Object.keys(values).find((k) => k.startsWith(ROW_PREFIX) || /^(hostpci|net|usb)\d+$/.test(k));
+        if (!key || !values[key]) { showError(new Error('the dialog gave no device settings')); return; }
+        let args = values[key];
+        if (kind === 'pci') {
+            const p = PVE.Parser.parsePropertyString(args, 'host');
+            if (p['x-vga'] && String(p['x-vga']) !== '0') { showError(new Error('Primary GPU needs the standard bus')); return; }
+            delete p.pcie; delete p['x-vga'];
+            const first = p.host !== undefined ? 'host' : 'mapping';
+            args = [`${first}=${p[first]}`].concat(Object.keys(p).filter((k) => k !== first).map((k) => `${k}=${p[k]}`)).join(',');
+        } else if (kind === 'net') {
+            // the PVE firewall does not apply to TB bus devices
+            args = args.split(',').filter((kv) => !/^firewall=/.test(kv)).join(',');
+        }
+        const edit = win.qdevTbDev;
+        win.setLoading(gettext('Please wait...'));
+        let call;
+        if (edit) {
+            call = request('PUT', `/api/v1/vms/${vmid}/devices/${encodeURIComponent(edit.id)}`, { args });
+        } else {
+            const bus = win.down('#qdevBus').getValue();
+            const plugin = `tb-${kind}`;
+            if (kind === 'usb') {
+                const ctrl = bus.slice(3);
+                const add = (ctrlId) => request('POST', `/api/v1/vms/${vmid}/devices`,
+                    { id: tbFreeId(info, TB_KINDS[plugin].prefix), plugin, args, bus: ctrlId });
+                if (ctrl) {
+                    call = add(ctrl);
+                } else {
+                    const ctrlId = tbFreeId(info, TB_KINDS['tb-xhci'].prefix);
+                    call = request('POST', `/api/v1/vms/${vmid}/devices`, { id: ctrlId, plugin: 'tb-xhci', args: '' })
+                        .then((first) => add(ctrlId).then((second) => ({
+                            messages: [].concat(first.messages || [], second.messages || []),
+                        })));
+                }
+            } else {
+                call = request('POST', `/api/v1/vms/${vmid}/devices`, { id: tbFreeId(info, TB_KINDS[plugin].prefix), plugin, args });
+            }
+        }
+        call.then((result) => {
+            win.setLoading(false);
+            win.close();
+            showMessages(result);
+        }).catch((error) => {
+            win.setLoading(false);
+            showError(error);
+        });
+    };
+    const tbOverride = (cls, kind) => {
+        Ext.define(`PVE.qdevHost.${kind}EditOverlay`, {
+            override: cls,
+            initComponent: function () {
+                const me = this;
+                me.qdevTbDev = tbEditDev(me);
+                me.callParent(arguments);
+                if (me.qdevTbDev && me.qdevTbDev.missing) {
+                    Ext.defer(() => { showError(new Error('The device list is not loaded yet; close this window and try again.')); me.close(); }, 1);
+                    return;
+                }
+                tbAddSelector(me, kind);
+            },
+            load: function (options) {
+                const me = this;
+                const dev = me.qdevTbDev;
+                if (dev && !dev.missing && options && options.success) {
+                    const success = options.success;
+                    options = Ext.apply({}, {
+                        success: function (response, opts) {
+                            response.result.data = Ext.apply({}, response.result.data, { [me.confid]: tbConfigValue(kind, dev) });
+                            return success.call(this, response, opts);
+                        },
+                    }, options);
+                }
+                return me.callParent([options]);
+            },
+            submit: function () {
+                const me = this;
+                const bus = me.down('#qdevBus');
+                if (me.qdevTbDev || (bus && bus.getValue() !== 'pve')) {
+                    tbSubmit(me, kind);
+                    return undefined;
+                }
+                return me.callParent(arguments);
+            },
+        });
+    };
+    tbOverride('PVE.qemu.PCIEdit', 'pci');
+    tbOverride('PVE.qemu.NetworkEdit', 'net');
+    tbOverride('PVE.qemu.USBEdit', 'usb');
 })();

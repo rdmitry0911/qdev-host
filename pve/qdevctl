@@ -10,6 +10,11 @@
   qdevctl start VMID [ID]      start device process(es) and hot-plug into the running VM
   qdevctl stop VMID [ID]       hot-unplug and stop device process(es)
   qdevctl hook VMID PHASE      called by the guest hookscript (post-start, post-stop, ...)
+  qdevctl tb VMID [--ports N]  the VM's TB bus: hot-plug PCIe root ports with Thunderbolt ACPI properties
+
+TB bus devices are QEMU's own: --plugin tb-pci (--args 'host=0000:06:00.0', PVE's hostpciN
+syntax), tb-net (--args 'virtio,bridge=vmbr0[,tag=N]', PVE's netN syntax), tb-xhci (a USB
+controller) and tb-usb (--args 'host=VENDOR:PRODUCT|BUS-PORT' --bus ID-of-a-tb-xhci).
 
 Device definitions live in /etc/qdev-host/vms/VMID.json. `add` also sets the VM's
 hookscript (chaining an existing one) and, for --bus qdev-rp0 (default), adds a
@@ -18,6 +23,7 @@ PCIe root port with reserved windows to the VM's `args` (needs a VM restart once
 import argparse, json, sys
 sys.path.insert(0, "/usr/lib/qdev-host/pve")
 import qdev_pve as Q
+import qdev_tb as TB
 
 def cmd_add(a):
     for m in Q.add_device(a.vmid, a.id, a.plugin, a.args or "", a.bus, not a.no_display, a.kms, a.persistent,
@@ -30,7 +36,9 @@ def cmd_remove(a):
 
 def _state_text(d):
     if d["state"] == "attached":
-        return f"attached ({d['pci']})"
+        return f"attached ({d['pci']})" if d.get("pci") else "attached"
+    if d["kind"] == "tb":
+        return "not attached" + (" (TB bus appears at next VM start)" if d["needs_restart"] else "")
     if d["state"] == "process":
         return "process running, not attached" + (" (root port appears at next VM start)" if d["needs_restart"] else "")
     return "stopped"
@@ -51,7 +59,14 @@ def cmd_status(a):
         print(f"VM {a.vmid} is on node {info['node']}"); return 1
     print(f"VM {a.vmid}: {'running' if info['running'] else 'stopped'}, {len(info['devices'])} device(s), "
           f"port addr {info['port_addr']} (in args: {info['port_in_args']}, in running VM: {info['port_in_vm']})")
+    tb = info["tb"]
+    if tb["enabled"]:
+        print(f"  TB bus: {tb['ports']} port(s) qdev-tb0..{tb['ports'] - 1} (in args: {tb['in_args']}, "
+              f"in running VM: {tb['in_vm']}), {TB.cfg_path(a.vmid)}, {TB.aml_path(a.vmid)}")
     for d in info["devices"]:
+        if d["kind"] == "tb":
+            print(f"  {d['id']}: plugin={d['plugin']} args='{d['args']}' bus={d['bus']} {_state_text(d)}")
+            continue
         u = Q.unit_name(a.vmid, d["id"])
         print(f"  {d['id']}: plugin={d['plugin']} args='{d['args']}' bus={d['bus']} unit={u} "
               f"({'active' if d['process_active'] else 'inactive'}) {_state_text(d)}")
@@ -66,6 +81,8 @@ def cmd_start(a):
             continue
         if Q.vm_running(a.vmid):
             print(Q.attach(a.vmid, d))
+        elif Q.dev_kind(d) == "tb":
+            print(f"{d['id']}: present from the next VM start")
         else:
             Q.start_process(a.vmid, d); print(f"{d['id']}: process started (VM not running)")
 
@@ -83,10 +100,23 @@ def cmd_set(a):
     for m in Q.update_device(a.vmid, a.id, a.args, kms, display, persistent):
         print(m)
 
+def cmd_tb(a):
+    conf = Q.load_conf(a.vmid)
+    if not Q.is_q35(Q.vm_config(a.vmid)):
+        raise Q.QdevError(f"VM {a.vmid} is not a q35 machine")
+    for m in TB.set_ports(a.vmid, conf, a.ports or TB.port_count(conf)):
+        print(m)
+
 def cmd_hook(a):
     conf = Q.load_conf(a.vmid)
     rc = 0
     if a.phase == "pre-start":
+        try:
+            for note in TB.pre_start(a.vmid, conf):
+                print(f"qdev-host: {note}", file=sys.stderr)
+        except Q.QdevError as e:
+            print(f"qdev-host: TB bus: {e}", file=sys.stderr)
+            return 2
         # a vhost-user GPU is on QEMU's command line: its process must listen before QEMU starts
         gpus = [d for d in conf["devices"] if Q.dev_kind(d) == "vhost-user-gpu"]
         if gpus:
@@ -108,15 +138,25 @@ def cmd_hook(a):
                     print(f"qdev-host: {d['id']}: {e}", file=sys.stderr)
                     return 2
     elif a.phase == "post-start":
+        try:
+            TB.post_start(a.vmid, conf)
+        except Q.QdevError as e:
+            print(f"qdev-host: TB bus: {e}", file=sys.stderr); rc = 1
         for d in conf["devices"]:
-            if Q.dev_kind(d) == "vhost-user-gpu":
+            if Q.dev_kind(d) in ("vhost-user-gpu", "tb"):
                 continue
             try:
                 print(Q.attach(a.vmid, d))
             except Q.QdevError as e:
                 print(f"qdev-host: {d['id']}: {e}", file=sys.stderr); rc = 1
     elif a.phase == "post-stop":
+        try:
+            TB.post_stop(a.vmid, conf)
+        except Q.QdevError as e:
+            print(f"qdev-host: TB bus: {e}", file=sys.stderr)
         for d in conf["devices"]:
+            if Q.dev_kind(d) == "tb":
+                continue
             if Q.dev_kind(d) == "vhost-user-gpu":
                 Q.stop_process(a.vmid, d["id"], "vhost-user-gpu")
             elif not d.get("persistent"):
@@ -144,6 +184,8 @@ def main():
     s = sub.add_parser("start"); s.add_argument("vmid", type=int); s.add_argument("id", nargs="?"); s.set_defaults(fn=cmd_start)
     s = sub.add_parser("stop"); s.add_argument("vmid", type=int); s.add_argument("id", nargs="?"); s.set_defaults(fn=cmd_stop)
     s = sub.add_parser("hook"); s.add_argument("vmid", type=int); s.add_argument("phase"); s.set_defaults(fn=cmd_hook)
+    s = sub.add_parser("tb", help="add the TB bus to the VM, or change its number of ports")
+    s.add_argument("vmid", type=int); s.add_argument("--ports", type=int); s.set_defaults(fn=cmd_tb)
     a = p.parse_args()
     try:
         rc = a.fn(a)
