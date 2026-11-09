@@ -1,5 +1,12 @@
 qdev-host (0.5.5) unstable; urgency=medium
 
+  * virgl-gpu: new setting display=primary|vga|secondary, replacing vga=1|0.
+    primary (the default) makes a vhost-user-gpu-pci the VM's only display:
+    it has no VGA part, so QEMU 11's crash in vga_update_display() when a
+    guest reboots with a console open cannot happen; OVMF's virtio-gpu driver
+    draws the firmware screen. vga is the former vhost-user-vga, secondary
+    the former vga=0. Devices saved with vga=1|0 keep their mode; the
+    Hardware panel offers the three as a list.
   * virgl-gpu: the vhost-user-gpu guard publishes the GPU's state in
     gpu-state next to its socket (running, stopping, stopped) and, when QEMU
     stops the device, waits up to 1.5 s for the display client named in

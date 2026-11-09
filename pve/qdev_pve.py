@@ -37,9 +37,18 @@ BUILTIN_PLUGINS: dict[str, dict] = {
         "args": [
             {"name": "render", "label": "Render node", "type": "render", "default": "",
              "hint": "empty: the first render node of this node"},
-            {"name": "vga", "label": "Primary display", "type": "bool", "default": True,
-             "hint": "VGA-compatible (vhost-user-vga), the VM's first display; it replaces the VM's own "
-                     "display device and QSM's in-process VirGL GPU until it is removed"},
+            {"name": "display", "label": "Display", "type": "choice", "default": "primary",
+             "choices": [["primary", "Primary display (virtio-gpu, no VGA)"],
+                         ["vga", "Primary display, VGA-compatible (vhost-user-vga)"],
+                         ["secondary", "Additional GPU next to the VM's display"]],
+             # devices saved before 0.5.5 carry vga=1|0
+             "legacy": {"name": "vga", "map": {"1": "vga", "0": "secondary"}},
+             "hint": "primary: the VM's only display (vhost-user-gpu-pci); it replaces the VM's own display "
+                     "device and QSM's in-process VirGL GPU until it is removed. The firmware screen needs "
+                     "OVMF (SeaBIOS shows nothing until the guest's driver). vga: the same with a VGA part "
+                     "(vhost-user-vga), for guests or firmware that need one; QEMU 11 crashes when such a "
+                     "guest reboots while a console is open. secondary: next to the VM's own display, "
+                     "which stays the one the console shows"},
             {"name": "outputs", "label": "Outputs", "type": "int", "default": 1, "min": 1, "max": 4},
             {"name": "xres", "label": "Width", "type": "int", "default": 1280, "min": 640, "max": 7680},
             {"name": "yres", "label": "Height", "type": "int", "default": 800, "min": 480, "max": 4320},
@@ -471,7 +480,7 @@ def list_render_nodes() -> list[dict]:
 def vug_options(dev: dict) -> dict:
     """Validated settings of a vhost-user-gpu device from its plugin args."""
     a = parse_args(dev.get("args", ""))
-    unknown = set(a) - {"render", "vga", "outputs", "xres", "yres", "virgl"}
+    unknown = set(a) - {"render", "display", "vga", "outputs", "xres", "yres", "virgl"}
     if unknown:
         raise QdevError(f"{dev['plugin']}: unknown setting(s) {', '.join(sorted(unknown))}")
     def number(key: str, default: int, low: int, high: int) -> int:
@@ -497,7 +506,18 @@ def vug_options(dev: dict) -> dict:
         render = nodes[0]["path"]
     if not RENDER_RE.match(render) or not Path(render).exists():
         raise QdevError(f"render node {render} does not exist on this node")
-    return {"render": render, "vga": flag("vga", True), "virgl": flag("virgl", True),
+    display = a.get("display", "")
+    if display and "vga" in a:
+        raise QdevError("give display=primary|vga|secondary or the older vga=1|0, not both")
+    if not display:
+        legacy = a.get("vga", "")
+        if legacy not in ("", "0", "1"):
+            raise QdevError("vga must be 0 or 1")
+        display = {"": "primary", "1": "vga", "0": "secondary"}[legacy]
+    if display not in ("primary", "vga", "secondary"):
+        raise QdevError("display must be primary, vga or secondary")
+    return {"render": render, "display": display, "primary": display != "secondary",
+            "vga": display == "vga", "virgl": flag("virgl", True),
             "outputs": number("outputs", 1, 1, 4), "xres": number("xres", 1280, 640, 7680),
             "yres": number("yres", 800, 480, 4320)}
 
@@ -512,7 +532,7 @@ def _find(args: str, pattern: str) -> str | None:
 def vug_groups(vmid: int, dev: dict) -> str:
     o = vug_options(dev)
     chardev = f"qdev-{dev['id']}"
-    driver = "vhost-user-vga" if o["vga"] else "vhost-user-gpu-pci"
+    driver = "vhost-user-vga" if o["display"] == "vga" else "vhost-user-gpu-pci"
     return (f"-chardev socket,id={chardev},path={gpu_socket(vmid, dev['id'])} "
             f"-device {driver},id={dev['id']},chardev={chardev},bus={dev['bus']},"
             f"max_outputs={o['outputs']},xres={o['xres']},yres={o['yres']}")
@@ -575,7 +595,7 @@ def apply_vug_args(vmid: int, conf: dict, cfg: dict[str, str]) -> list[str]:
     for pat in SHARED_MEM_PATTERNS:
         args = _drop(args, pat)
     vugs = [d for d in conf["devices"] if dev_kind(d) == "vhost-user-gpu"]
-    primary = [d for d in vugs if vug_options(d)["vga"]]
+    primary = [d for d in vugs if vug_options(d)["primary"]]
     if len(primary) > 1:
         raise QdevError("only one qdev-host GPU can be the primary display")
     # QSM's in-process VirGL GPU gives way to a primary qdev-host GPU and comes back without one
@@ -608,7 +628,7 @@ def apply_vug_args(vmid: int, conf: dict, cfg: dict[str, str]) -> list[str]:
     if primary and cfg.get("dbus-display") in ("1", "on", "yes", "true"):
         raise QdevError("the VM uses the native shared display of the older QSM preview (dbus-display), which "
                         "needs a graphical Display: switch it to QSM Display1 VirGL in Hardware > Display and its "
-                        "sound to QSM Console first, or add this GPU with vga=0")
+                        "sound to QSM Console first, or add this GPU with display=secondary")
     if primary and "saved_vga" not in conf:
         if vga_now != "none":
             conf["saved_vga"] = vga_now

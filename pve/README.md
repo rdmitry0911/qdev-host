@@ -44,7 +44,7 @@ A built-in plugin backed by QEMU's own out-of-process virtio-gpu, the
 Linux guests use it with their stock `virtio_gpu` driver and Mesa's virgl driver.
 
 ```bash
-qdevctl add 990 gpu0 --plugin virgl-gpu --args render=/dev/dri/renderD128,vga=1
+qdevctl add 990 gpu0 --plugin virgl-gpu --args render=/dev/dri/renderD128,display=primary
 qm stop 990 && qm start 990     # the GPU is on QEMU's command line from the next start
 ```
 
@@ -61,11 +61,20 @@ qm stop 990 && qm start 990     # the GPU is on QEMU's command line from the nex
   the memory, save the GPU again (Edit, or `qdevctl set VMID ID`); the pre-start
   hook stops a start whose sizes differ and says so. VMs with NUMA nodes or memory
   hot-plug need hugepages or virtiofs instead.
-- **Primary display** (`vga=1`, the default): `vhost-user-vga`, the VM's first
-  display. qdev-host sets the VM's Display to none and takes the place of QSM
-  Direct's in-process VirGL GPU (`virtio-vga-gl,id=qsm-direct-gpu`); both come back
-  when the GPU is removed. With QSM Direct's Display1 VirGL profile (a D-Bus
-  display with `gl=on`, qsm-pve-direct 0.4.0+stock4.14~exp233 or later) the QSM console shows it. `vga=0` adds a `vhost-user-gpu-pci` next to the VM's display instead.
+- **Display** (`display=`):
+  - `primary` (the default from 0.5.5): `vhost-user-gpu-pci` is the VM's only display.
+    qdev-host sets the VM's Display to none and takes the place of QSM Direct's in-process
+    VirGL GPU (`virtio-vga-gl,id=qsm-direct-gpu`); both come back when the GPU is removed.
+    With QSM Direct's Display1 VirGL profile (a D-Bus display with `gl=on`) the QSM console
+    shows it. It has no VGA part, so QEMU 11's crash on a guest reboot (below) cannot happen.
+    The firmware screen needs OVMF, whose virtio-gpu driver draws it; with SeaBIOS nothing
+    shows until the guest's driver starts.
+  - `vga`: the same with a VGA part (`vhost-user-vga`), for guests or firmware that need a
+    VGA adapter. QEMU 11 crashes when such a guest reboots while a console is open.
+  - `secondary`: a `vhost-user-gpu-pci` next to the VM's own display, which stays the one
+    the console shows.
+
+  Devices saved before 0.5.5 keep their mode: `vga=1` is `vga`, `vga=0` is `secondary`.
 - **Picture.** The GPU hands its frames to QEMU as dma-bufs, so only a GL display
   shows them. Without one the guest still renders, and the panel says so.
 - **NVIDIA and AMD.** Checked on an AMD Raphael (amdgpu) and an RTX 3080 with the
@@ -102,7 +111,7 @@ qm stop 990 && qm start 990     # the GPU is on QEMU's command line from the nex
 - **Not with the native shared display** of the older QSM preview (`dbus-display: 1`):
   move the VM to QSM Display1 VirGL (Hardware > Display) and its sound to QSM
   Console first. One device per PCIe root port: a GPU and a tb-vga need two buses.
-- Settings: `render` (default the first render node), `vga`, `outputs` (1-4),
+- Settings: `render` (default the first render node), `display`, `outputs` (1-4),
   `xres`, `yres`. Removing the GPU from a running VM changes its config only; the
   VM keeps the GPU until it stops.
 

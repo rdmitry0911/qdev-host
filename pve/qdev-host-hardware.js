@@ -200,6 +200,17 @@
                     } else if (arg.type === 'bool') {
                         const value = current(arg.name, arg.default ? '1' : '0');
                         argsPanel.add(Ext.apply(common, { xtype: 'proxmoxcheckbox', checked: value === true || value === '1' }));
+                    } else if (arg.type === 'choice') {
+                        // a choice may replace an older argument (`legacy`): show what that one meant
+                        let value = current(arg.name, undefined);
+                        if (value === undefined && editDev && arg.legacy && editArgs[arg.legacy.name] !== undefined) {
+                            value = (arg.legacy.map || {})[editArgs[arg.legacy.name]];
+                        }
+                        argsPanel.add(Ext.apply(common, {
+                            xtype: 'combobox', editable: false, queryMode: 'local', displayField: 'label', valueField: 'value',
+                            value: value !== undefined ? value : arg.default,
+                            store: { fields: ['value', 'label'], data: (arg.choices || []).map((c) => ({ value: c[0], label: c[1] })) },
+                        }));
                     } else if (arg.type === 'render') {
                         argsPanel.add(Ext.apply(common, {
                             xtype: 'combobox', editable: true, queryMode: 'local', displayField: 'label', valueField: 'path',
