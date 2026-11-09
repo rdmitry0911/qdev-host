@@ -1,5 +1,6 @@
 #!/bin/bash
-# No-VM test of the qdev-host plugin ABI: test-v2 (ABI 2) and tb-vga (ABI 1)
+# No-VM test of the qdev-host plugin ABI: test-v2 (ABI 2) and tb-vga (in-tree: the
+# header's ABI; give an ABI 1 binary as TBVGA_SO for the v1 check)
 # driven by tools/vfu-test-client, a Display1 listener and the control socket.
 #   tools/test-abi-v2.sh OUTDIR [TBVGA_SO]
 # TBVGA_SO: a tb-vga.so to check instead of the in-tree one (e.g. a v1 binary
@@ -44,6 +45,11 @@ result $? "Display1 listener: Scanout, Update per frame, CursorDefine, MouseSet"
 timeout 20 python3 tools/qdev-control.py "$RUN/ctl.sock" frame "screendump $RUN/a.ppm" "screendump $RUN/b.ppm" frame stats \
     --check > "$OUT/t2-display.control.log" 2>&1
 result $? "control socket: screendump waits for the next frame, PPM matches the reply seq"
+# ABI 2 plugin on an ABI 3 host: no ui_info, the request is refused and nothing else changes
+timeout 10 python3 tools/qdev-control.py "$RUN/ctl.sock" "uiinfo 1600 900" "uiinfo 1600" frame > "$OUT/t2-display.uiinfo.log" 2>&1
+grep -q "< err plugin has no ui_info (ABI 2)" "$OUT/t2-display.uiinfo.log" && grep -q "< err usage: uiinfo W H \[WMM HMM\]" "$OUT/t2-display.uiinfo.log" \
+    && grep -q "< ok [0-9]* 640x480" "$OUT/t2-display.uiinfo.log" && grep -q "plugin test-v2 0.1 (ABI 2" "$OUT/t2-display.host.log"
+result $? "uiinfo to the ABI 2 plugin: 'err plugin has no ui_info (ABI 2)', usage error, scanout unchanged"
 stop_host
 
 step "test-v2: initial get_scanout() after setup (no frame_ready), QDP_RESET_EXIT on the lost client"
