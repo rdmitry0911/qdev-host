@@ -1,5 +1,5 @@
 /*
- * qdp.h - qdev-host plugin ABI, versions 1 and 2
+ * qdp.h - qdev-host plugin ABI, versions 1, 2 and 3
  *
  * A plugin implements one PCI device for a stock QEMU through vfio-user.
  * The host owns the libvfio-user context, the socket, the main loop and the
@@ -10,7 +10,7 @@
  * ABI rules: this header only; the plugin links against libvfio-user and
  * nothing of the host. New fields are appended; abi_version bumps on
  * incompatible changes. The host loads plugins of every version it knows
- * (1 and 2) and touches only the fields of the plugin's version.
+ * (1 to 3) and touches only the fields of the plugin's version.
  *
  * Version 2 (GPU plugins) adds:
  *  - guest RAM regions with their backing fd and file offset (dma_register /
@@ -21,6 +21,10 @@
  *    IRQ trigger, frame-ready notification, cursor change, log;
  *  - plugin-driven damage (no shadow comparison) and a cursor plane.
  *
+ * Version 3 adds an optional ui_info() operation: the display size a UI asks
+ * for (window resized, fullscreen entered or left), from Display1 SetUIInfo
+ * or the control socket. A v2 plugin is loaded and served as before.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #ifndef QDP_H
@@ -30,7 +34,7 @@
 #include <stdint.h>
 #include "libvfio-user.h"
 
-#define QDP_ABI_VERSION 2
+#define QDP_ABI_VERSION 3
 #define QDP_ABI_VERSION_MIN 1
 
 /* Current scanout of a display plugin. fd is a memfd/shm fd the host may dup
@@ -121,6 +125,24 @@ typedef struct qdp_host_ops {
     void (*log)(void *host, int level, const char *fmt, ...)
         __attribute__((format(printf, 3, 4)));
 } qdp_host_ops;
+
+/* ---------------------------------------------------------------- ABI v3 */
+
+/* A display size request from a UI: the size in pixels the UI would show
+ * 1:1 (device pixels, after the UI's own scale factor) and, when known, the
+ * physical size it stands for. The plugin decides what the guest is offered
+ * (it may offer exactly this size, ignore it, or refuse it); the size of the
+ * scanout changes only when the guest presents at a new size. */
+typedef struct qdp_ui_info {
+    uint32_t size;               /* sizeof(qdp_ui_info) of the host */
+    uint32_t width, height;      /* pixels */
+    uint16_t width_mm, height_mm;/* physical size; 0 = unknown (plugin policy) */
+    uint32_t refresh_mhz;        /* refresh in millihertz; 0 = plugin default */
+    uint32_t flags;              /* none defined yet: 0 */
+} qdp_ui_info;
+
+/* ui_info() result: the request equals the last one accepted, nothing to do. */
+#define QDP_UI_INFO_UNCHANGED 1
 
 /* Plugin flags (qdp_device_ops.flags, v2). */
 #define QDP_F_PLUGIN_DAMAGE  (1u << 0)   /* frames are announced with frame_ready();
@@ -213,6 +235,15 @@ typedef struct qdp_device_ops {
 
     /* Optional cursor plane (host main loop). Return false without one. */
     bool (*get_cursor)(void *priv, qdp_cursor *out);
+
+    /* ------------------------------------------------------------ v3 */
+    /* Optional: a UI asks for a display size (host main loop; the host calls
+     * it only for abi_version >= 3). Returns 0 when the request was accepted
+     * (handed to the device; the guest may follow later),
+     * QDP_UI_INFO_UNCHANGED when it equals the last accepted one, or -errno:
+     * -EINVAL out of the plugin's bounds, -ENOTSUP the plugin's policy does
+     * not follow UI sizes, -ENODEV the device is stopped. */
+    int  (*ui_info)(void *priv, const qdp_ui_info *info);
 } qdp_device_ops;
 
 /* The single exported symbol of a plugin shared object. */
