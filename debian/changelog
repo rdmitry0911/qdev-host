@@ -1,3 +1,28 @@
+qdev-host (0.6.2) unstable; urgency=medium
+
+  * TB bus in macOS guests: hot-unplug as well as hot-plug, repeatedly, with
+    stock QEMU. macOS releases a device only through the attention-button
+    sequence of a slot with a power controller, and it switches such a slot
+    on only when the device's link is down at the hot-plug event. The ports
+    of a macOS VM keep their power controller, get x-speed=2_5 and no ACPI
+    properties, and each hot-plug starts with a key device (pvpanic-pci with
+    x-pcie-lnksta-dllla=off) that makes macOS switch the slot on and then
+    leaves on the host side; the real device arrives in the powered slot.
+    qdev-host reads the slot state through the PCIe MMCONFIG window.
+  * PCI pass-through and vfio-user devices that the hookscript hot-plugs at
+    post-start wait in a background job (qdev-host-tb-boot-VMID) until macOS
+    has started the ports.
+  * qdevctl tb --acpi auto; --acpi thunderbolt or --power-controller off on
+    a macOS VM keep the 0.6.1 hot-plug-only mode.
+  * Status: a USB device whose TB controller is detached no longer says the
+    TB bus appears at the next VM start.
+  * Packages the runtime display resize merged after 0.6.1: qdp ABI v3 adds
+    an optional ui_info() so a display client's window size reaches plugins
+    that implement it (Display1 Console.SetUIInfo is forwarded, control
+    command "uiinfo W H [WMM HMM]"); ABI 1 and 2 plugins run as before.
+
+ -- Dmitry R <rdmitry0911@gmail.com>  Mon, 09 Nov 2026 23:30:00 +0100
+
 qdev-host (0.6.1) unstable; urgency=medium
 
   * TB bus for macOS guests: macOS waits for the ports' own PCIe hot-plug

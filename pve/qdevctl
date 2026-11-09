@@ -148,10 +148,11 @@ def cmd_hook(a):
                     print(f"qdev-host: {d['id']}: {e}", file=sys.stderr)
                     return 2
     elif a.phase == "post-start":
+        later = {d["id"] for d in TB.deferred(a.vmid, conf, Q.vm_config(a.vmid))}
         for m in TB.post_start(a.vmid, conf):
             print(m)
         for d in conf["devices"]:
-            if Q.dev_kind(d) in ("vhost-user-gpu", "tb"):
+            if Q.dev_kind(d) in ("vhost-user-gpu", "tb") or d["id"] in later:
                 continue
             try:
                 print(Q.attach(a.vmid, d))
@@ -177,6 +178,9 @@ def cmd_hook(a):
                 Q.stop_process(a.vmid, d["id"])
     return rc
 
+def cmd_tb_boot(a):
+    return TB.boot_attach(a.vmid)
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -201,14 +205,17 @@ def main():
     s = sub.add_parser("hook"); s.add_argument("vmid", type=int); s.add_argument("phase"); s.set_defaults(fn=cmd_hook)
     s = sub.add_parser("tb", help="add the TB bus to the VM, or change its number of ports")
     s.add_argument("vmid", type=int); s.add_argument("--ports", type=int)
-    s.add_argument("--acpi", choices=sorted(TB.ACPI_MODES), help="ACPI properties of the ports (default thunderbolt)")
+    s.add_argument("--acpi", choices=["auto"] + sorted(TB.ACPI_MODES),
+                   help="ACPI properties of the ports (auto: none on macOS ports with slot power, else thunderbolt)")
     s.add_argument("--hotplug", choices=TB.HOTPLUG_MODES,
                    help="PCIe hot-plug: native (needed by macOS), acpi (QEMU's q35 default) or auto (native for macOS guests)")
     s.add_argument("--power-controller", choices=("on", "off", "default"),
-                   help="slot power controller of the ports (QEMU default on)")
+                   help="slot power controller of the ports (QEMU default on; macOS: on = hot-plug and "
+                        "hot-unplug through the slot power handshake, off = hot-plug only)")
     for key, default in (("io-reserve", "0"), ("mem-reserve", "32M"), ("pref64-reserve", "1G")):
         s.add_argument(f"--{key}", help=f"window the firmware reserves per port (default {default}; '' = QEMU's default)")
     s.set_defaults(fn=cmd_tb)
+    s = sub.add_parser("tb-boot", help=argparse.SUPPRESS); s.add_argument("vmid", type=int); s.set_defaults(fn=cmd_tb_boot)
     a = p.parse_args()
     try:
         rc = a.fn(a)

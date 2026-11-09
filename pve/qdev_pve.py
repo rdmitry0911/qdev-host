@@ -425,6 +425,9 @@ def attach(vmid: int, dev: dict) -> str:
     if not bus_present(vmid, dev["bus"]):
         return (f"{dev['id']}: bus {dev['bus']} is not in the running VM "
                 f"(the root port is added at the next VM start); process running, not attached")
+    if dev["bus"].startswith("qdev-tb"):
+        import qdev_tb
+        qdev_tb.power_slot(vmid, load_conf(vmid), vm_config(vmid), dev["bus"])
     device_add(vmid, dev, device_socket(vmid, dev["id"]))
     return f"{dev['id']}: attached to {dev['bus']} (plugin {dev['plugin']})"
 
@@ -939,7 +942,9 @@ def describe_vm(vmid: int) -> dict:
             target = d["bus"] in present or d["bus"] in tb_where
             devices.append({**{k: d.get(k) for k in ("id", "plugin", "args", "bus", "display", "kms", "persistent")},
                             "kind": kind, "state": "attached" if attached else "stopped", "process_active": False,
-                            "pci": present.get(d["id"]), "needs_restart": bool(running and not attached and not target),
+                            "pci": present.get(d["id"]),
+                            # a USB device whose controller is detached waits for the controller, not a restart
+                            "needs_restart": bool(running and not attached and not target and qdev_tb.is_port(d["bus"])),
                             "warning": None})
             continue
         active = process_active(vmid, d["id"], kind)

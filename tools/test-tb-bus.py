@@ -100,18 +100,37 @@ with tempfile.TemporaryDirectory() as d:
     check("aml with qdev-rp0", b"S40_" in aml and b"S4B_" in aml and sum(aml) % 256 == 0)
     check("no notes", notes == [], str(notes))
 
-# macOS guests: native PCIe hot-plug for the VM, ports without a power controller
+# macOS guests: native PCIe hot-plug for the VM; ports with slot power and no link-active
+# reporting (the power handshake), no ACPI properties, QEMU's default windows
 mac = {"args": "-device isa-applesmc,osk=x -cpu host"}
 lin = {"args": "-cpu host"}
 c = {"tb": {"ports": 2}}
 check("macOS hot-plug native", T.hotplug_mode(c, mac) == "native" and T.hotplug_mode(c, lin) == "acpi")
 check("macOS args", T.NATIVE_HOTPLUG_GLOBAL in T.arg_groups(990, c, mac) and T.NATIVE_HOTPLUG_GLOBAL not in T.arg_groups(990, c, lin))
-check("macOS ports", all(p.get("power_controller_present") == "off" for _, p in T.port_devices(c, mac))
-      and all("power_controller_present" not in p for _, p in T.port_devices(c, lin)))
+check("macOS slot power", T.slot_handshake(c, mac) and not T.slot_handshake(c, lin))
+check("macOS ports", all("power_controller_present" not in p and p.get("x-speed") == "2_5" for _, p in T.port_devices(c, mac))
+      and all("power_controller_present" not in p and "x-speed" not in p for _, p in T.port_devices(c, lin)))
+check("macOS acpi", T.acpi_mode(c, mac) == "none" and T.acpi_mode(c, lin) == "thunderbolt" and T.acpi_mode(c) == "thunderbolt")
 check("macOS reserves", all("io-reserve" not in p and "pref64-reserve" not in p for _, p in T.port_devices(c, mac))
       and all(p.get("io-reserve") == "0" for _, p in T.port_devices(c, lin)))
+tbc = {"tb": {"ports": 2, "acpi": "thunderbolt"}}
+check("macOS thunderbolt = 0.6.1 hot-plug only", not T.slot_handshake(tbc, mac) and T.power_controller(tbc, mac) == "off"
+      and all(p.get("power_controller_present") == "off" and "x-speed" not in p for _, p in T.port_devices(tbc, mac)))
+off = {"tb": {"ports": 2, "power-controller": "off"}}
+check("macOS power controller off", not T.slot_handshake(off, mac) and T.acpi_mode(off, mac) == "thunderbolt")
 check("explicit override", T.power_controller({"tb": {"power-controller": "on"}}, mac) == "on"
-      and T.hotplug_mode({"tb": {"hotplug": "acpi"}}, mac) == "acpi")
+      and T.hotplug_mode({"tb": {"hotplug": "acpi"}}, mac) == "acpi" and not T.slot_handshake({"tb": {"hotplug": "acpi"}}, mac))
+dev_pci = {"id": "tbpci0", "plugin": "tb-pci", "bus": "qdev-tb0", "args": "host=0000:01:00"}
+dev_vu = {"id": "tbvga0", "plugin": "tb-vga", "bus": "qdev-tb1", "args": ""}
+dev_vu2 = {"id": "vga1", "plugin": "tb-vga", "bus": "qdev-rp0", "args": ""}
+orig_kind = T.Q.dev_kind
+T.Q.dev_kind = lambda d: "tb" if d["plugin"].startswith("tb-") and d["plugin"] != "tb-vga" else "vfio-user"
+try:
+    check("deferred: PCI first, then every vfio-user device", [d["id"] for d in T.deferred(990, {"tb": {"ports": 2}, "devices": [dev_vu2, dev_vu, dev_pci]}, mac)] == ["tbpci0", "vga1", "tbvga0"])
+    check("deferred: vfio-user on TB ports only", [d["id"] for d in T.deferred(990, {"tb": {"ports": 2}, "devices": [dev_vu2, dev_vu]}, mac)] == ["tbvga0"])
+    check("deferred: none for Linux", T.deferred(990, {"tb": {"ports": 2}, "devices": [dev_pci, dev_vu]}, lin) == [])
+finally:
+    T.Q.dev_kind = orig_kind
 
 print("PASS" if not failures else f"{failures} FAILED")
 sys.exit(1 if failures else 0)

@@ -66,9 +66,14 @@ def tb_devices(conf: dict) -> list[dict]:
 def port_id(i: int) -> str:
     return f"{PORT_PREFIX}{i}"
 
-def acpi_mode(conf: dict) -> str:
-    mode = conf.get("tb", {}).get("acpi", DEFAULT_ACPI)
-    return mode if mode in ACPI_MODES else DEFAULT_ACPI
+def acpi_mode(conf: dict, vmcfg: dict | None = None) -> str:
+    """The ports' ACPI properties; auto (unset) = none on macOS ports with slot power
+    (Thunderbolt ports there would need link reporting the handshake turns off),
+    thunderbolt otherwise."""
+    mode = conf.get("tb", {}).get("acpi", "auto")
+    if mode in ACPI_MODES:
+        return mode
+    return "none" if vmcfg is not None and slot_handshake(conf, vmcfg) else DEFAULT_ACPI
 
 def port_count(conf: dict) -> int:
     return int(conf.get("tb", {}).get("ports", DEFAULT_PORTS))
@@ -345,33 +350,46 @@ def macos_guest(vmcfg: dict) -> bool:
 
 def power_controller(conf: dict, vmcfg: dict | None) -> str | None:
     """on/off for the ports' slot power controller, None for QEMU's default (on).
-    macOS never powers a slot on: with a power controller a hot-plugged device stays
-    unpowered and invisible to it.  Without one, plug works but the guest cannot
-    switch the slot off, so QEMU does not complete a PCIe unplug."""
+    off: macOS takes hot-plugged devices but cannot release one (QEMU waits for the
+    slot to be switched off), so a device leaves only when the VM stops (0.6.1)."""
     value = conf.get("tb", {}).get("power-controller")
     if value in ("on", "off"):
         return value
-    if vmcfg is not None and macos_guest(vmcfg) and hotplug_mode(conf, vmcfg) == "native":
-        return "off"
+    if (vmcfg is not None and macos_guest(vmcfg) and hotplug_mode(conf, vmcfg) == "native"
+            and conf.get("tb", {}).get("acpi") == "thunderbolt"):
+        return "off"    # Thunderbolt ports in macOS: the 0.6.1 hot-plug-only mode
     return None
+
+def slot_handshake(conf: dict, vmcfg: dict | None) -> bool:
+    """macOS ports run with slot power: hot-plug through the power handshake below,
+    hot-unplug through macOS's own release (attention button, power off)."""
+    return (vmcfg is not None and macos_guest(vmcfg) and hotplug_mode(conf, vmcfg) == "native"
+            and power_controller(conf, vmcfg) != "off" and conf.get("tb", {}).get("acpi") != "thunderbolt")
 
 def port_devices(conf: dict, vmcfg: dict | None = None) -> list[tuple[str, dict]]:
     out = []
     pcp = power_controller(conf, vmcfg)
+    handshake = slot_handshake(conf, vmcfg)
     for i in range(port_count(conf)):
         p = {"driver": "pcie-root-port", "bus": "pcie.0", "addr": f"{TB_SLOT:02x}.{i}",
              "multifunction": "on", "chassis": str(CHASSIS_BASE + i), "port": str(CHASSIS_BASE + i),
              "io-reserve": "0", "mem-reserve": "32M", "pref64-reserve": "1G"}
         if pcp:
             p["power_controller_present"] = pcp
+        if handshake:
+            # no Data Link Layer Link Active reporting (QEMU ties it to speeds above
+            # 2.5 GT/s): the handshake's key device must arrive with its link down
+            p["x-speed"] = "2_5"
         for key in ("io-reserve", "mem-reserve", "pref64-reserve"):
             v = conf.get("tb", {}).get(key)
-            if v is None and pcp == "off" and vmcfg is not None and macos_guest(vmcfg):
-                v = ""      # macOS sizes Thunderbolt port windows itself: QEMU's defaults, as checked
+            if v is None and vmcfg is not None and macos_guest(vmcfg):
+                v = ""      # macOS sizes hot-plug port windows itself: QEMU's defaults, as checked
             if v == "":
                 p.pop(key)
             elif v:
                 p[key] = v
+        for key, v in (conf.get("tb", {}).get("port-props") or {}).items():
+            p[str(key)] = str(v)
         out.append((port_id(i), p))
     return out
 
@@ -476,7 +494,7 @@ def write_files(vmid: int, conf: dict, vmcfg: dict, starting: bool = False) -> l
             except Q.QdevError as e:
                 notes.append(f"{dev['id']}: {e}; left out")
     TB_DIR.mkdir(parents=True, exist_ok=True)
-    props = ACPI_MODES[acpi_mode(conf)]
+    props = ACPI_MODES[acpi_mode(conf, vmcfg)]
     for path, data in ((cfg_path(vmid), _config_file(groups).encode()),
                        (aml_path(vmid), ssdt(ssdt_scopes(conf, vmcfg), props=props))):
         tmp = path.with_suffix(".tmp")
@@ -590,6 +608,145 @@ def _wait_gone(vmid: int, ids: list[str], timeout: float) -> bool:
         time.sleep(0.5)
     return False
 
+# ------------------------------------------------- macOS slot power handshake
+# macOS (IOPCIFamily's IOPCI2PCIBridge) drives a PCIe slot that has a power controller
+# with the attention-button state machine.  It releases a device only that way: blink,
+# driver teardown, slot power off, indicator off -- the write that completes QEMU's
+# device_del.  It switches a slot on only when the device's link is down at the
+# hot-plug event, but QEMU reports the link up at once, so a device hot-plugged into a
+# slot that macOS switched off stays unpowered.  The handshake: a key device without
+# link-active reporting makes macOS switch the slot on; the attention button takes
+# macOS out of its hot-add state; the key leaves on the host side (unrealized, moved to
+# function 7 and deleted: QEMU removes a function without function 0 at once); the
+# real device then arrives in a powered slot with its link up, and macOS takes it.
+# The state is read from the port's config space through the PCIe MMCONFIG window
+# (HMP xp: plain reads, no side effects).
+KEY_DRIVER = "pvpanic-pci"
+SLTCTL_PCC, SLTCTL_PIC, SLTCTL_HPIE = 0x400, 0x300, 0x20
+PIC_NAMES = {0x100: "on", 0x200: "blink", 0x300: "off", 0: "-"}
+_mmcfg: dict[int, tuple[int, int]] = {}
+
+def _hmp(vmid: int, line: str) -> str:
+    return Q.mon_cmd(vmid, "human-monitor-command", **{"command-line": line})
+
+def _xp_words(vmid: int, addr: int, n: int) -> list[int]:
+    out = _hmp(vmid, f"xp /{n}wx {addr:#x}")
+    return [int(w, 16) for line in out.splitlines() if ":" in line for w in line.split(":", 1)[1].split()][:n]
+
+def _port_cfg(vmid: int, bus: str) -> int:
+    """MMCONFIG address of the port's config space (TB ports sit on bus 0)."""
+    i = int(bus[len(PORT_PREFIX):])
+    return (TB_SLOT << 15) | (i << 12)
+
+def _mmcfg_info(vmid: int, bus: str, fresh: bool = False) -> tuple[int, int]:
+    """(MMCONFIG base, PCIe capability offset), checked on the port's vendor ID."""
+    if not fresh and vmid in _mmcfg:
+        return _mmcfg[vmid]
+    base = None
+    for line in _hmp(vmid, "info mtree").splitlines():
+        if "pcie-mmcfg-mmio" in line:
+            base = int(line.strip().split("-", 1)[0], 16)
+            break
+    if base is None:
+        raise Q.QdevError("the VM has no PCIe MMCONFIG window yet")
+    words = _xp_words(vmid, base + _port_cfg(vmid, bus), 64)
+    if len(words) < 64 or words[0] & 0xffff != 0x1b36:
+        raise Q.QdevError(f"{bus}: config space not readable yet")
+    cfg = b"".join(w.to_bytes(4, "little") for w in words)
+    pos, cap = cfg[0x34], None
+    for _ in range(48):
+        if not pos or pos >= 0xff:
+            break
+        if cfg[pos] == 0x10:
+            cap = pos
+            break
+        pos = cfg[pos + 1]
+    if cap is None:
+        raise Q.QdevError(f"{bus}: no PCIe capability")
+    _mmcfg[vmid] = (base, cap)
+    return base, cap
+
+def slot_state(vmid: int, bus: str) -> dict:
+    """The port's Slot Control as the guest set it: power, indicator, interrupts."""
+    for fresh in (False, True):
+        try:
+            base, cap = _mmcfg_info(vmid, bus, fresh)
+            w = _xp_words(vmid, base + _port_cfg(vmid, bus) + (cap & ~3) + 0x18, 1)
+            w0 = _xp_words(vmid, base + _port_cfg(vmid, bus), 1)
+            if not w or not w0 or w0[0] & 0xffff != 0x1b36:
+                raise Q.QdevError(f"{bus}: config space not readable")
+            ctl = (w[0] >> (8 * ((cap + 0x18) & 3))) & 0xffff
+            return {"ctl": ctl, "power": not ctl & SLTCTL_PCC, "pic": PIC_NAMES[ctl & SLTCTL_PIC],
+                    "ints": bool(ctl & SLTCTL_HPIE)}
+        except Q.QdevError:
+            _mmcfg.pop(vmid, None)
+            if fresh:
+                raise
+    raise Q.QdevError(f"{bus}: no slot state")
+
+def wait_port_ready(vmid: int, bus: str, timeout: float) -> bool:
+    """Until the guest's PCIe driver runs the port (hot-plug interrupts enabled)."""
+    end = time.time() + timeout
+    while time.time() < end:
+        if not Q.vm_running(vmid):
+            return False
+        try:
+            if slot_state(vmid, bus)["ints"]:
+                return True
+        except Q.QdevError:
+            pass
+        time.sleep(2)
+    return False
+
+def _drop_key(vmid: int, key: str) -> None:
+    path = f"/machine/peripheral/{key}"
+    Q.mon_cmd(vmid, "qom-set", path=path, property="realized", value=False)
+    Q.mon_cmd(vmid, "qom-set", path=path, property="addr", value="0.7")
+    for _ in range(40):
+        try:
+            Q.mon_cmd(vmid, "device_del", id=key)
+            break
+        except Q.QdevError as e:
+            if "process of unplug" not in str(e):
+                raise
+            time.sleep(0.25)
+    _wait_gone(vmid, [key], 3.0)
+
+def power_slot(vmid: int, conf: dict, vmcfg: dict, bus: str) -> str | None:
+    """Have macOS switch the port's slot on before a device is hot-plugged into it."""
+    if not slot_handshake(conf, vmcfg) or not is_port(bus):
+        return None
+    st = slot_state(vmid, bus)
+    if not st["ints"]:
+        raise Q.QdevError(f"{bus}: the guest has not started this port yet (macOS still booting?)")
+    if st["power"]:
+        if st["pic"] == "blink":
+            raise Q.QdevError(f"{bus}: the guest is busy with this slot (indicator blinking); try again")
+        return None
+    key = f"{bus}-key"
+    if key in peripherals(vmid):
+        Q.mon_cmd(vmid, "device_del", id=key)      # a leftover in a switched-off slot: removed at once
+        _wait_gone(vmid, [key], 3.0)
+    Q.mon_cmd(vmid, "device_add", driver=KEY_DRIVER, id=key, bus=bus, addr="0.0",
+              **{"x-pcie-lnksta-dllla": False})
+    end = time.time() + 20
+    while time.time() < end:
+        st = slot_state(vmid, bus)
+        if st["power"] and st["pic"] == "on":
+            break
+        time.sleep(0.25)
+    else:
+        try:
+            Q.mon_cmd(vmid, "device_del", id=key)  # still switched off: QEMU removes it without the guest
+            _wait_gone(vmid, [key], 3.0)
+        except Q.QdevError:
+            pass
+        raise Q.QdevError(f"{bus}: the guest did not switch the slot on (indicator {st['pic']})")
+    Q.mon_cmd(vmid, "device_del", id=key)          # attention button: macOS leaves its hot-add state
+    time.sleep(5.3)                                # QEMU takes the next device_del of the key after 5 s
+    _drop_key(vmid, key)
+    return f"{bus}: slot switched on by the guest"
+
 def target_present(vmid: int, dev: dict, present: set[str]) -> bool:
     return dev["bus"] in present
 
@@ -602,6 +759,8 @@ def plug(vmid: int, conf: dict, dev: dict) -> str:
         what = "controller" if dev["plugin"] == "tb-usb" else "TB port"
         return f"{dev['id']}: {what} {dev['bus']} is not in the running VM; present from the next VM start"
     kind = dev["plugin"]
+    if kind in PORT_KINDS:
+        power_slot(vmid, conf, Q.vm_config(vmid), dev["bus"])
     if kind == "tb-pci":
         # QEMU 11 (hw/vfio/container-legacy.c) casts every VFIO container of the address
         # space to a legacy one when a vfio-pci device connects, and aborts on the
@@ -678,7 +837,7 @@ def unplug(vmid: int, dev: dict, timeout: float = 30.0) -> str:
         conf = Q.load_conf(vmid)
         if kind != "tb-usb" and power_controller(conf, Q.read_vm_config(vmid)) == "off":
             return (f"{dev['id']}: device_del sent; the guest cannot switch off a port without a power "
-                    "controller (macOS guests), so QEMU removes the device when the VM stops")
+                    "controller, so QEMU removes the device when the VM stops")
         return f"{dev['id']}: device_del sent, the guest has not released it yet"
     if kind == "tb-net":
         try:
@@ -836,8 +995,8 @@ def purge(vmid: int, conf: dict, vmcfg: dict) -> None:
 
 def set_ports(vmid: int, conf: dict, n: int, acpi: str | None = None, hotplug: str | None = None,
               power_controller: str | None = None) -> list[str]:
-    if acpi is not None and acpi not in ACPI_MODES:
-        raise Q.QdevError(f"ACPI properties: {', '.join(ACPI_MODES)}")
+    if acpi is not None and acpi not in ACPI_MODES and acpi != "auto":
+        raise Q.QdevError(f"ACPI properties: auto, {', '.join(ACPI_MODES)}")
     if hotplug is not None and hotplug not in HOTPLUG_MODES:
         raise Q.QdevError(f"hot-plug: {', '.join(HOTPLUG_MODES)}")
     if power_controller is not None and power_controller not in ("on", "off", "default"):
@@ -849,7 +1008,9 @@ def set_ports(vmid: int, conf: dict, n: int, acpi: str | None = None, hotplug: s
         raise Q.QdevError(f"{', '.join(d['id'] for d in used)} use ports beyond {n}")
     Q.check_editable(vmid)
     conf.setdefault("tb", {})["ports"] = n
-    if acpi is not None:
+    if acpi == "auto":
+        conf["tb"].pop("acpi", None)
+    elif acpi is not None:
         conf["tb"]["acpi"] = acpi
     if hotplug is not None:
         conf["tb"]["hotplug"] = hotplug
@@ -862,8 +1023,12 @@ def set_ports(vmid: int, conf: dict, n: int, acpi: str | None = None, hotplug: s
     changed = ensure_args(vmid, vmcfg, conf)
     Q.ensure_hookscript(vmid, vmcfg, conf)
     Q.save_conf(conf)
-    return [f"VM {vmid}: TB bus with {n} port(s), ACPI properties {acpi_mode(conf)}, "
-            f"{hotplug_mode(conf, vmcfg)} hot-plug" + (", args updated" if changed else "") +
+    mode = ""
+    if macos_guest(vmcfg):
+        mode = (", macOS slot power (hot-plug and hot-unplug)" if slot_handshake(conf, vmcfg)
+                else ", macOS: hot-plug only (a device leaves when the VM stops)")
+    return [f"VM {vmid}: TB bus with {n} port(s), ACPI properties {acpi_mode(conf, vmcfg)}, "
+            f"{hotplug_mode(conf, vmcfg)} hot-plug{mode}" + (", args updated" if changed else "") +
             (": the change applies at the next VM start" if Q.vm_running(vmid) else "")]
 
 # --------------------------------------------------------------- hooks
@@ -875,9 +1040,30 @@ def pre_start(vmid: int, conf: dict) -> list[str]:
         f"VM {vmid}'s args do not match its TB bus settings (edited by hand?); run: qdevctl tb {vmid}"]
     return notes + write_files(vmid, conf, vmcfg, starting=True)
 
+BOOT_UNIT = "qdev-host-tb-boot-{vmid}"
+
+def deferred(vmid: int, conf: dict, vmcfg: dict) -> list[dict]:
+    """Devices hot-plugged once the guest runs its TB ports (macOS slot power): plugged
+    while the firmware runs, a device sits in a switched-off slot and macOS, starting
+    the port, finds it unpowered and then releases it.  Order: PCI pass-through first,
+    then vfio-user devices (QEMU 11)."""
+    if not slot_handshake(conf, vmcfg):
+        return []
+    later = [d for d in tb_devices(conf) if d["plugin"] == "tb-pci"]
+    users = [d for d in conf["devices"] if Q.dev_kind(d) == "vfio-user"]
+    return later + (users if later else [d for d in users if is_port(d["bus"])])
+
 def post_start(vmid: int, conf: dict) -> list[str]:
     """Hot-plug the PCI pass-through devices; before qdev-host's vfio-user devices,
     which QEMU 11 must not have when a vfio-pci device connects."""
+    later = deferred(vmid, conf, Q.vm_config(vmid))
+    if later:
+        unit = BOOT_UNIT.format(vmid=vmid)
+        Q.run(["systemctl", "stop", unit], check=False)
+        Q.run(["systemctl", "reset-failed", unit], check=False)
+        Q.run(["systemd-run", f"--unit={unit}", "--collect", "--quiet",
+               "/usr/sbin/qdevctl", "tb-boot", str(vmid)], check=False)
+        return [f"{', '.join(d['id'] for d in later)}: hot-plugged once the guest has started its TB ports"]
     msgs = []
     for dev in tb_devices(conf):
         if dev["plugin"] == "tb-pci":
@@ -887,7 +1073,24 @@ def post_start(vmid: int, conf: dict) -> list[str]:
                 msgs.append(f"{dev['id']}: {e}")
     return msgs
 
+def boot_attach(vmid: int) -> int:
+    """qdevctl tb-boot: the deferred hot-plugs of a VM start (macOS slot power)."""
+    conf = Q.load_conf(vmid)
+    rc = 0
+    for dev in deferred(vmid, conf, Q.vm_config(vmid)):
+        if is_port(dev["bus"]) and not wait_port_ready(vmid, dev["bus"], 900):
+            print(f"{dev['id']}: the guest did not start {dev['bus']}; not attached", flush=True)
+            rc = 1
+            continue
+        try:
+            print(Q.attach(vmid, dev), flush=True)
+        except Q.QdevError as e:
+            print(f"{dev['id']}: {e}", flush=True)
+            rc = 1
+    return rc
+
 def post_stop(vmid: int, conf: dict) -> None:
+    Q.run(["systemctl", "stop", BOOT_UNIT.format(vmid=vmid)], check=False)
     ids = []
     for dev in tb_devices(conf):
         if dev["plugin"] == "tb-pci":
@@ -908,7 +1111,7 @@ def describe(vmid: int, conf: dict, vmcfg: dict, running: bool) -> tuple[dict, d
         if d["id"] in present:
             where[d["id"]] = d["bus"]
     ports_in_vm = running and port_id(0) in (present or peripherals(vmid))
-    info = {"enabled": bool(conf.get("tb")), "ports": port_count(conf), "acpi": acpi_mode(conf), "in_args": in_args(vmid, vmcfg, conf), "hotplug": hotplug_mode(conf, vmcfg),
-            "power_controller": power_controller(conf, vmcfg) or "on",
+    info = {"enabled": bool(conf.get("tb")), "ports": port_count(conf), "acpi": acpi_mode(conf, vmcfg), "in_args": in_args(vmid, vmcfg, conf), "hotplug": hotplug_mode(conf, vmcfg),
+            "power_controller": power_controller(conf, vmcfg) or "on", "slot_power": slot_handshake(conf, vmcfg),
             "in_vm": bool(ports_in_vm)}
     return info, where

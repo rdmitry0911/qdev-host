@@ -429,9 +429,9 @@ reboot inside the guest.
 properties of the fork, generated per VM, for QEMU's own devices: PCI
 pass-through, network cards, a USB controller and USB devices of the node on it,
 added to and removed from the running VM. qdev-host's own devices (tb-vga,
-virgl-gpu) take its ports as well. For a macOS guest the bus switches the VM to native
-PCIe hot-plug and drops the ports' power controller, which is what macOS needs to see
-devices arrive (0.6.1). PVE's own *PCI Device*, *Network
+virgl-gpu) take its ports as well. In a macOS guest devices arrive in and leave the
+running system any number of times, with stock QEMU: native PCIe hot-plug, and a slot
+power handshake with macOS's own attention-button logic (0.6.2). PVE's own *PCI Device*, *Network
 Device* and *USB Device* dialogs get a *Bus* field (*Standard* or *TB bus*)
 ([details](pve/README.md#tb-bus-hot-plug-ports-with-thunderbolt-properties)).
 

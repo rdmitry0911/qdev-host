@@ -224,11 +224,14 @@ How it works:
   GPU with a 256 MiB BAR; `qdevctl tb VMID --io-reserve/--mem-reserve/--pref64-reserve
   SIZE` changes them for a VM (`''` = QEMU's default), from its next start.
 - `qdevctl tb VMID --acpi MODE` chooses the ports' ACPI properties: `thunderbolt`
-  (default, the fork's `PCI-Thunderbolt` + `pci-supports-link-change`),
-  `hotplug` (`PCIHotplugCapable` + `pci-supports-link-change`, macOS's native
-  hot-plug port) or `none`.
+  (the fork's `PCI-Thunderbolt` + `pci-supports-link-change`; the default except for
+  macOS, see below), `hotplug` (`PCIHotplugCapable` + `pci-supports-link-change`),
+  `none`, or `auto` (back to the default).
 - `qdevctl remove ... --purge-port` of the VM's last qdev-host device also
   removes the TB bus from `args` and deletes its two files.
+- Advanced: `"port-props": {"KEY": "VALUE"}` in the `tb` object of
+  `/etc/qdev-host/vms/VMID.json` adds `pcie-root-port` properties to every port
+  (written at the next VM start).
 
 Checked on PVE 9.2.21 (pve-qemu-kvm 11.0.3) with a Debian 13 guest: the ports
 at `00:09.0-3` with ACPI paths `\_SB.PCI0.S48..S4B`, the SSDT loaded without
@@ -240,30 +243,58 @@ with its device; on a second node an AMD USB 3 controller passed through
 (Add, Edit, Remove in the PCI, Network and USB dialogs) passes the headless
 test `tools/pve-tb-ui-test.mjs`.
 
-**macOS** (checked with macOS 26.1 on OpenCore, SMBIOS iMacPro1,1, PVE 9.2.21): macOS reads
-the properties (`PCI-Thunderbolt`, `IOPCITunnelLinkChange` on the ports) and handles
-the ports as Thunderbolt hot-plug bridges that wait for the port's own PCIe hot-plug
-interrupts (its IOPCIFamily log: `supportsHotPlug 49, linkInterrupts 1`). Two QEMU
-defaults stand in the way, and qdev-host changes both for a macOS guest (`isa-applesmc`
-in its args; `qdevctl tb VMID --hotplug native|acpi|auto --power-controller on|off|default`):
+**macOS** (checked with macOS 26.1 on OpenCore, SMBIOS iMacPro1,1, PVE 9.2.21 with
+pve-qemu-kvm 11.0.3): devices are hot-plugged into the running macOS *and* hot-unplugged
+from it, any number of times, with stock QEMU. For a macOS guest (`isa-applesmc` in its
+args) the TB bus changes three QEMU defaults and drives each hot-plug through a
+handshake with macOS:
 
 - q35 hands the hot-plug of every cold-plugged bridge to ACPI (since QEMU 6.1;
-  `hw/acpi/pcihp.c`), and macOS ignores those ACPI events on its Thunderbolt ports.
-  The TB bus adds `-global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off` to the
-  args (native PCIe hot-plug for the whole VM, as PVE does for VMs created before 6.1).
-- A `pcie-root-port` has a slot power controller, and an empty slot starts powered off:
-  a hot-plugged device stays unpowered until the guest switches the slot on, which
-  macOS does not do on a Thunderbolt port. The TB ports of a macOS VM therefore have
-  `power_controller_present=off`.
+  `hw/acpi/pcihp.c`), and macOS ignores those ACPI events: its PCI driver waits for
+  the port's own PCIe hot-plug interrupts. The TB bus adds
+  `-global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off` to the args (native
+  PCIe hot-plug for the whole VM, as PVE does for VMs created before 6.1).
+- macOS (IOPCIFamily's `IOPCI2PCIBridge`) runs a slot that has a power controller
+  with the PCIe attention-button state machine, and that is the only way it releases
+  a device: indicator blinking, driver teardown, slot power off, indicator off. The
+  last write completes QEMU's `device_del`. So the ports keep their power controller
+  (QEMU's default).
+- macOS switches such a slot on only if the device's link is down at the hot-plug
+  event (it then powers the slot and waits for the link). QEMU reports the link up at
+  once, so a device hot-plugged into a slot that macOS switched off would stay
+  unpowered. The ports therefore have `x-speed=2_5` (QEMU ties link-active reporting
+  to faster links), and every hot-plug starts with a *key* device: a `pvpanic-pci`
+  with `x-pcie-lnksta-dllla=off` arrives with its link down, macOS switches the slot
+  on (about 6 s), an attention-button press takes macOS out of its hot-add state, and
+  the key leaves on the host side (unrealized, moved to function 7, deleted: QEMU
+  removes a function without function 0 at once, so the slot keeps its power). The
+  real device then arrives in a powered slot with its link up, and macOS configures it.
+  qdev-host follows the slot state that macOS sets by reading the port's config space
+  through the PCIe MMCONFIG window (HMP `xp`).
+- The ports carry no ACPI properties (`--acpi auto` = `none` here): macOS treats a
+  `PCI-Thunderbolt` port without link-active reporting as one without hot-plug
+  interrupts. They keep QEMU's default windows, which macOS sizes itself.
 
-With both, in that macOS VM: a USB controller and a virtio NIC on TB ports at the VM
-start are configured; a qemu-xhci, tb-vga and a virtio NIC hot-plugged into the
-running macOS are configured in about 6 s; USB devices of the node on the TB USB
-controller are plugged, unplugged and plugged again. Not possible with stock QEMU:
-the PCIe *unplug* on these ports. QEMU removes a device only after the guest switches
-the slot off, and without a power controller there is nothing to switch, so a removed
-PCIe device goes away when the VM stops (`--power-controller on` makes macOS release
-devices at once, but then a later hot-plug into that port stays unpowered).
+Devices on the ports at the VM start come from the `-readconfig` file and are powered
+at reset. The ones the hookscript hot-plugs at post-start on other guests (PCI
+pass-through, vfio-user devices on TB ports) are plugged by a background job,
+`qdev-host-tb-boot-VMID`, once macOS has started the ports: hot-plugged while the
+firmware runs, they would sit in a switched-off slot.
+
+Checked in the running macOS, through `qdevctl add`, `stop`, `start` (the Hardware
+panel runs the same code): a qemu-xhci with a USB audio device of the node on it, a
+virtio NIC, a second qemu-xhci and an AMD USB 3 controller passed through
+(`0000:08:00.3`), each on its own TB port, all at the same time; each pulled out (6-8 s,
+the time macOS takes to release it) and put back (14-16 s; the first PCI pass-through
+device of a VM also waits for QEMU to pin the VM's memory), more than once; the USB
+device of the node came back with its controller. With QMP directly, the USB check of the
+qemu-thunderbolt fork's README: controller hot-plugged, `usb-storage` on it (macOS read the disk), the
+storage device unplugged, the controller unplugged, three cycles in a row.
+
+`qdevctl tb VMID --power-controller off` (or `--acpi thunderbolt`) gives the 0.6.1
+behaviour instead: Thunderbolt ports without a power controller, hot-plug without
+the handshake, but a PCIe device removed from the running macOS goes away only when
+the VM stops.
 
 Linux guests keep QEMU's defaults (ACPI hot-plug, power controller): there both
 directions work. Switching an existing Linux VM to native hot-plug can change its
