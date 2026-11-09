@@ -140,6 +140,13 @@ typedef struct PvgState {
     char *spirv_cache_dir;
     bool log_to_host;
     bool exit_on_disconnect;
+    /* display-modes=follow (default): a UI size request (qdp v3 ui_info)
+     * replaces the mode list by that one size; fixed: requests are refused */
+    bool display_modes_follow;
+
+    /* last accepted UI size request (host main loop only) */
+    bool ui_info_accepted;
+    qdp_ui_info ui_info_last;
 
     vfu_ctx_t *vfu;
     const qdp_host_ops *host_ops;

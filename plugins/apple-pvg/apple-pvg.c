@@ -27,6 +27,11 @@
  *                                 "[apple-gfx-ml]" lines unchanged)
  *   exit-on-disconnect=on         after the client is gone: stop the device
  *                                 and exit the process (default on)
+ *   display-modes=follow          follow: a UI size request (qdp v3 ui_info:
+ *                                 Display1 SetUIInfo, control "uiinfo") makes
+ *                                 the guest's mode list that one size; fixed:
+ *                                 requests are refused. Without a request the
+ *                                 list stays xres x yres, 1440x1080, 1280x1024.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -50,6 +55,9 @@ void qmu_vk_consume_current_frame_signal(struct qmu_vulkan_ctx *ctx);
 #pragma weak qmu_get_private_ordinary_physical_comparison_v1
 #pragma weak qmu_get_private_ordinary_task_memory_v1
 #pragma weak qmu_get_private_mapped_transport_v1
+/* Newer than the QMetal of the first qdev package: without it a UI size
+ * request is refused and everything else works. */
+#pragma weak qmu_display_set_mode_list
 
 #define APPLE_GFX_ML_VENDOR_ID          0x106b
 #define APPLE_GFX_ML_DEVICE_ID          0xeeee
@@ -2244,6 +2252,9 @@ static int pvg_parse_args(PvgState *s, const char *args)
             s->log_to_host = !strcmp(val, "host");
         } else if (!strcmp(tok, "exit-on-disconnect")) {
             ok = pvg_parse_bool(val, &s->exit_on_disconnect);
+        } else if (!strcmp(tok, "display-modes")) {
+            ok = !strcmp(val, "follow") || !strcmp(val, "fixed");
+            s->display_modes_follow = !strcmp(val, "follow");
         } else {
             fprintf(stderr, "[apple-gfx-ml] [ERROR] unknown arg '%s'\n", tok);
             r = -EINVAL;
@@ -2469,6 +2480,7 @@ static int pvg_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env, 
     s->pci_device_id = APPLE_GFX_ML_DEVICE_ID;
     s->vsync_enabled = true;
     s->exit_on_disconnect = true;
+    s->display_modes_follow = true;
     r = pvg_parse_args(s, args);
     if (r) {
         g_free(s);
@@ -2700,6 +2712,144 @@ static void pvg_dma_unregister(void *priv, const qdp_dma_region *region)
     pvg_memory_dma_unregister(priv, region);
 }
 
+/* =========================================================== UI size requests
+ * qdp v3 ui_info, host main loop (the plane of the BAR0 accesses). In follow
+ * mode the device's PGDisplay.modeList becomes the single requested mode (the
+ * preferred one of the guest's EDID) through qmu_display_set_mode_list, the
+ * port of -[_PGDisplay setModeList:]: the guest is re-onlined, re-reads the
+ * EDID and WindowServer re-lays out; the scanout follows the guest's first
+ * present at the new size (pvg_mode_change -> pvg_apply_mode_change). A
+ * single mode keeps an older saved resolution out of the guest's choice.
+ * Physical size: the request's mm, or (provisional policy, to be measured)
+ * 4.8 px/mm, i.e. the reference 1920 px over 400 mm. */
+
+/* NULL when one requested mode can be offered, else the reason:
+ * - 1..65535 per side: u16 fields of the display shared-state page;
+ * - at least 800x600 (design policy: the viewer's minimum window);
+ * - at most 16777216 pixels: at 4 bytes they fit the reference framebuffer's
+ *   64 MiB IOFBMemorySize (and the eee1 primary backing);
+ * - the guest's edidInit (AppleParavirtGPU 25C56, 0x6a4) drops a mode whose
+ *   DisplayID pixel clock ((h+10000)(w+10000)*refresh16 + 0x270fffff) /
+ *   0x27100000 exceeds 0x1000000 (10 kHz units); a single-mode list would
+ *   then leave the guest without a mode;
+ * - 60 Hz only: another rate needs the eee1 kext's VBL period port first
+ *   (design debt E1). */
+static const char *pvg_ui_info_refusal(const qdp_ui_info *in)
+{
+    uint64_t refresh16, clock;
+
+    if (in->flags) {
+        return "unknown flags";
+    }
+    if (in->refresh_mhz != 60000) {
+        return "only 60 Hz is offered (eee1 VBL period port E1 pending)";
+    }
+    if (!in->width || !in->height || in->width > 0xffff || in->height > 0xffff) {
+        return "a side outside 1..65535";
+    }
+    if (in->width < 800 || in->height < 600) {
+        return "smaller than 800x600";
+    }
+    if ((uint64_t)in->width * in->height > 16777216ull) {
+        return "more than 16777216 pixels (64 MiB framebuffer)";
+    }
+    /* testUpdateModeList: floor(Hz * 65536 + 0.5) */
+    refresh16 = ((uint64_t)in->refresh_mhz * 65536u + 500u) / 1000u;
+    clock = (((uint64_t)in->height + 10000) * ((uint64_t)in->width + 10000) * refresh16 +
+             0x270fffffull) / 0x27100000ull;
+    if ((uint32_t)clock > 0x1000000u) {
+        return "pixel clock above the guest EDID limit";
+    }
+    return NULL;
+}
+
+typedef struct PvgModeListCall {
+    PvgState *state;
+    qmu_display_mode mode;
+    qmu_display_settings settings;
+    qmu_status status;
+} PvgModeListCall;
+
+static void pvg_mode_list_call(void *opaque)
+{
+    PvgModeListCall *call = opaque;
+
+    call->status = qmu_display_set_mode_list(call->state->qmu_dev, 0, &call->mode, 1,
+                                             &call->settings);
+}
+
+static int pvg_ui_info(void *priv, const qdp_ui_info *info)
+{
+    PvgState *s = priv;
+    qdp_ui_info req;
+    PvgModeListCall call = { .state = s };
+    PvgHostWork owner;
+    const char *reason;
+    bool mm_given;
+
+    if (!s || !info || info->size < sizeof(qdp_ui_info)) {
+        return -EINVAL;
+    }
+    memset(&req, 0, sizeof(req));
+    req.size = sizeof(req);
+    req.width = info->width;
+    req.height = info->height;
+    mm_given = info->width_mm && info->height_mm;
+    req.width_mm = mm_given ? info->width_mm : 0;
+    req.height_mm = mm_given ? info->height_mm : 0;
+    req.refresh_mhz = info->refresh_mhz ? info->refresh_mhz : 60000;
+    req.flags = info->flags;
+    if (!s->display_modes_follow) {
+        pvg_log(s, "[apple-gfx-ml][display] ui_info %ux%u not followed (display-modes=fixed)\n",
+                req.width, req.height);
+        return -ENOTSUP;
+    }
+    reason = pvg_ui_info_refusal(&req);
+    if (reason) {
+        pvg_log(s, "[apple-gfx-ml][display][WARN] ui_info %ux%u %ux%umm %u mHz refused: %s\n",
+                req.width, req.height, req.width_mm, req.height_mm, req.refresh_mhz, reason);
+        return -EINVAL;
+    }
+    if (s->ui_info_accepted && !memcmp(&req, &s->ui_info_last, sizeof(req))) {
+        return QDP_UI_INFO_UNCHANGED;
+    }
+    if (!qmu_display_set_mode_list) {
+        pvg_log(s, "[apple-gfx-ml][display][WARN] ui_info %ux%u refused: this libmlapi has "
+                "no qmu_display_set_mode_list\n", req.width, req.height);
+        return -ENOTSUP;
+    }
+    if (s->retired || !s->qmu_dev) {
+        return -ENODEV;
+    }
+    owner = pvg_host_work_ref(s, true);
+    if (!owner.work) {
+        return -ENODEV;
+    }
+    call.mode.width = req.width;
+    call.mode.height = req.height;
+    call.mode.refresh_hz = req.refresh_mhz / 1000.0;
+    call.mode.flags = 0;
+    call.settings.serial_num = 1;
+    call.settings.size_mm_width = mm_given ? (float)req.width_mm : (float)req.width / 4.8f;
+    call.settings.size_mm_height = mm_given ? (float)req.height_mm : (float)req.height / 4.8f;
+    call.settings.origin_x = 0xffff;
+    call.settings.origin_y = 0xffff;
+    call.settings.scale_factor = 0;
+    pvg_host_work_invoke(&owner, pvg_mode_list_call, &call);
+    pvg_host_work_unref(&owner);
+    if (call.status != QMU_OK) {
+        pvg_log(s, "[apple-gfx-ml][display][ERROR] qmu_display_set_mode_list %ux%u: status %d\n",
+                req.width, req.height, (int)call.status);
+        return -EIO;
+    }
+    s->ui_info_last = req;
+    s->ui_info_accepted = true;
+    pvg_log(s, "[apple-gfx-ml][display] ui_info: mode list [%ux%u @ %u mHz], %.1fx%.1f mm%s\n",
+            req.width, req.height, req.refresh_mhz, (double)call.settings.size_mm_width,
+            (double)call.settings.size_mm_height, mm_given ? "" : " (4.8 px/mm policy)");
+    return 0;
+}
+
 static const qdp_device_ops ops = {
     .abi_version = QDP_ABI_VERSION,
     .name = "apple-pvg",
@@ -2714,6 +2864,7 @@ static const qdp_device_ops ops = {
     .dma_register = pvg_dma_register,
     .dma_unregister = pvg_dma_unregister,
     .get_cursor = pvg_get_cursor,
+    .ui_info = pvg_ui_info,
 };
 
 __attribute__((visibility("default")))

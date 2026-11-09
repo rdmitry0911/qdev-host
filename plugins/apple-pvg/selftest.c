@@ -232,14 +232,15 @@ int main(int argc, char **argv)
     }
     fn = (qdp_plugin_v1_fn)dlsym(h, QDP_PLUGIN_SYMBOL);
     ops = fn ? fn() : NULL;
-    CHECK(ops && ops->abi_version == 2 && !strcmp(ops->name, "apple-pvg"),
+    CHECK(ops && ops->abi_version == 3 && !strcmp(ops->name, "apple-pvg"),
           "qdp_plugin_v1: abi %u name %s", ops ? ops->abi_version : 0, ops ? ops->name : "-");
     if (!ops) {
         return 1;
     }
     CHECK((ops->flags & QDP_F_PLUGIN_DAMAGE) && ops->quiesce && ops->resume &&
           ops->dma_register && ops->dma_unregister && ops->get_scanout && ops->get_cursor &&
-          ops->reset && ops->teardown, "v2 ops present, QDP_F_PLUGIN_DAMAGE set");
+          ops->reset && ops->teardown && ops->ui_info,
+          "v2 ops and the v3 ui_info present, QDP_F_PLUGIN_DAMAGE set");
 
     /* 2. setup on a real vfu context */
     snprintf(sock, sizeof(sock), "/tmp/apple-pvg-selftest-%d.sock", getpid());
@@ -545,6 +546,60 @@ int main(int argc, char **argv)
               get_int(&frame_calls));
         CHECK(ops->get_cursor(priv, &cur) && !cur.visible && !cur.pixels,
               "cursor plane present, no glyph defined yet");
+    }
+
+    /* 9b. UI size requests (qdp v3 ui_info, display-modes=follow): the mode
+     * list becomes the one requested size (served by the EFI mode registers
+     * too), a repeat is reported unchanged, out-of-bounds requests change
+     * nothing, and the scanout keeps its size until the guest presents. */
+    {
+        qdp_ui_info ui = { .size = sizeof(ui), .width = 1600, .height = 900 };
+        static const struct { uint32_t w, h, mhz, flags; const char *what; } bad[] = {
+            { 799, 600, 0, 0, "799x600" }, { 800, 599, 0, 0, "800x599" },
+            { 0x10000, 1000, 0, 0, "65536x1000" }, { 8192, 4096, 0, 0, "8192x4096" },
+            { 1600, 900, 59940, 0, "59.94 Hz" }, { 1600, 900, 0, 1, "flag 1" },
+        };
+        int errors0 = get_int(&plugin_errors), refused = 0;
+        uint32_t m0, m1;
+        qdp_scanout so;
+
+        r = ops->ui_info(priv, &ui);
+        wr(PVG_REG_IOSFC_CMD, 0);
+        m0 = rd(PVG_REG_IOSFC_DATA);
+        wr(PVG_REG_IOSFC_CMD, 1);
+        m1 = rd(PVG_REG_IOSFC_DATA);
+        CHECK(r == 0 && m0 == ((900u << 16) | 1600u) && m1 == 0,
+              "ui_info 1600x900: %d; mode list [1600x900] (IOSFC_DATA 0x%08x, then 0x%08x)", r, m0, m1);
+        r = ops->ui_info(priv, &ui);
+        CHECK(r == QDP_UI_INFO_UNCHANGED, "the same request again: %d (QDP_UI_INFO_UNCHANGED)", r);
+        for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+            qdp_ui_info b = { .size = sizeof(b), .width = bad[i].w, .height = bad[i].h,
+                              .refresh_mhz = bad[i].mhz, .flags = bad[i].flags };
+            int rb = ops->ui_info(priv, &b);
+
+            refused += rb == -EINVAL;
+            if (rb != -EINVAL) {
+                printf("INFO ui_info %s returned %d\n", bad[i].what, rb);
+            }
+        }
+        wr(PVG_REG_IOSFC_CMD, 0);
+        m0 = rd(PVG_REG_IOSFC_DATA);
+        CHECK(refused == (int)(sizeof(bad) / sizeof(bad[0])) && m0 == ((900u << 16) | 1600u),
+              "%d of %zu out-of-bounds requests refused with -EINVAL (min 800x600, 16777216 "
+              "pixels, 60 Hz, sides <= 65535, flags 0); list unchanged (0x%08x)", refused,
+              sizeof(bad) / sizeof(bad[0]), m0);
+        ui.width = 2560;
+        ui.height = 1440;
+        ui.width_mm = 600;
+        ui.height_mm = 340;
+        r = ops->ui_info(priv, &ui);
+        wr(PVG_REG_IOSFC_CMD, 0);
+        m0 = rd(PVG_REG_IOSFC_DATA);
+        CHECK(r == 0 && m0 == ((1440u << 16) | 2560u), "ui_info 2560x1440 600x340 mm: %d, mode 0x%08x",
+              r, m0);
+        CHECK(ops->get_scanout(priv, &so) && so.width == 1920 && so.height == 1080,
+              "scanout stays %ux%u until the guest presents at the new size", so.width, so.height);
+        CHECK(get_int(&plugin_errors) == errors0, "no plugin [ERROR] line from ui_info");
     }
 
     /* 10. reset of the device keeps the device (fork semantics) */
