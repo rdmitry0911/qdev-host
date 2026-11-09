@@ -64,6 +64,23 @@ echo "   host exit status $st after $(echo "$t1 - $t0" | bc) s" | tee -a "$OUT/s
 [ "$st" = 0 ] && grep -q "QDP_RESET_EXIT): exiting" "$OUT/t2-exit.host.log" && grep -q "teardown:.*regions at lost connection 4" "$OUT/t2-exit.host.log"
 result $? "host tore the plugin down and exited 0 by itself"
 rm -f "$RUN"/*.sock
+
+step "startup cpu affinity of every host thread: QDEV_CPU_AFFINITY=CPU, off, a bad list, the default on this CPU"
+mine=$(awk '/^Cpus_allowed_list/ {print $2}' /proc/$$/status); c0=${mine%%[-,]*}; auto=$mine
+[ -r /sys/devices/cpu_core/cpus ] && [ "$mine" = "$(cat /sys/devices/system/cpu/online)" ] && auto=$(cat /sys/devices/cpu_core/cpus)
+for c in "$c0|$c0|cpu affinity $c0 (QDEV_CPU_AFFINITY)" "off|$mine|cpu affinity unchanged (QDEV_CPU_AFFINITY=off)" \
+         "3-1|$mine|cpu affinity unchanged: bad cpu list '3-1'" "|$auto|"; do
+    IFS='|' read -r val want line <<< "$c"
+    if [ -n "$val" ]; then export QDEV_CPU_AFFINITY=$val; else unset QDEV_CPU_AFFINITY; fi
+    start_host aff --plugin plugins/test-v2/test-v2.so --socket "$RUN/dev.sock"
+    got=$(awk '/^Cpus_allowed_list/ {print $2}' /proc/"$(pgrep -P "$PID")"/task/*/status | sort -u | tr '\n' ' ')
+    stop_host; unset QDEV_CPU_AFFINITY
+    if [ -n "$line" ]; then grep -qF "qdev-host: $line" "$OUT/aff.host.log"
+    elif [ "$auto" = "$mine" ] && [ ! -r /sys/devices/cpu_core/cpus ]; then ! grep -q "cpu affinity" "$OUT/aff.host.log"
+    else grep -q "cpu affinity" "$OUT/aff.host.log"; fi
+    r=$?; [ "$got" = "$want " ] || r=1
+    result $r "QDEV_CPU_AFFINITY='$val': threads on $got(want $want), log '$(grep "cpu affinity" "$OUT/aff.host.log")'"
+done
 fi
 
 step "tb-vga ($TBVGA): load, config space, EDID/DISPI/QEXT registers, mode set, VRAM write, PPM"

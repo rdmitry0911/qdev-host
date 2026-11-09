@@ -177,6 +177,18 @@ qdev-host --plugin plugins/tb-vga/tb-vga.so --socket /run/qdev/tbvga0.sock \
 | `--kms-copy` | force the dumb-buffer copy path instead of zero-copy |
 | `--head-origin X,Y`, `--desktop WxH` | guest desktop layout for the pointer on this head (see below) |
 
+**CPU placement.** On a hybrid Intel CPU (`/sys/devices/cpu_core/cpus` exists) qdev-host
+moves itself to the performance cores at startup, before the plugin creates any thread,
+and logs the set (`qdev-host: cpu affinity 0-11 (P-cores, /sys/devices/cpu_core/cpus)`):
+a GPU plugin's translator thread is on the guest's per-frame path and is slower on an
+E-core. A process that is already restricted (`taskset`, a cgroup cpuset) keeps its set,
+other CPUs are left alone. `QDEV_CPU_AFFINITY=off` disables this,
+`QDEV_CPU_AFFINITY=CPULIST` (e.g. `0-11`) sets that list on any host. QEMU, with the
+guest's vCPUs, is placed by its launcher; on Proxmox VE that is the VM's `affinity`
+option (`affinity: 0-11` in the VM config, `qm set VMID --affinity 0-11`, or
+*Processors → Affinity* in the web UI), which covers QEMU only: qdev-host runs in its
+own unit (`qdev-host-device@VMID-ID.service`) and picks its set itself.
+
 ### 2. Start the VM on a stock QEMU
 
 What the VM needs (see `tools/run-guest.sh` for a complete example):

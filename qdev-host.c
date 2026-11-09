@@ -31,6 +31,7 @@
 #include <inttypes.h>
 #include <stdarg.h>
 #include <pthread.h>
+#include <sched.h>
 #include <glib.h>
 #include <glib-unix.h>
 #include <gio/gio.h>
@@ -1505,7 +1506,8 @@ static void usage(void)
         "                           uiinfo W H [WMM HMM]\n"
         "  --kms-copy               force the copy path (no udmabuf zero-copy)\n"
         "  --stats-interval S       print stats every S seconds (SIGUSR2 prints them once)\n"
-        "  -v                       verbose\n");
+        "  -v                       verbose\n"
+        "env QDEV_CPU_AFFINITY=off|CPULIST: hybrid Intel CPUs default to the P-cores (see README)\n");
     exit(2);
 }
 
@@ -1531,6 +1533,92 @@ static void setup_limits(void)
     }
 }
 
+/* "0-11" / "0-5,8,10-11", the kernel's cpulist format; false if malformed or empty */
+static bool parse_cpulist(const char *s, cpu_set_t *set)
+{
+    CPU_ZERO(set);
+    while (*s && *s != '\n') {
+        char *end;
+        unsigned long a = strtoul(s, &end, 10), b = a;
+        if (end == s) return false;
+        if (*end == '-') {
+            s = end + 1;
+            b = strtoul(s, &end, 10);
+            if (end == s || b < a) return false;
+        }
+        if (b >= CPU_SETSIZE) return false;
+        for (unsigned long c = a; c <= b; c++) CPU_SET(c, set);
+        s = end;
+        if (*s == ',') s++;
+        else if (*s && *s != '\n') return false;
+    }
+    return CPU_COUNT(set) > 0;
+}
+
+static void format_cpulist(const cpu_set_t *set, char *buf, size_t len)
+{
+    size_t n = 0;
+    buf[0] = 0;
+    for (int c = 0; c < CPU_SETSIZE && n < len; c++) {
+        if (!CPU_ISSET(c, set)) continue;
+        int e = c;
+        while (e + 1 < CPU_SETSIZE && CPU_ISSET(e + 1, set)) e++;
+        if (e > c) n += snprintf(buf + n, len - n, "%s%d-%d", n ? "," : "", c, e);
+        else       n += snprintf(buf + n, len - n, "%s%d", n ? "," : "", c);
+        c = e;
+    }
+}
+
+/* On a hybrid Intel CPU, run the device process on the performance cores. A GPU
+ * plugin's translator thread (apple-pvg's P0) is on the guest's per-frame
+ * critical path, and under load the scheduler puts it and the plugin's other
+ * threads on the E-cores for a large share of their time. Called before any
+ * thread exists, so every host and plugin thread inherits the set. A process
+ * that is already restricted (taskset, a launcher, a cgroup cpuset) keeps its
+ * set; other CPUs are left alone. QDEV_CPU_AFFINITY=off disables this,
+ * QDEV_CPU_AFFINITY=CPULIST sets that list on any host. */
+static void setup_cpu_affinity(void)
+{
+    const char *env = getenv("QDEV_CPU_AFFINITY"), *why = "QDEV_CPU_AFFINITY";
+    char list[256] = "", have[256];
+    cpu_set_t cur, want;
+
+    if (env && !strcmp(env, "off")) {
+        LOG("cpu affinity unchanged (QDEV_CPU_AFFINITY=off)");
+        return;
+    }
+    if (sched_getaffinity(0, sizeof(cur), &cur) < 0) {
+        LOG("unable to query cpu affinity: %s", strerror(errno));
+        return;
+    }
+    if (env && *env) {
+        snprintf(list, sizeof(list), "%s", env);
+    } else {
+        FILE *f = fopen("/sys/devices/cpu_core/cpus", "r");   /* P-cores; only on a hybrid CPU */
+        if (!f) return;
+        bool ok = fgets(list, sizeof(list), f) != NULL;
+        fclose(f);
+        if (!ok) return;
+        list[strcspn(list, "\n")] = 0;
+        if (CPU_COUNT(&cur) < sysconf(_SC_NPROCESSORS_ONLN)) {
+            format_cpulist(&cur, have, sizeof(have));
+            LOG("cpu affinity %s kept (already restricted; P-cores %s)", have, list);
+            return;
+        }
+        why = "P-cores, /sys/devices/cpu_core/cpus";
+    }
+    if (!parse_cpulist(list, &want)) {
+        LOG("cpu affinity unchanged: bad cpu list '%s' (%s)", list, why);
+        return;
+    }
+    if (sched_setaffinity(0, sizeof(want), &want) < 0 || sched_getaffinity(0, sizeof(cur), &cur) < 0) {
+        LOG("cpu affinity %s (%s): %s", list, why, strerror(errno));
+        return;
+    }
+    format_cpulist(&cur, have, sizeof(have));
+    LOG("cpu affinity %s (%s)", have, why);
+}
+
 int main(int argc, char **argv)
 {
     static const struct option lopts[] = {
@@ -1544,6 +1632,7 @@ int main(int argc, char **argv)
         { "qemu-qmp", 1, 0, 11 }, { "help", 0, 0, 'h' }, { 0 }
     };
     setup_limits();
+    setup_cpu_affinity();
     int c;
     while ((c = getopt_long(argc, argv, "p:s:a:P:B:N:V:D:f:K:Q:S:vh", lopts, NULL)) != -1) {
         switch (c) {
