@@ -1,0 +1,11 @@
+(Reply for the qdev-host thread, if the first post is already up.)
+
+Update, qdev-host 0.6.2: devices now come and go in running macOS guests too.
+
+Since the first post qdev-host got a "TB bus": hot-plug PCIe root ports for QEMU's own devices. PVE's own PCI Device, Network Device and USB Device dialogs get a Bus field, Standard or TB bus, and on the TB bus a passed-through device, a NIC or a QEMU USB controller goes into the running VM and comes out again; USB devices of the node attach to that controller and detach. qdev-host's own devices (tb-vga, virgl-gpu) sit on the same ports.
+
+The part that took longest was macOS. Its PCI driver releases a device only through the attention-button sequence of a slot with a power controller, and it switches such a slot on only when the device's link is down at the hot-plug event, while QEMU reports the link up at once. It still works with stock QEMU: every hot-plug into a macOS VM starts with a short handshake, where a throwaway device with its link down makes macOS switch the slot on, leaves again from the host side, and the real device arrives in a powered slot. Devices arrive in about 15 s and leave in about 7 s, as often as you like. Checked with macOS 26.1 on OpenCore: a USB controller with a USB disk on it (mounted, written, ejected, the controller pulled out and put back, the file still there), a virtio NIC, a second USB controller and an AMD USB 3 controller passed through, all at the same time. Linux guests keep QEMU's defaults.
+
+Upgrade from the signed APT repository (apt update; apt install qdev-host qdev-host-pve), or take the debs from https://github.com/rdmitry0911/qdev-host/releases/tag/v0.6.2. The details are in the README's TB bus section.
+
+Thank you, Dmitry
