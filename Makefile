@@ -42,9 +42,14 @@ ifneq ($(QMETAL_INCLUDE),)
 PLUGINS += plugins/apple-pvg/apple-pvg.so
 endif
 
-all: qdev-host $(PLUGINS) tools/display1-input-bench tools/vfu-test-client
+all: qdev-host $(PLUGINS) tools/display1-input-bench tools/vfu-test-client pve/libqdev-vugpu-guard.so
 
 vfu: $(VFU_LOCAL)/lib/libvfio-user.so.0
+
+# LD_PRELOAD library for QEMU's vhost-user-gpu (the virgl-gpu plugin's process):
+# works around two faults of it (pve/vugpu-guard.c); needs the virglrenderer header.
+pve/libqdev-vugpu-guard.so: pve/vugpu-guard.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -shared $(GLIB_ONLY_CFLAGS) $(shell pkg-config --cflags virglrenderer) -o $@ $< $(LDFLAGS) $(GLIB_ONLY_LIBS) -ldl
 $(VFU_LOCAL)/lib/libvfio-user.so.0: $(wildcard $(VFU_SRC)/lib/*.[ch] $(VFU_SRC)/include/*.h $(VFU_SRC)/include/*/*.h)
 	[ -f build/vfu-build/build.ninja ] || meson setup build/vfu-build $(VFU_SRC) --prefix=$(VFU_LOCAL) --libdir=lib -Dbuildtype=release
 	ninja -C build/vfu-build install >/dev/null
@@ -93,7 +98,7 @@ install: all
 	install -D -m 644 plugins/tb-vga/edid-1280x800.bin $(DESTDIR)$(PREFIX)/share/qdev-host/edid-1280x800.bin
 
 clean:
-	rm -f qdev-host plugins/*/*.so plugins/apple-pvg/selftest tools/display1-input-bench tools/vfu-test-client dbus/dbus-display1.c dbus/dbus-display1.h
+	rm -f qdev-host plugins/*/*.so pve/libqdev-vugpu-guard.so plugins/apple-pvg/selftest tools/display1-input-bench tools/vfu-test-client dbus/dbus-display1.c dbus/dbus-display1.h
 
 distclean: clean
 	rm -rf build

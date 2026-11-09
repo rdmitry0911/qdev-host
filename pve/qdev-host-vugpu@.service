@@ -12,6 +12,9 @@ RuntimeDirectoryMode=0750
 CacheDirectory=qdev-host/%i
 Environment=MESA_SHADER_CACHE_DIR=/var/cache/qdev-host/%i
 Environment=__GL_SHADER_DISK_CACHE_PATH=/var/cache/qdev-host/%i
+# Works around two faults of vhost-user-gpu: a crash when a virgl fence comes during an
+# EDID or display info reply, and a refused GPU socket after a pause or guest reboot.
+Environment=LD_PRELOAD=/usr/lib/qdev-host/libqdev-vugpu-guard.so
 ExecStart=/usr/lib/kvm/vhost-user-gpu $QDEV_ARGS
 Restart=no
 KillSignal=SIGTERM

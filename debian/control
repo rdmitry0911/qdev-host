@@ -9,6 +9,7 @@ Build-Depends: debhelper-compat (= 13),
  libglib2.0-dev,
  libglib2.0-dev-bin,
  libdrm-dev,
+ libvirglrenderer-dev,
  libjson-c-dev,
  libcmocka-dev,
  python3

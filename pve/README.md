@@ -71,8 +71,34 @@ qm stop 990 && qm start 990     # the GPU is on QEMU's command line from the nex
 - **NVIDIA and AMD.** Checked on an AMD Raphael (amdgpu) and an RTX 3080 with the
   proprietary driver 595.91 (its GBM backend): a Kubuntu guest's KWin and SDDM
   render through virgl on the host GPU, where `nvidia-smi` lists the
-  `vhost-user-gpu` process. If the GPU process dies while the VM runs, QEMU cannot
-  reconnect and logs `failed to read msg header` until the VM stops; stop the VM.
+  `vhost-user-gpu` process.
+- **Two faults of vhost-user-gpu, worked around** (from 0.5.4) by
+  `/usr/lib/qdev-host/libqdev-vugpu-guard.so`, which the unit preloads into the
+  process (`pve/vugpu-guard.c`). It uses only virglrenderer's public callbacks and
+  the vhost-user-gpu protocol; QEMU and its binary are unchanged.
+  - *Crash on a fence during an EDID or display info reply.* vhost-user-gpu keeps
+    these requests on its fence queue while QEMU answers, and a virgl fence
+    signalled meanwhile completes and frees them; the reply then finds an empty
+    queue (`segfault at 28` in `get_edid_cb`). Seen with a Plasma guest while a
+    console resized its display. The library holds fence notifications until the
+    reply has been handled.
+  - *GPU socket refused after a pause or a device reset.* QEMU closes its end of
+    the GPU socket whenever it stops the device (`qm suspend`, a backup in suspend
+    mode, a snapshot with RAM, a reboot inside the guest) and sends a new one when
+    it starts it again; vhost-user-gpu refuses it (`assertion 'g->sock_fd == -1'
+    failed`), the display stops, and a later stop ends the process. The library
+    puts the new socket under the old descriptor and answers for QEMU while its end
+    is gone. vhost-user-gpu's own assertion message still appears; the library
+    logs `qdev-host vugpu guard: ...` lines next to it.
+
+  The process picks the library up when the VM next starts. Not covered: commands
+  still running when the guest resets the device, and the contexts and resources
+  virglrenderer keeps from the guest's previous boot; vhost-user-gpu clears
+  neither. A 3D desktop after a reboot inside the guest has not been checked yet;
+  `qm reboot` (or Shutdown and Start) starts a fresh process.
+- **If the GPU process dies anyway**, QEMU cannot reconnect and logs `failed to
+  read msg header` many thousand times a minute until the VM stops: stop the VM.
+  journald keeps its size limit, but the flood pushes older entries out.
 - **Not with the native shared display** of the older QSM preview (`dbus-display: 1`):
   move the VM to QSM Display1 VirGL (Hardware > Display) and its sound to QSM
   Console first. One device per PCIe root port: a GPU and a tb-vga need two buses.
@@ -86,6 +112,16 @@ sets, and the QSM Direct console showed the GPU's output (the guest's console at
 1024x768, captured as dma-buf, encoded with VA-API). Adding and removing the GPU
 gave back the VM's config byte for byte. A 3D application in the guest was not
 run (the test guest has no Mesa).
+
+The guard (0.5.4), on the same node and guest: with a test fence reported during
+every EDID reply (`QDEV_VUGPU_TEST_FENCE_IN_REPLY=edid`), the stock process
+crashed at the same address as on the Plasma VM, and with the guard it held the
+fence and the guest got its 256-byte EDID. Two `qm suspend`/`qm resume` cycles, a
+driver rebind and two reboots inside the guest each replaced the GPU socket; the
+guest initialized its GPU at once with the EDID and logged no errors. Without the
+library each of these lost the display or ended the process. Test switches:
+`QDEV_VUGPU_FENCE_HOLD=0`, `QDEV_VUGPU_SOCKET_GUARD=0`,
+`QDEV_VUGPU_TEST_FENCE_IN_REPLY=1|edid|info` (environment of the unit).
 
 Sockets: `/run/qdev-host/VMID-ID/vfio.sock` (vfio-user) and `display.sock`
 (org.qemu.Display1 p2p). When QSM Direct runs the VM's Display1 bus

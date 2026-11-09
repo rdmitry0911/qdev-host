@@ -419,7 +419,10 @@ clipboard and audio to it automatically.
 Built-in plugin `virgl-gpu`: a VirGL 3D GPU whose rendering runs in QEMU's own
 `vhost-user-gpu` process on a render node of the node, on the VM's command line
 from its next start, as the primary display or an additional GPU, and shown by the
-QSM Direct console ([details](pve/README.md#virgl-3d-gpu-virgl-gpu)).
+QSM Direct console ([details](pve/README.md#virgl-3d-gpu-virgl-gpu)). From 0.5.4 a
+preloaded library works around two faults of `vhost-user-gpu`: a crash when a virgl
+fence comes during an EDID reply, and a GPU socket refused after a VM pause or a
+reboot inside the guest.
 
 Not yet: VMs on another
 cluster node than the one serving the browser, several devices per process, a

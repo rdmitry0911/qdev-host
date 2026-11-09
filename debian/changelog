@@ -1,3 +1,24 @@
+qdev-host (0.5.4) unstable; urgency=medium
+
+  * virgl-gpu: the GPU process (QEMU's vhost-user-gpu) runs with
+    /usr/lib/qdev-host/libqdev-vugpu-guard.so preloaded, which works around
+    two faults of it without changing QEMU:
+    - a virgl fence signalled while QEMU answers an EDID or display info
+      request freed the waiting command, and the reply crashed the process
+      (segfault in get_edid_cb); seen with a Plasma guest during a console
+      resize. Fence notifications are held until the reply is handled.
+    - after a pause (qm suspend, suspend-mode backup, snapshot with RAM) or a
+      reboot inside the guest, the process refused QEMU's new GPU socket, the
+      display stopped and a later stop ended the process. The new socket is
+      put under the old descriptor, and QEMU is answered for while it is away.
+    Takes effect when a VM next starts. Not covered: commands running when
+    the guest resets the device, and virglrenderer state from the guest's
+    previous boot.
+  * Includes 0.5.3 (Hardware panel through the TCP 8006 gateway on a page
+    opened by IP address).
+
+ -- Dmitry R <rdmitry0911@gmail.com>  Mon, 09 Nov 2026 12:10:00 +0200
+
 qdev-host (0.5.3) unstable; urgency=medium
 
   * Hardware panel: through the TCP 8006 gateway the panel's requests use the

@@ -13,7 +13,7 @@ override_dh_auto_configure:
 override_dh_auto_build:
 	ninja -C debian/vfu-build
 	DESTDIR=$(VFU_STAGE) ninja -C debian/vfu-build install
-	$(MAKE) VFU_PREFIX=$(VFU_STAGE)/usr PRIVLIB=$(PRIVLIB) qdev-host plugins/tb-vga/tb-vga.so tools/display1-input-bench
+	$(MAKE) VFU_PREFIX=$(VFU_STAGE)/usr PRIVLIB=$(PRIVLIB) qdev-host plugins/tb-vga/tb-vga.so tools/display1-input-bench pve/libqdev-vugpu-guard.so
 
 override_dh_auto_install:
 	install -D -m 755 qdev-host debian/qdev-host/usr/bin/qdev-host
@@ -24,6 +24,7 @@ override_dh_auto_install:
 	install -D -m 644 plugins/tb-vga/edid-1280x800.bin debian/qdev-host/usr/share/qdev-host/edid-1280x800.bin
 	install -D -m 644 acpi/ssdt-tb.aml debian/qdev-host/usr/share/qdev-host/ssdt-tb.aml
 	install -D -m 644 $(VFU_STAGE)/usr/lib/libvfio-user.so.0 debian/qdev-host/usr/lib/qdev-host/libvfio-user.so.0
+	install -D -m 644 pve/libqdev-vugpu-guard.so debian/qdev-host/usr/lib/qdev-host/libqdev-vugpu-guard.so
 	install -D -m 755 pve/qdevctl debian/qdev-host-pve/usr/sbin/qdevctl
 	install -D -m 644 pve/qdev_pve.py debian/qdev-host-pve/usr/lib/qdev-host/pve/qdev_pve.py
 	install -D -m 755 pve/qdev-host-hook.pl debian/qdev-host-pve/usr/share/qdev-host/pve/qdev-host-hook.pl
