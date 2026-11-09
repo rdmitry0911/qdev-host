@@ -46,8 +46,17 @@
         const user = Proxmox.UserName;
         if (!ticket || !user) { throw new Error('not authenticated'); }
         const headers = { 'Authorization': `Bearer ${ticket}`, 'X-QDev-User': user };
-        const options = () => {
-            const value = { method, mode: 'cors', cache: 'no-store', credentials: 'omit', headers,
+        // Through the gateway the request is same-origin and goes with the page's own
+        // credentials mode, so the browser sends it on the page's connections.  A page
+        // opened by address while the certificate names the node (the user accepted the
+        // warning) is otherwise unusable: Chrome keeps requests without credentials on
+        // separate connections and does not apply the accepted warning to them, so their
+        // TLS handshake fails and fetch reports "Failed to fetch".  The PVE cookie that
+        // then comes along is ignored by the service, which authorises only the
+        // Authorization header.  The service's own port is another origin: no cookie.
+        const options = (gateway) => {
+            const value = { method, mode: 'cors', cache: 'no-store', headers,
+                credentials: gateway ? 'same-origin' : 'omit',
                 signal: AbortSignal.timeout(method === 'GET' ? 15000 : 90000) };
             if (method !== 'GET' && params) {
                 headers['Content-Type'] = 'application/json';
@@ -66,7 +75,7 @@
             const url = `${serviceOrigin()}${path}`;
             failure = null;
             try {
-                const response = await fetch(url, options());
+                const response = await fetch(url, options(gateway));
                 if (gateway && !fromService(response)) {
                     failure = `HTTP ${response.status}${serverOf(response) ? ` from ${serverOf(response)}` : ''}`;
                     warn(`${method} ${url}: the node service did not answer (${failure})`);

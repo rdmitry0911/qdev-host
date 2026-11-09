@@ -1,3 +1,15 @@
+qdev-host (0.5.3) unstable; urgency=medium
+
+  * Hardware panel: through the TCP 8006 gateway the panel's requests use the
+    page's credentials mode, so the browser sends them on the page's own
+    connections. On a page opened by IP address with the certificate's
+    warning accepted (the certificate names the node), Chrome rejected the
+    certificate on the separate connections of requests without credentials,
+    and the panel showed "Failed to fetch". The service still authorises
+    only the Authorization header and ignores the PVE cookie.
+
+ -- Dmitry R <rdmitry0911@gmail.com>  Mon, 09 Nov 2026 09:40:00 +0200
+
 qdev-host (0.5.2) unstable; urgency=medium
 
   * Hardware panel behind QSM Direct's TCP 8006 gateway: one failed or

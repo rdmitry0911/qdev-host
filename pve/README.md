@@ -134,7 +134,12 @@ Device* and *Remove*. Two parts, modelled on QSM Direct's PVE integration:
    where the browser had often not accepted the certificate). The service
    marks its answers with `X-QDev-Host: 1`; the panel logs failed requests to
    the browser console (`qdev-host: ...`). `qsm-pve-direct-gateway routes`
-   lists what is published.
+   lists what is published. Through the gateway the requests go with the
+   page's credentials mode (from 0.5.3), on the page's own connections: with a
+   page opened by IP address and the certificate warning accepted, Chrome
+   rejected the certificate on separate connections without credentials, and
+   the row said "Failed to fetch". The service ignores the PVE cookie that now
+   comes along and authorises only the `Authorization` header.
 
    The panel's GET reads the VM config from `/etc/pve/qemu-server/VMID.conf`
    (pending changes applied, as `qm config` prints it) and the running state
