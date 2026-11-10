@@ -160,7 +160,7 @@ running VM:
 |---|---|---|---|
 | `tb-pci` | PCI pass-through (`vfio-pci`), all functions of a device when the function is left out | `host=0000:06:00.0` or `mapping=NAME`, `rombar`, `romfile`, `vendor-id`... | *Add > PCI Device*, Bus *TB bus* |
 | `tb-net` | network card on a tap of a node bridge | `virtio[=MAC],bridge=vmbr0[,tag=N][,rate=MB/s][,mtu=N][,queues=N]` | *Add > Network Device*, Bus *TB bus* |
-| `tb-xhci` | QEMU's USB 3 controller (`qemu-xhci`) | `ports=N` (USB 2 and USB 3 ports each, default 8) | *Add > qdev-host Device* |
+| `tb-xhci` | QEMU's USB 3 controller (`qemu-xhci`) | `ports=N` (USB 2 and USB 3 ports each, default 8) | with its first USB device: *Add > USB Device*, Bus *TB bus, new USB controller*; the port count in the controller's row (*Edit*) |
 | `tb-usb` | USB device of the node on a `tb-xhci` controller (its bus) | `host=VENDOR:PRODUCT`, `host=BUS-PORT` or `mapping=NAME` | *Add > USB Device*, Bus *TB bus, USB controller ...* |
 
 ```bash

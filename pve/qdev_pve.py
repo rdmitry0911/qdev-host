@@ -54,9 +54,10 @@ BUILTIN_PLUGINS: dict[str, dict] = {
             {"name": "yres", "label": "Height", "type": "int", "default": 800, "min": 480, "max": 4320},
         ],
     },
-    # QEMU's own devices on the TB bus (pve/qdev_tb.py); "dialog" names the PVE dialog that adds them
+    # QEMU's own devices on the TB bus (pve/qdev_tb.py); "dialog" names the PVE dialog that adds them,
+    # so the qdev-host Device dialog does not offer them (it still edits a USB controller's ports)
     "tb-xhci": {
-        "kind": "tb",
+        "kind": "tb", "dialog": "usb",
         "title": "USB controller on the TB bus (qemu-xhci)",
         "description": ("QEMU's USB 3 controller on a hot-plug port of the VM's TB bus, a PCIe root port with "
                         "Thunderbolt ACPI properties. USB devices of this node are then added to it "
@@ -695,8 +696,11 @@ def list_plugins() -> list[dict]:
                     "fields": {"kms": True, "display": True, "persistent": True}})
     for name, meta in BUILTIN_PLUGINS.items():  # after the .so plugins: tb-vga stays the dialog's default
         if plugin_available(name):
-            out.append({"name": name, "kind": meta["kind"], "title": meta["title"],
-                        "description": meta["description"], "args": meta["args"], "fields": meta["fields"]})
+            entry = {"name": name, "kind": meta["kind"], "title": meta["title"],
+                     "description": meta["description"], "args": meta["args"], "fields": meta["fields"]}
+            if meta.get("dialog"):
+                entry["dialog"] = meta["dialog"]
+            out.append(entry)
     return out
 
 def list_kms_outputs() -> list[dict]:

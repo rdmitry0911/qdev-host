@@ -5,8 +5,8 @@
 //
 // The VM must be a running q35 VM with a TB USB controller (qdevctl add VMID tbxhci0 --plugin tb-xhci)
 // and its TB bus present.  Steps: Add > Network Device on the TB bus, Edit it in the same dialog
-// (rate), Add > USB Device USB_DEV on the TB controller, Remove it, open the controller's dialog and
-// Add > PCI Device with the TB bus (neither submitted), Remove the network device.  The VM's other
+// (rate), Add > USB Device USB_DEV on the TB controller, Remove it, open the controller's dialog,
+// check that Add > qdev-host Device offers no TB device, and Add > PCI Device with the TB bus (none submitted), Remove the network device.  The VM's other
 // devices stay.  Needs the playwright package next to this file (or PLAYWRIGHT=/path/node_modules/playwright/index.mjs).
 import fs from 'node:fs';
 const { chromium } = await import(process.env.PLAYWRIGHT || 'playwright');
@@ -102,6 +102,7 @@ try {
     await page.waitForTimeout(2500);
     const usbChoices = await page.evaluate(() => { const c = Ext.WindowManager.getActive().down('#qdevBus'); return c ? c.getStore().getRange().map((r) => `${r.get('value')}=${r.get('label')}`) : null; });
     step(`bus choices: ${JSON.stringify(usbChoices)}`);
+    if (!usbChoices || !usbChoices.some((c) => /^tb:tb/.test(c)) || !usbChoices.some((c) => /^tb:=/.test(c))) await fail('USB Bus choices: an existing TB controller and a new one');
     const usbBefore = await ids(/^USB Device \(tb/);
     await page.evaluate((dev) => { const w = Ext.WindowManager.getActive(); const c = w.down('#qdevBus'); c.setValue(c.getStore().getRange().map((r) => r.get('value')).find((v) => v.startsWith('tb:'))); w.down('radiofield[inputValue=hostdevice]').setValue(true); w.down('[name=hostdevice]').setValue(dev); }, usbDev);
     await page.waitForTimeout(500);
@@ -131,6 +132,15 @@ try {
     const ctl = await page.evaluate(() => { const w = Ext.WindowManager.getActive(); const f = w.down('[qdevArg=ports]'); return { plugin: w.down('[name=plugin]').getValue(), ports: f && f.getValue(), kmsHidden: w.down('[name=kms]').isHidden() }; });
     step(`controller dialog: ${JSON.stringify(ctl)}`);
     if (ctl.plugin !== 'tb-xhci' || !ctl.ports || !ctl.kmsHidden) await fail('USB controller dialog');
+    await page.evaluate(() => Ext.WindowManager.getActive().close());
+
+    step('Add > qdev-host Device: only plugins without a PVE dialog (not submitted)');
+    await addMenu('qdev-host Device');
+    await waitWin(/DeviceEdit/);
+    await page.waitForTimeout(500);
+    const offered = await page.evaluate(() => Ext.WindowManager.getActive().down('[name=plugin]').getStore().getRange().map((r) => r.get('key')));
+    step(`plugins offered: ${JSON.stringify(offered)}`);
+    if (!offered.includes('tb-vga') || offered.some((p) => ['tb-pci', 'tb-net', 'tb-usb', 'tb-xhci'].includes(p))) await fail('qdev-host Device plugin list');
     await page.evaluate(() => Ext.WindowManager.getActive().close());
 
     step('Add > PCI Device: Bus selector (not submitted)');

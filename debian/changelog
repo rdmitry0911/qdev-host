@@ -1,3 +1,20 @@
+qdev-host (0.6.3) unstable; urgency=medium
+
+  * Web UI: Add > qdev-host Device offers only qdev-host's own devices
+    (tb-vga, virgl-gpu, installed plugins) again. The node service dropped
+    the marker of the TB devices that PVE's own dialogs add, so PCI, network
+    and USB devices on the TB bus and the USB controller showed up there too.
+  * The USB Device dialog offers "TB bus, new USB controller" also when the
+    VM has one, so a second controller is added there; a controller's port
+    count is still edited in its row.
+  * Packages the P-core placement committed after 0.6.2: on a hybrid Intel
+    CPU (/sys/devices/cpu_core/cpus) the device process moves itself to the
+    performance cores before any thread starts; an already restricted
+    affinity is kept, QDEV_CPU_AFFINITY=off|CPULIST overrides it, other
+    CPUs are left alone.
+
+ -- Dmitry R <rdmitry0911@gmail.com>  Tue, 10 Nov 2026 11:56:33 +0200
+
 qdev-host (0.6.2) unstable; urgency=medium
 
   * TB bus in macOS guests: hot-unplug as well as hot-plug, repeatedly, with

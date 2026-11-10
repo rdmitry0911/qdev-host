@@ -116,8 +116,9 @@
     // The latest node service answer per VM, for the Edit dialog that PVE opens itself.
     const latestInfo = {};
     // QEMU's own devices on the VM's TB bus (hot-plug PCIe root ports with Thunderbolt
-    // ACPI properties): added in PVE's own PCI, Network and USB dialogs (Bus), the USB
-    // controller as a qdev-host Device
+    // ACPI properties): added in PVE's own PCI, Network and USB dialogs (Bus); a USB
+    // controller comes with a USB device (Bus "TB bus, new USB controller"), and its
+    // row opens the qdev-host Device dialog for the port count
     const TB_KINDS = {
         'tb-pci': { label: 'PCI Device', editor: 'PVE.qemu.PCIEdit', icon: 'cube', prefix: 'tbpci' },
         'tb-net': { label: 'Network Device', editor: 'PVE.qemu.NetworkEdit', icon: 'exchange', prefix: 'tbnet' },
@@ -203,7 +204,8 @@
             if (editDev && editDev.args) {
                 editDev.args.split(',').forEach((kv) => { const i = kv.indexOf('='); if (i > 0) { editArgs[kv.slice(0, i)] = kv.slice(i + 1); } });
             }
-            const plugins = (info.plugins || []).filter((p) => !p.dialog);
+            // devices that PVE's own dialogs add (p.dialog) are not offered here, only edited
+            const plugins = (info.plugins || []).filter((p) => (editDev ? p.name === editDev.plugin : !p.dialog));
             const used = new Set((info.devices || []).map((d) => d.id));
             const freeId = (plugin) => {
                 const base = String(plugin || 'qdev').replace(/[^A-Za-z0-9]/g, '').toLowerCase() || 'qdev';
@@ -508,8 +510,8 @@
     const tbBusChoices = (kind, info) => {
         if (kind !== 'usb') { return [['tb', 'TB bus (qdev-host, hot-plug)']]; }
         const ctrls = (info.devices || []).filter((d) => d.plugin === 'tb-xhci');
-        if (!ctrls.length) { return [['tb:', 'TB bus, new USB controller (qdev-host, hot-plug)']]; }
-        return ctrls.map((c) => [`tb:${c.id}`, `TB bus, USB controller ${c.id} (qdev-host, hot-plug)`]);
+        return ctrls.map((c) => [`tb:${c.id}`, `TB bus, USB controller ${c.id} (qdev-host, hot-plug)`])
+            .concat([['tb:', 'TB bus, new USB controller (qdev-host, hot-plug)']]);
     };
     const tbEditDev = (win) => {
         const key = String(win.confid || '');
