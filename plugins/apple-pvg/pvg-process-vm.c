@@ -547,6 +547,13 @@ static int agfx_eeee_task_remap_shared_fixed_overwrite(
         PVM_REMAP_FAIL("file offset", 0);
         return 0;
     }
+    /* A hugetlbfs fd maps only whole huge pages at huge-page-aligned
+     * addresses (mmap(2)): a smaller alias of it cannot exist. */
+    if (region->fd_page > page_size &&
+        (((file_offset + region_offset) | *address | length) & (region->fd_page - 1))) {
+        PVM_REMAP_FAIL("alias below the huge page of a hugetlb DMA region", 0);
+        return 0;
+    }
 
     /* QMetal calls remap under task_lock. */
     allocation = agfx_eeee_allocation_containing(state, *address, length);
@@ -1233,6 +1240,15 @@ static void agfx_ordinary_physical_capture(void *opaque,
             file_offset + translated_offset > INT64_MAX ||
             piece->length > INT64_MAX - (file_offset + translated_offset) ||
             !agfx_eeee_page_range(file_offset + translated_offset, piece->length)) {
+            goto partial;
+        }
+        /* agfx_source_backing_map_pieces maps each piece MAP_FIXED from the
+         * region fd: of a hugetlbfs fd only whole, aligned huge pages. */
+        if (region->fd_page > page &&
+            (((file_offset + translated_offset) | piece->length | piece->logical_offset) &
+             (region->fd_page - 1) || request->allocation_alignment < region->fd_page)) {
+            pvg_memory_refuse(s, "ordinary_physical_capture", piece->gpa, piece->length,
+                              "piece below the huge page of a hugetlb DMA region");
             goto partial;
         }
         backing = g_new0(AgfxEeeePhysicalBacking, 1);

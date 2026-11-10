@@ -67,6 +67,9 @@ typedef struct PvgRegion {
     uint64_t fd_offset;     /* file offset of iova */
     uint32_t prot;
     uint8_t *map;           /* own MAP_SHARED mapping of [iova, iova + len) */
+    uint8_t *map_base;      /* the mmap() holding it: fd_offset rounded down to fd_page */
+    uint64_t map_len;       /* its length, a multiple of fd_page */
+    uint64_t fd_page;       /* mapping granularity of fd (pvg_fd_page_size) */
     bool in_table;
     uint64_t serial;
 } PvgRegion;
@@ -271,6 +274,10 @@ void pvg_region_ref(PvgState *s, PvgRegion *r);
 void pvg_region_unref(PvgState *s, PvgRegion *r);
 void pvg_memory_refuse(PvgState *s, const char *what, uint64_t gpa, uint64_t size,
                        const char *why);
+/* mapping granularity of a guest-RAM fd: the huge page of a hugetlbfs file
+ * (memfd MFD_HUGETLB, memory-backend-memfd hugetlb=on, a hugetlbfs mem-path),
+ * else the system page */
+uint64_t pvg_fd_page_size(int fd);
 
 /* QMetal memory callbacks */
 void *pvg_map_gpa(void *ctx, uint64_t gpa, size_t size, int writable);

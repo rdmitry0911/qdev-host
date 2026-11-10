@@ -14,11 +14,20 @@
  * Non-RAM targets (no region, or a region without an fd) fail: there is no
  * message-DMA fallback. Every refusal is logged.
  *
+ * A region is mapped in units of its fd's page (pvg_fd_page_size): a
+ * hugetlbfs fd takes mmap offsets and munmap ranges only in whole huge pages
+ * (mmap(2), "Huge page (Huge TLB) mappings"), and QEMU's q35 RAM after the
+ * PAM hole starts at file offset 1 MiB. The plugin maps the enclosing aligned
+ * file range and points into it, as libvfio-user does with its own mapping
+ * (dma.c dma_map_region: offset rounded down to the region page size).
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "pvg.h"
 #include <fcntl.h>
+#include <linux/magic.h>
 #include <sys/mman.h>
+#include <sys/vfs.h>
 #include <unistd.h>
 
 /* depth of the table read section of this thread (nesting, as RCU) */
@@ -100,8 +109,7 @@ void pvg_region_unref(PvgState *s, PvgRegion *r)
         return;
     }
     if (r->map) {
-        uint64_t delta = r->fd_offset % pvg_page_size();
-        munmap(r->map - delta, r->len + delta);
+        munmap(r->map_base, r->map_len);
     }
     if (r->fd >= 0) {
         close(r->fd);
@@ -129,6 +137,19 @@ PvgRegion *pvg_memory_region_from_host(PvgState *s, const void *hva,
     }
     pthread_mutex_unlock(&s->mem.live_lock);
     return found;
+}
+
+uint64_t pvg_fd_page_size(int fd)
+{
+    struct statfs fs;
+    uint64_t page = pvg_page_size();
+
+    if (fd >= 0 && fstatfs(fd, &fs) == 0 && (uint32_t)fs.f_type == HUGETLBFS_MAGIC &&
+        fs.f_bsize > 0 && (uint64_t)fs.f_bsize > page &&
+        ((uint64_t)fs.f_bsize & ((uint64_t)fs.f_bsize - 1)) == 0) {
+        page = (uint64_t)fs.f_bsize;   /* hugetlbfs_statfs: the huge page size */
+    }
+    return page;
 }
 
 void pvg_memory_refuse(PvgState *s, const char *what, uint64_t gpa,
@@ -412,9 +433,10 @@ void pvg_memory_dma_register(PvgState *s, const qdp_dma_region *in)
     r->fd = -1;
     r->fd_offset = in->fd_offset;
     r->prot = in->prot;
+    r->fd_page = pvg_page_size();
     if (in->fd >= 0) {
-        uint64_t delta = in->fd_offset % pvg_page_size();
         int prot = (in->prot & PROT_WRITE) ? PROT_READ | PROT_WRITE : PROT_READ;
+        uint64_t page, delta, map_len = 0;
         void *map;
 
         r->fd = fcntl(in->fd, F_DUPFD_CLOEXEC, 0);
@@ -422,15 +444,32 @@ void pvg_memory_dma_register(PvgState *s, const qdp_dma_region *in)
             pvg_log(s, "[apple-gfx-ml][memory][ERROR] dma_register: dup fd %d: %s\n",
                     in->fd, strerror(errno));
         } else {
-            map = mmap(NULL, in->len + delta, prot, MAP_SHARED, r->fd,
-                       (off_t)(in->fd_offset - delta));
+            page = r->fd_page = pvg_fd_page_size(r->fd);
+            delta = in->fd_offset & (page - 1);
+            if (in->len > UINT64_MAX - delta - (page - 1) ||
+                in->fd_offset - delta > (uint64_t)INT64_MAX) {
+                map = MAP_FAILED;
+                errno = EOVERFLOW;
+            } else {
+                map_len = (in->len + delta + page - 1) & ~(page - 1);
+                map = mmap(NULL, map_len, prot, MAP_SHARED, r->fd,
+                           (off_t)(in->fd_offset - delta));
+            }
             if (map == MAP_FAILED) {
+                int err = errno;
+                char huge[40] = "";
+
+                if (page != pvg_page_size()) {
+                    snprintf(huge, sizeof(huge), " page=0x%" PRIx64, page);
+                }
                 pvg_log(s, "[apple-gfx-ml][memory][ERROR] dma_register: mmap "
-                        "iova=0x%" PRIx64 " len=0x%" PRIx64 ": %s\n",
-                        in->iova, in->len, strerror(errno));
+                        "iova=0x%" PRIx64 " len=0x%" PRIx64 "%s: %s\n",
+                        in->iova, in->len, huge, strerror(err));
                 close(r->fd);
                 r->fd = -1;
             } else {
+                r->map_base = map;
+                r->map_len = map_len;
                 r->map = (uint8_t *)map + delta;
             }
         }
@@ -464,11 +503,21 @@ void pvg_memory_dma_register(PvgState *s, const qdp_dma_region *in)
     r->in_table = true;
     pvg_topology_write_end(s);
 
-    pvg_log(s, "[apple-gfx-ml][memory] dma_register iova=0x%" PRIx64 " len=0x%" PRIx64
-            " fd=%s offset=0x%" PRIx64 " prot=%s%s regions=%u\n",
-            r->iova, r->len, r->map ? "yes" : "no", r->fd_offset,
-            (r->prot & PROT_READ) ? "r" : "-", (r->prot & PROT_WRITE) ? "w" : "-",
-            m->ntab);
+    /* page= only for a region not in system pages: 4 KiB lines stay as they were */
+    if (r->map && r->fd_page != pvg_page_size()) {
+        pvg_log(s, "[apple-gfx-ml][memory] dma_register iova=0x%" PRIx64 " len=0x%" PRIx64
+                " fd=yes offset=0x%" PRIx64 " page=0x%" PRIx64 " mapped=0x%" PRIx64
+                "+0x%" PRIx64 " prot=%s%s regions=%u\n",
+                r->iova, r->len, r->fd_offset, r->fd_page, r->fd_offset - (uint64_t)(r->map - r->map_base),
+                r->map_len, (r->prot & PROT_READ) ? "r" : "-",
+                (r->prot & PROT_WRITE) ? "w" : "-", m->ntab);
+    } else {
+        pvg_log(s, "[apple-gfx-ml][memory] dma_register iova=0x%" PRIx64 " len=0x%" PRIx64
+                " fd=%s offset=0x%" PRIx64 " prot=%s%s regions=%u\n",
+                r->iova, r->len, r->map ? "yes" : "no", r->fd_offset,
+                (r->prot & PROT_READ) ? "r" : "-", (r->prot & PROT_WRITE) ? "w" : "-",
+                m->ntab);
+    }
 }
 
 void pvg_memory_dma_unregister(PvgState *s, const qdp_dma_region *in)

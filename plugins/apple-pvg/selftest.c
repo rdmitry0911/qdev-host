@@ -15,6 +15,13 @@
  *     table, write the stamp back to guest memory and raise the MSI;
  *   - provokes non-RAM accesses and checks they are refused and logged;
  *   - quiesces, changes the map, resumes; checks the scanout and cursor;
+ *   - guest RAM on a hugetlb memfd (memory-backend-memfd hugetlb=on): a
+ *     region at file offset 1 MiB with an unaligned end carries a FIFO
+ *     round trip, and an unregistered region leaves no mapping behind. On a
+ *     real hugetlb memfd when 2 MiB pages are reserved (vm.nr_hugepages >= 4;
+ *     otherwise SKIP, or FAIL with SELFTEST_REQUIRE_HUGETLB=1), and always on
+ *     a TEST DOUBLE that applies the hugetlbfs mmap/munmap rules to a 4 KiB
+ *     memfd;
  *   - runs teardown (the quit stop phase).
  * The QMetal library is the real one; select its Vulkan driver with
  * VK_ICD_FILENAMES. The host services are a test double, not qdev-host.
@@ -38,6 +45,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <time.h>
 #include <unistd.h>
 #include "qdp.h"
@@ -199,6 +207,277 @@ static bool wait_reg(uint32_t off, uint32_t want, double timeout_s)
 #define C_IOVA 0xc0000000ull          /* 1 MiB without fd (message DMA only) */
 #define C_LEN (1 * MiB)
 #define D_IOVA 0x200000000ull         /* registered after the quiesce test */
+/* hugetlb guest RAM: 8 MiB in 2 MiB pages; E as QEMU's q35 RAM after the PAM
+ * hole (file offset 1 MiB) with an end inside a huge page; F only inside the
+ * huge page [2 MiB, 4 MiB) */
+#ifndef HUGETLBFS_MAGIC
+#define HUGETLBFS_MAGIC 0x958458f6
+#endif
+#ifndef MFD_HUGETLB
+#define MFD_HUGETLB 0x0004U
+#endif
+#define HUGE_PAGE (2 * MiB)
+#define HUGE_FILE_SIZE (8 * MiB)
+#define E_IOVA 0x300000000ull
+#define E_FILE_OFF (1 * MiB)
+#define E_LEN (0x580000ull)           /* ends at file offset 6.5 MiB */
+#define E_FIFO_OFF (0x180000ull)      /* FIFO at file offset 2.5 MiB */
+#define F_IOVA_DELTA 0x80000000ull   /* F after E, in its own GPA range */
+#define M_IOVA 0x400000000ull          /* the same layout on the hugetlbfs double */
+#define F_FILE_OFF (3 * MiB)
+#define F_LEN (0x80000ull)
+
+static long read_long_file(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    long v = -1;
+
+    if (f) {
+        if (fscanf(f, "%ld", &v) != 1) {
+            v = -1;
+        }
+        fclose(f);
+    }
+    return v;
+}
+
+/* ------------------------------------- hugetlbfs boundary double (TEST DOUBLE)
+ * A plain 4 KiB memfd presented to the plugin as a hugetlbfs file with 2 MiB
+ * pages, for hosts that cannot reserve huge pages (a container, a fragmented
+ * host): fstatfs() of it reports HUGETLBFS_MAGIC and f_bsize 2 MiB, and
+ * mmap()/munmap() of it apply the rules of mmap(2) "Huge page (Huge TLB)
+ * mappings": the offset must be a multiple of the huge page (else EINVAL), the
+ * length is rounded up to it and the address is huge-page aligned; munmap()
+ * needs an address and a length that are multiples of the huge page. Calls
+ * on any other fd go to libc. Scope: whether the plugin keeps that contract;
+ * this is no evidence of kernel behaviour (the real-hugetlb case is). The
+ * selftest is linked -rdynamic, so these definitions also serve the plugin. */
+static struct {
+    pthread_mutex_t lock;
+    int on, nmaps, mmap_einval, munmap_einval;
+    dev_t dev;
+    ino_t ino;
+    struct { uintptr_t addr; size_t len; } maps[64];
+} mock = { .lock = PTHREAD_MUTEX_INITIALIZER };
+
+static void *(*libc_mmap)(void *, size_t, int, int, int, off_t);
+static int (*libc_munmap)(void *, size_t);
+static int (*libc_fstatfs)(int, struct statfs *);
+
+static void mock_resolve(void)
+{
+    if (!libc_mmap) {
+        *(void **)&libc_munmap = dlsym(RTLD_NEXT, "munmap");
+        *(void **)&libc_fstatfs = dlsym(RTLD_NEXT, "fstatfs");
+        *(void **)&libc_mmap = dlsym(RTLD_NEXT, "mmap");
+    }
+}
+
+static bool mock_fd(int fd)
+{
+    struct stat st;
+
+    return __atomic_load_n(&mock.on, __ATOMIC_ACQUIRE) && fd >= 0 && fstat(fd, &st) == 0 &&
+           st.st_dev == mock.dev && st.st_ino == mock.ino;
+}
+
+static int mock_hugetlb_attach(int fd)
+{
+    struct stat st;
+
+    mock_resolve();
+    if (fd < 0 || fstat(fd, &st) != 0) {
+        return -1;
+    }
+    mock.dev = st.st_dev;
+    mock.ino = st.st_ino;
+    __atomic_store_n(&mock.on, 1, __ATOMIC_RELEASE);
+    return 0;
+}
+
+static int mock_mappings(void)
+{
+    int n;
+
+    pthread_mutex_lock(&mock.lock);
+    n = mock.nmaps;
+    pthread_mutex_unlock(&mock.lock);
+    return n;
+}
+
+int fstatfs(int fd, struct statfs *buf)
+{
+    int r;
+
+    mock_resolve();
+    r = libc_fstatfs(fd, buf);
+    if (r == 0 && mock_fd(fd)) {
+        buf->f_type = HUGETLBFS_MAGIC;
+        buf->f_bsize = HUGE_PAGE;
+    }
+    return r;
+}
+
+void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off)
+{
+    uint8_t *res, *at;
+    size_t want;
+
+    mock_resolve();
+    if (!mock_fd(fd)) {
+        return libc_mmap(addr, len, prot, flags, fd, off);
+    }
+    if ((off & (HUGE_PAGE - 1)) || !len ||
+        ((flags & MAP_FIXED) && ((uintptr_t)addr & (HUGE_PAGE - 1)))) {
+        pthread_mutex_lock(&mock.lock);
+        mock.mmap_einval++;
+        pthread_mutex_unlock(&mock.lock);
+        errno = EINVAL;
+        return MAP_FAILED;
+    }
+    want = (len + HUGE_PAGE - 1) & ~(size_t)(HUGE_PAGE - 1);
+    at = addr;
+    if (!(flags & MAP_FIXED)) {
+        /* a huge-page-aligned address, as hugetlb_get_unmapped_area gives */
+        res = libc_mmap(NULL, want + HUGE_PAGE, PROT_NONE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (res == MAP_FAILED) {
+            return MAP_FAILED;
+        }
+        at = (uint8_t *)(((uintptr_t)res + HUGE_PAGE - 1) & ~(uintptr_t)(HUGE_PAGE - 1));
+        if (at > res) {
+            libc_munmap(res, at - res);
+        }
+        if (res + want + HUGE_PAGE > at + want) {
+            libc_munmap(at + want, res + want + HUGE_PAGE - (at + want));
+        }
+        flags |= MAP_FIXED;
+    }
+    res = libc_mmap(at, want, prot, flags, fd, off);
+    if (res != MAP_FAILED) {
+        pthread_mutex_lock(&mock.lock);
+        if (mock.nmaps < 64) {
+            mock.maps[mock.nmaps].addr = (uintptr_t)res;
+            mock.maps[mock.nmaps].len = want;
+            mock.nmaps++;
+        }
+        pthread_mutex_unlock(&mock.lock);
+    }
+    return res;
+}
+
+int munmap(void *addr, size_t len)
+{
+    uintptr_t a = (uintptr_t)addr;
+
+    mock_resolve();
+    pthread_mutex_lock(&mock.lock);
+    for (int i = 0; i < mock.nmaps; i++) {
+        uintptr_t b = mock.maps[i].addr;
+
+        if (a < b + mock.maps[i].len && b < a + len) {
+            if ((a | len) & (HUGE_PAGE - 1)) {
+                mock.munmap_einval++;
+                pthread_mutex_unlock(&mock.lock);
+                errno = EINVAL;
+                return -1;
+            }
+            if (a <= b && a + len >= b + mock.maps[i].len) {
+                mock.maps[i--] = mock.maps[--mock.nmaps];
+            }
+        }
+    }
+    pthread_mutex_unlock(&mock.lock);
+    return libc_munmap(addr, len);
+}
+
+/* mappings of the real hugetlb memfd in this process (the plugin runs here) */
+static int real_hugetlb_mappings(void)
+{
+    char line[512];
+    FILE *f = fopen("/proc/self/maps", "r");
+    int n = 0;
+
+    while (f && fgets(line, sizeof(line), f)) {
+        n += strstr(line, "/memfd:selftest-guest-ram-hugetlb") != NULL;
+    }
+    if (f) {
+        fclose(f);
+    }
+    return n;
+}
+
+/* Region E at file offset 1 MiB (QEMU's q35 RAM after the PAM hole) with an
+ * end inside a huge page carries a FIFO round trip at a file offset that is
+ * no huge-page multiple; region F, never pinned by QMetal, is registered and
+ * unregistered and must leave no mapping behind (munmap of whole huge pages). */
+static void hugetlb_case(const qdp_device_ops *ops, void *priv, int hfd, uint8_t *huge,
+                         uint64_t iova, const char *what, uint32_t stamp_value)
+{
+    const bool real = strcmp(what, "real hugetlb") == 0;
+    int (*mappings)(void) = real ? real_hugetlb_mappings : mock_mappings;
+    qdp_dma_region e = { iova, E_LEN, huge + E_FILE_OFF, hfd, E_FILE_OFF, PROT_READ | PROT_WRITE };
+    qdp_dma_region f = { iova + F_IOVA_DELTA, F_LEN, huge + F_FILE_OFF, hfd, F_FILE_OFF,
+                         PROT_READ | PROT_WRITE };
+    const uint64_t fifo_gpa = iova + (E_FIFO_OFF - E_FILE_OFF);
+    uint8_t *fifo = huge + E_FIFO_OFF;
+    uint32_t nop[3] = { 0x03, 12, stamp_value }, stamp = 0;
+    int before = get_int(&refusals), maps0, maps1, maps2, delivered0, r;
+    struct stat st;
+
+    memset(huge, 0, HUGE_FILE_SIZE);
+    if (real) {
+        CHECK(fstat(hfd, &st) == 0 && st.st_blksize == (blksize_t)HUGE_PAGE,
+              "%s: memfd %llu MiB, st_blksize 0x%lx", what, HUGE_FILE_SIZE / MiB,
+              (unsigned long)st.st_blksize);
+    }
+    maps0 = mappings();
+    ops->dma_register(priv, &e);
+    CHECK(wait_refusals(before + 1) == before && mappings() == maps0 + 1,
+          "%s: region iova 0x%llx len 0x%llx at file offset 0x%llx mapped by the plugin "
+          "(%d -> %d mappings, %d refusals)", what, (unsigned long long)e.iova,
+          (unsigned long long)E_LEN, (unsigned long long)E_FILE_OFF, maps0, mappings(),
+          get_int(&refusals) - before);
+
+    wr(PVG_REG_SHARED_STATE_PFN, (uint32_t)((iova + 0x40000) >> 12));
+    CHECK(wait_refusals(before + 1) == before, "%s: map_gpa inside the first huge page", what);
+
+    /* QMetal reads the NOP and writes the stamp through the plugin's mapping */
+    msi_enabled = 1;
+    memcpy(fifo + 0x1000, nop, sizeof(nop));
+    memset(fifo, 0, 4);
+    wr(PVG_REG_FIFO_PFN, (uint32_t)(fifo_gpa >> 12));
+    wr(PVG_REG_FIFO_OFFSET, 0x1000);
+    wr(PVG_REG_FIFO_SIZE, 0x10000);
+    wr(PVG_REG_FIFO_ENABLE, 1);
+    delivered0 = get_int(&irq_delivered);
+    wr(PVG_REG_FIFO_WRITE, 12);
+    CHECK(wait_reg(PVG_REG_FIFO_READ, 12, 5.0), "%s: FIFO NOP consumed: FIFO_READ %u", what,
+          rd(PVG_REG_FIFO_READ));
+    for (int i = 0; i < 5000 && get_int(&irq_delivered) == delivered0; i++) {
+        usleep(1000);
+    }
+    memcpy(&stamp, fifo, 4);
+    CHECK(stamp == stamp_value && get_int(&irq_delivered) > delivered0,
+          "%s: stamp 0x%x at file offset 0x%llx (GPA 0x%llx), MSI delivered", what, stamp,
+          (unsigned long long)E_FIFO_OFF, (unsigned long long)fifo_gpa);
+    (void)rd(PVG_REG_EVENT_STAMPS);
+    wr(PVG_REG_FIFO_ENABLE, 0);
+    CHECK(wait_refusals(before + 1) == before, "%s: no refusal during the FIFO round trip (%d)",
+          what, get_int(&refusals) - before);
+
+    ops->dma_register(priv, &f);
+    maps1 = mappings();
+    r = ops->quiesce(priv);
+    ops->dma_unregister(priv, &f);
+    ops->resume(priv);
+    maps2 = mappings();
+    CHECK(r == 0 && wait_refusals(before + 1) == before && maps1 == maps0 + 2 && maps2 == maps1 - 1,
+          "%s: region at file offset 0x%llx, 0x%llx bytes, registered and unregistered: "
+          "%d -> %d mappings", what, (unsigned long long)F_FILE_OFF, (unsigned long long)F_LEN,
+          maps1, maps2);
+    wr(PVG_REG_SHARED_STATE_PFN, 0x100);
+}
 
 int main(int argc, char **argv)
 {
@@ -518,6 +797,46 @@ int main(int argc, char **argv)
               strstr(last_refusal, "gpa=0x100300000") && strstr(last_refusal, "not in a DMA region"),
               "after resume: unregistered region B is refused for new mappings");
         wr(PVG_REG_SHARED_STATE_PFN, 0x100);
+    }
+
+    /* 8b. guest RAM on a hugetlb memfd: a real one when 2 MiB pages are
+     * reserved, and always the hugetlbfs boundary double */
+    {
+        const char *require = getenv("SELFTEST_REQUIRE_HUGETLB");
+        long reserved = read_long_file("/proc/sys/vm/nr_hugepages");
+        long free_pages = read_long_file("/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages");
+        int hfd = memfd_create("selftest-guest-ram-hugetlb",
+                               MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_HUGETLB);
+        uint8_t *huge = MAP_FAILED;
+
+        if (hfd >= 0 && ftruncate(hfd, HUGE_FILE_SIZE) == 0) {
+            fcntl(hfd, F_ADD_SEALS, F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL);
+            huge = mmap(NULL, HUGE_FILE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, hfd, 0);
+        }
+        if (huge == MAP_FAILED) {
+            printf("%s hugetlb guest RAM (real kernel): no 2 MiB hugetlb memfd of %llu MiB (%s; "
+                   "vm.nr_hugepages=%ld free=%ld)\n", require && *require == '1' ? "FAIL" : "SKIP",
+                   HUGE_FILE_SIZE / MiB, strerror(errno), reserved, free_pages);
+            if (require && *require == '1') {
+                failures++;
+                checks++;
+            }
+        } else {
+            hugetlb_case(ops, priv, hfd, huge, E_IOVA, "real hugetlb", 0x2234);
+        }
+
+        hfd = memfd_create("selftest-guest-ram-mock-hugetlb", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+        r = ftruncate(hfd, HUGE_FILE_SIZE);
+        fcntl(hfd, F_ADD_SEALS, F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL);
+        CHECK(hfd >= 0 && r == 0 && mock_hugetlb_attach(hfd) == 0,
+              "TEST DOUBLE: 4 KiB memfd presented as a hugetlbfs file with 2 MiB pages");
+        huge = mmap(NULL, HUGE_FILE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, hfd, 0);
+        if (huge != MAP_FAILED) {
+            hugetlb_case(ops, priv, hfd, huge, M_IOVA, "hugetlb double", 0x3234);
+        }
+        CHECK(mock.mmap_einval == 0 && mock.munmap_einval == 0,
+              "hugetlb double: the plugin made %d mmap and %d munmap calls the hugetlb rules refuse",
+              mock.mmap_einval, mock.munmap_einval);
     }
 
     /* 9. display and cursor */
