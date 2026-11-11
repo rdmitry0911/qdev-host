@@ -19,10 +19,14 @@
  * The QMetal library is the real one; select its Vulkan driver with
  * VK_ICD_FILENAMES. The host services are a test double, not qdev-host.
  *
- * Usage: selftest PLUGIN.so [--personality DEVICE_ID]
- * With --personality, only the PCI identity is checked, then the client
+ * Usage: selftest PLUGIN.so [--personality DEVICE_ID | --fw-identity]
+ * With --personality, only the PCI identity is checked (and that a BAR0
+ * access and a device reset leave it unchanged), then the client
  * connection is dropped (VFU_RESET_LOST_CONN): the plugin must run its quit
  * stop phase and return QDP_RESET_EXIT (exit-on-disconnect); the host exits 0.
+ * With --fw-identity, the firmware-phase identity (fw-vendor-id/fw-device-id)
+ * is checked the same way: 106b:eeee from setup and after every device/FLR
+ * reset, 1b36:eee1 from the first BAR0 access on; then the LOST_CONN exit.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -204,6 +208,7 @@ int main(int argc, char **argv)
 {
     const char *plugin = argc > 1 ? argv[1] : "plugins/apple-pvg/apple-pvg.so";
     unsigned personality = 0;
+    bool fw_identity = false;
     char sock[256], args[1024], cache[256];
     qdp_host_ops host_ops = {
         .size = sizeof(host_ops), .host = NULL, .irq_trigger = host_irq_trigger,
@@ -221,6 +226,10 @@ int main(int argc, char **argv)
 
     if (argc > 3 && !strcmp(argv[2], "--personality")) {
         personality = strtoul(argv[3], NULL, 0);
+    }
+    if (argc > 2 && !strcmp(argv[2], "--fw-identity")) {
+        fw_identity = true;
+        personality = 0xeee1;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
 
@@ -252,7 +261,16 @@ int main(int argc, char **argv)
     if (!ctx) {
         return 1;
     }
-    if (personality) {
+    if (fw_identity) {
+        /* one of the pair alone is refused before any device state exists */
+        snprintf(args, sizeof(args), "log=host,vendor-id=0x1b36,device-id=0xeee1,fw-vendor-id=0x106b,"
+                 "spirv_cache_dir=%s", cache);
+        r = ops->setup(ctx, args, &env, &priv);
+        CHECK(r == -EINVAL && !priv, "fw-vendor-id without fw-device-id refused (%d)", r);
+        snprintf(args, sizeof(args), "xres=1920,yres=1080,vram_size_mb=256,debug=0,log=host,"
+                 "vendor-id=0x1b36,device-id=0xeee1,fw-vendor-id=0x106b,fw-device-id=0xeeee,"
+                 "spirv_cache_dir=%s", cache);
+    } else if (personality) {
         snprintf(args, sizeof(args), "xres=1920,yres=1080,vram_size_mb=256,debug=0,"
                  "log=host,device-id=0x%x,spirv_cache_dir=%s", personality, cache);
     } else {
@@ -281,10 +299,10 @@ int main(int argc, char **argv)
         uint16_t ssvid = cfg[0x2c] | cfg[0x2d] << 8, ssid = cfg[0x2e] | cfg[0x2f] << 8;
         uint32_t bar0 = cfg[0x10] | cfg[0x11] << 8 | cfg[0x12] << 16 | (uint32_t)cfg[0x13] << 24;
         uint8_t cap = cfg[0x34];
-        unsigned expect_did = personality ? personality : 0xeeee;
+        unsigned expect_did = personality && !fw_identity ? personality : 0xeeee;
 
-        CHECK(vid == 0x106b && did == expect_did, "IDs %04x:%04x (want 106b:%04x)", vid, did,
-              expect_did);
+        CHECK(vid == 0x106b && did == expect_did, "IDs %04x:%04x (want 106b:%04x%s)", vid, did,
+              expect_did, fw_identity ? ", the firmware identity" : "");
         CHECK(cfg[8] == 0 && cfg[9] == 0x00 && cfg[0xa] == 0x80 && cfg[0xb] == 0x03,
               "revision %u, class %02x%02x%02x (want 03 80 00)", cfg[8], cfg[0xb], cfg[0xa],
               cfg[9]);
@@ -305,6 +323,34 @@ int main(int argc, char **argv)
         }
     }
 
+#define IDS() ((uint32_t)(cfg[0] | cfg[1] << 8) << 16 | (uint32_t)(cfg[2] | cfg[3] << 8))
+    if (fw_identity) {
+        uint16_t v16 = 0;
+
+        r = ops->reset(priv, VFU_RESET_DEVICE);
+        CHECK(r == 0 && IDS() == 0x106beeee, "device reset before any BAR0 access: %08x (firmware identity)",
+              IDS());
+        (void)rd(PVG_REG_DISPLAY_PORT_COUNT);
+        CHECK(IDS() == 0x1b36eee1, "first BAR0 read switches config space: %08x (want 1b36eee1)", IDS());
+        (void)rd(PVG_REG_DISPLAY_PORT_COUNT);
+        wr(0x3ff0, 0);
+        CHECK(IDS() == 0x1b36eee1, "later BAR0 accesses keep it: %08x", IDS());
+        r = ops->reset(priv, VFU_RESET_DEVICE);
+        CHECK(r == 0 && IDS() == 0x106beeee, "device reset (guest reboot) re-arms: %08x", IDS());
+        /* a refused (2-byte) access counts too: it is still the guest touching BAR0 */
+        bar0_cb(NULL, (char *)&v16, 2, PVG_REG_FIFO_SIZE, true);
+        CHECK(IDS() == 0x1b36eee1, "first BAR0 write (refused size) switches: %08x", IDS());
+        r = ops->reset(priv, VFU_RESET_PCI_FLR);
+        CHECK(r == 0 && IDS() == 0x106beeee, "FLR re-arms: %08x", IDS());
+        CHECK(cfg[0xa] == 0x80 && cfg[0xb] == 0x03 && cfg[0x2c] == 0 && cfg[0x2e] == 0,
+              "class and subsystem unchanged by the identity switch");
+    } else if (personality) {
+        /* without fw-* args nothing switches */
+        (void)rd(PVG_REG_DISPLAY_PORT_COUNT);
+        CHECK(IDS() == (0x106b0000u | personality), "BAR0 access leaves IDs %08x", IDS());
+        r = ops->reset(priv, VFU_RESET_DEVICE);
+        CHECK(r == 0 && IDS() == (0x106b0000u | personality), "device reset leaves IDs %08x", IDS());
+    }
     if (personality) {
         /* The client goes away: with exit-on-disconnect (default on) the
          * plugin runs the quit stop phase and asks the host to exit
