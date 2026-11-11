@@ -23,6 +23,16 @@
  *   vsync=on, direct_scanout=off  passed to QMetal
  *   spirv_cache_dir=PATH          SPIR-V / VkPipelineCache directory
  *   device-id=0xeee1 (x-pci-device-id=), vendor-id= (x-pci-vendor-id=)
+ *   fw-vendor-id=,fw-device-id=   firmware-phase identity (both or neither):
+ *                                 config space carries these ids from setup
+ *                                 and after every device/FLR reset until the
+ *                                 first BAR0 access, then vendor-id/device-id.
+ *                                 For a stock option ROM whose UEFI driver
+ *                                 checks the ids (Apple's AppleParavirtEFI
+ *                                 Supported(): one PciIo->Pci.Read of offset 0,
+ *                                 106b:eeee) while the OS sees the device ids;
+ *                                 that driver's Start() makes the first BAR0
+ *                                 access and reads no ids after it.
  *   log=stderr|host               device log sink (default stderr, the fork's
  *                                 "[apple-gfx-ml]" lines unchanged)
  *   exit-on-disconnect=on         after the client is gone: stop the device
@@ -1744,6 +1754,8 @@ static void pvg_mmio_write(PvgState *s, uint32_t offset, uint32_t value)
  * bytes, aligned, impl 4 bytes little-endian (an 8-byte access is the low
  * dword at offset, then the high dword at offset + 4). Invalid accesses read
  * 0 and drop writes, as QEMU does for a rejected access. */
+static inline void pvg_fw_identity_bar0(PvgState *s, loff_t off, bool is_write);
+
 static ssize_t pvg_bar0_access(vfu_ctx_t *ctx, char *buf, size_t count, loff_t off,
                                bool is_write)
 {
@@ -1751,6 +1763,7 @@ static ssize_t pvg_bar0_access(vfu_ctx_t *ctx, char *buf, size_t count, loff_t o
     static uint64_t invalid;
 
     (void)ctx;
+    pvg_fw_identity_bar0(s, off, is_write);
     if (off < 0 || (count != 4 && count != 8) || ((uint64_t)off & (count - 1)) ||
         (uint64_t)off + count > APPLE_GFX_ML_MMIO_SIZE) {
         if (!is_write) {
@@ -2247,6 +2260,13 @@ static int pvg_parse_args(PvgState *s, const char *args)
             ok = pvg_parse_u32(val, &s->pci_device_id) && s->pci_device_id <= 0xffff;
         } else if (!strcmp(tok, "vendor-id") || !strcmp(tok, "x-pci-vendor-id")) {
             ok = pvg_parse_u32(val, &s->pci_vendor_id) && s->pci_vendor_id <= 0xffff;
+        } else if (!strcmp(tok, "fw-vendor-id")) {
+            ok = pvg_parse_u32(val, &s->fw_vendor_id) && s->fw_vendor_id <= 0xffff &&
+                 s->fw_vendor_id != 0xffff;
+            s->fw_identity = true;
+        } else if (!strcmp(tok, "fw-device-id")) {
+            ok = pvg_parse_u32(val, &s->fw_device_id) && s->fw_device_id <= 0xffff;
+            s->fw_identity = true;
         } else if (!strcmp(tok, "log")) {
             ok = !strcmp(val, "stderr") || !strcmp(val, "host");
             s->log_to_host = !strcmp(val, "host");
@@ -2307,6 +2327,45 @@ static void pvg_pin_libraries(void)
     }
 }
 
+/* Config space ids: the firmware identity while armed, else the device ids. */
+static void pvg_apply_pci_ids(PvgState *s, vfu_ctx_t *ctx)
+{
+    if (s->fw_identity_armed) {
+        vfu_pci_set_id(ctx, (uint16_t)s->fw_vendor_id, (uint16_t)s->fw_device_id, 0, 0);
+    } else {
+        vfu_pci_set_id(ctx, (uint16_t)s->pci_vendor_id, (uint16_t)s->pci_device_id, 0, 0);
+    }
+}
+
+/* Device or FLR reset: the firmware runs again, so it sees its identity again. */
+static void pvg_fw_identity_rearm(PvgState *s, const char *why)
+{
+    if (!s->fw_identity || !s->vfu) {
+        return;
+    }
+    if (!s->fw_identity_armed) {
+        s->fw_identity_armed = true;
+        pvg_apply_pci_ids(s, s->vfu);
+    }
+    pvg_log(s, "[apple-gfx-ml] firmware PCI identity %04x:%04x armed (%s)\n",
+            s->fw_vendor_id, s->fw_device_id, why);
+}
+
+/* The first BAR0 access after a reset ends the firmware identity. */
+static inline void pvg_fw_identity_bar0(PvgState *s, loff_t off, bool is_write)
+{
+    if (G_LIKELY(!s->fw_identity_armed)) {
+        return;
+    }
+    s->fw_identity_armed = false;
+    s->fw_identity_switches++;
+    pvg_apply_pci_ids(s, s->vfu);
+    pvg_log(s, "[apple-gfx-ml] firmware PCI identity %04x:%04x ended by the first BAR0 %s "
+            "off=0x%llx: config space now %04x:%04x (switch #%" PRIu64 ")\n",
+            s->fw_vendor_id, s->fw_device_id, is_write ? "write" : "read", (unsigned long long)off,
+            s->pci_vendor_id, s->pci_device_id, s->fw_identity_switches);
+}
+
 static int pvg_pci_setup(PvgState *s, vfu_ctx_t *ctx)
 {
     struct msicap msi = {
@@ -2320,8 +2379,14 @@ static int pvg_pci_setup(PvgState *s, vfu_ctx_t *ctx)
     if (vfu_pci_init(ctx, VFU_PCI_TYPE_EXPRESS, PCI_HEADER_TYPE_NORMAL, 0) < 0) {
         return -errno;
     }
-    vfu_pci_set_id(ctx, (uint16_t)s->pci_vendor_id, (uint16_t)s->pci_device_id, 0, 0);
+    s->fw_identity_armed = s->fw_identity;
+    pvg_apply_pci_ids(s, ctx);
     vfu_pci_set_class(ctx, 0x03, 0x80, 0x00);
+    if (s->fw_identity) {
+        pvg_log(s, "[apple-gfx-ml] firmware PCI identity %04x:%04x until the first BAR0 access "
+                "after each reset, then %04x:%04x\n", s->fw_vendor_id, s->fw_device_id,
+                s->pci_vendor_id, s->pci_device_id);
+    }
     if (s->pci_vendor_id != APPLE_GFX_ML_VENDOR_ID) {
         pvg_log(s, "[apple-gfx-ml] PCI vendor id overridden to 0x%04x\n", s->pci_vendor_id);
     }
@@ -2481,7 +2546,12 @@ static int pvg_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env, 
     s->vsync_enabled = true;
     s->exit_on_disconnect = true;
     s->display_modes_follow = true;
+    s->fw_vendor_id = s->fw_device_id = UINT32_MAX;   /* "not given" */
     r = pvg_parse_args(s, args);
+    if (!r && s->fw_identity && (s->fw_vendor_id == UINT32_MAX || s->fw_device_id == UINT32_MAX)) {
+        fprintf(stderr, "[apple-gfx-ml] [ERROR] fw-vendor-id and fw-device-id go together\n");
+        r = -EINVAL;
+    }
     if (r) {
         g_free(s);
         return r;
@@ -2629,6 +2699,9 @@ static int pvg_reset(void *priv, vfu_reset_type_t type)
     /* Fork agfx_reset: no device state change; QMetal resets through the
      * guest's MMIO (FIFO_ENABLE 1->0 is the FIFO teardown boundary). */
     pvg_log(s, "[apple-gfx-ml] device reset type=%d: no device state change\n", (int)type);
+    if (type == VFU_RESET_DEVICE || type == VFU_RESET_PCI_FLR) {
+        pvg_fw_identity_rearm(s, type == VFU_RESET_DEVICE ? "device reset" : "FLR");
+    }
     return 0;
 }
 
