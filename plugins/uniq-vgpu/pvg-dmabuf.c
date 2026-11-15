@@ -1,5 +1,5 @@
 /*
- * apple-pvg plugin: udmabuf export of a saved source backing.
+ * uniq-vgpu plugin: udmabuf export of a saved source backing.
  *
  * Port of hw/display/apple-gfx-eeee-source-dmabuf.c (QEMU fork c43589029b),
  * unchanged in policy: the pieces must be page aligned, every file must carry

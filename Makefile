@@ -24,8 +24,8 @@ DRM_LIBS    := $(shell pkg-config --libs libdrm)
 CFLAGS ?= -O2 -g -Wall -Wno-unused-parameter
 PLUGINS := plugins/tb-vga/tb-vga.so plugins/test-v2/test-v2.so
 
-# apple-pvg (Apple ParavirtualizedGraphics GPU) links QMetal's libmlapi.so and
-# is built only when QMETAL_INCLUDE is given:
+# uniq-vgpu (a GPU on the Apple ParavirtualizedGraphics protocol) links
+# QMetal's libmlapi.so and is built only when QMETAL_INCLUDE is given:
 #   make QMETAL_INCLUDE=<qmetal>/include QMETAL_LIBDIR=<dir of libmlapi.so>
 # QMETAL_RPATH (default QMETAL_LIBDIR) is recorded as the plugin's rpath; with
 # QMETAL_RPATH= empty, put libmlapi.so (and its libair2spirv.so.1) on
@@ -33,13 +33,13 @@ PLUGINS := plugins/tb-vga/tb-vga.so plugins/test-v2/test-v2.so
 QMETAL_INCLUDE ?=
 QMETAL_LIBDIR ?=
 QMETAL_RPATH ?= $(QMETAL_LIBDIR)
-APPLE_PVG_SRC := $(addprefix plugins/apple-pvg/,apple-pvg.c pvg-memory.c pvg-process-vm.c pvg-dmabuf.c)
-APPLE_PVG_HDR := plugins/apple-pvg/pvg.h plugins/apple-pvg/pvg-process-vm.h \
-                 $(wildcard plugins/apple-pvg/qmu-private/*.h)
+UNIQ_VGPU_SRC := $(addprefix plugins/uniq-vgpu/,uniq-vgpu.c pvg-memory.c pvg-process-vm.c pvg-dmabuf.c)
+UNIQ_VGPU_HDR := plugins/uniq-vgpu/pvg.h plugins/uniq-vgpu/pvg-process-vm.h \
+                 $(wildcard plugins/uniq-vgpu/qmu-private/*.h)
 GLIB_ONLY_CFLAGS = $(shell pkg-config --cflags glib-2.0)
 GLIB_ONLY_LIBS   = $(shell pkg-config --libs glib-2.0)
 ifneq ($(QMETAL_INCLUDE),)
-PLUGINS += plugins/apple-pvg/apple-pvg.so
+PLUGINS += plugins/uniq-vgpu/uniq-vgpu.so plugins/uniq-vgpu/apple-pvg.so
 endif
 
 all: qdev-host $(PLUGINS) tools/display1-input-bench tools/vfu-test-client pve/libqdev-vugpu-guard.so
@@ -72,24 +72,30 @@ tools/vfu-test-client: tools/vfu-test-client.c $(VFU_DEP)
 plugins/%.so: plugins/%.c qdp.h $(VFU_DEP)
 	$(CC) $(CFLAGS) -fPIC -shared -I. $(VFU_CFLAGS) -o $@ $< $(VFU_LIBS) -lpthread
 
-plugins/apple-pvg/apple-pvg.so: $(APPLE_PVG_SRC) $(APPLE_PVG_HDR) qdp.h $(VFU_DEP)
+plugins/uniq-vgpu/uniq-vgpu.so: $(UNIQ_VGPU_SRC) $(UNIQ_VGPU_HDR) qdp.h $(VFU_DEP)
 	@test -n "$(QMETAL_INCLUDE)" -a -n "$(QMETAL_LIBDIR)" || \
-	    { echo "apple-pvg needs QMETAL_INCLUDE and QMETAL_LIBDIR" >&2; exit 1; }
-	$(CC) $(CFLAGS) -fPIC -shared -pthread -fvisibility=hidden -I. -Iplugins/apple-pvg \
-	    -I$(QMETAL_INCLUDE) $(VFU_CFLAGS) $(GLIB_ONLY_CFLAGS) -o $@ $(APPLE_PVG_SRC) \
+	    { echo "uniq-vgpu needs QMETAL_INCLUDE and QMETAL_LIBDIR" >&2; exit 1; }
+	$(CC) $(CFLAGS) -fPIC -shared -pthread -fvisibility=hidden -I. -Iplugins/uniq-vgpu \
+	    -I$(QMETAL_INCLUDE) $(VFU_CFLAGS) $(GLIB_ONLY_CFLAGS) -o $@ $(UNIQ_VGPU_SRC) \
 	    $(VFU_LIBS) -L$(QMETAL_LIBDIR) -lmlapi $(if $(QMETAL_RPATH),-Wl$(comma)-rpath$(comma)$(QMETAL_RPATH)) \
 	    $(GLIB_ONLY_LIBS) -ldl
 
-# Self-test of the apple-pvg plugin on a vfu context without a VM (see
-# plugins/apple-pvg/README.md). Runs the real libmlapi; select the Vulkan
+# The plugin's former name, kept for one release so that device definitions
+# and scripts that load apple-pvg.so keep working: a symlink to uniq-vgpu.so.
+plugins/uniq-vgpu/apple-pvg.so: plugins/uniq-vgpu/uniq-vgpu.so
+	ln -sfn uniq-vgpu.so $@
+
+# Self-test of the uniq-vgpu plugin on a vfu context without a VM (see
+# plugins/uniq-vgpu/README.md). Runs the real libmlapi; select the Vulkan
 # driver with VK_ICD_FILENAMES (e.g. lavapipe) when no GPU should be used.
-plugins/apple-pvg/selftest: plugins/apple-pvg/selftest.c qdp.h $(VFU_DEP)
+plugins/uniq-vgpu/selftest: plugins/uniq-vgpu/selftest.c qdp.h $(VFU_DEP)
 	$(CC) $(CFLAGS) -pthread -rdynamic -I. -I$(QMETAL_INCLUDE) $(VFU_CFLAGS) -o $@ $< \
 	    $(VFU_LIBS) -ldl
 
-apple-pvg-selftest: plugins/apple-pvg/apple-pvg.so plugins/apple-pvg/selftest
-	plugins/apple-pvg/selftest plugins/apple-pvg/apple-pvg.so
-	plugins/apple-pvg/selftest plugins/apple-pvg/apple-pvg.so --personality 0xeee1
+uniq-vgpu-selftest: plugins/uniq-vgpu/uniq-vgpu.so plugins/uniq-vgpu/apple-pvg.so plugins/uniq-vgpu/selftest
+	plugins/uniq-vgpu/selftest plugins/uniq-vgpu/uniq-vgpu.so
+	plugins/uniq-vgpu/selftest plugins/uniq-vgpu/uniq-vgpu.so --personality 0xeee1
+	plugins/uniq-vgpu/selftest plugins/uniq-vgpu/apple-pvg.so --personality 0xeee1
 
 install: all
 	install -D -m 755 qdev-host $(DESTDIR)$(PREFIX)/bin/qdev-host
@@ -98,11 +104,11 @@ install: all
 	install -D -m 644 plugins/tb-vga/edid-1280x800.bin $(DESTDIR)$(PREFIX)/share/qdev-host/edid-1280x800.bin
 
 clean:
-	rm -f qdev-host plugins/*/*.so pve/libqdev-vugpu-guard.so plugins/apple-pvg/selftest tools/display1-input-bench tools/vfu-test-client dbus/dbus-display1.c dbus/dbus-display1.h
+	rm -f qdev-host plugins/*/*.so pve/libqdev-vugpu-guard.so plugins/uniq-vgpu/selftest tools/display1-input-bench tools/vfu-test-client dbus/dbus-display1.c dbus/dbus-display1.h
 
 distclean: clean
 	rm -rf build
 
 PREFIX ?= /usr/local
 comma := ,
-.PHONY: all clean distclean install vfu apple-pvg-selftest
+.PHONY: all clean distclean install vfu uniq-vgpu-selftest

@@ -1,7 +1,7 @@
 /*
- * apple-pvg plugin: internal declarations shared by its source files.
+ * uniq-vgpu plugin: internal declarations shared by its source files.
  *
- * Port of the apple-gfx-ml device of the apple-virgl QEMU fork
+ * Port of the apple-gfx-ml device of the uniq-vgpu QEMU fork
  * (hw/display/apple-gfx-ml.c and companions at c43589029b) to a qdev-host
  * plugin. The QEMU main loop / BQL of the fork becomes one plugin thread, the
  * "device loop" (agfx-main): every function the fork ran in a main-loop BH
@@ -12,8 +12,8 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
-#ifndef APPLE_PVG_H
-#define APPLE_PVG_H
+#ifndef UNIQ_VGPU_H
+#define UNIQ_VGPU_H
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -314,4 +314,4 @@ void agfx_ordinary_physical_context_retire(AgfxOrdinaryPhysicalContext *context)
 uint32_t agfx_ordinary_physical_compare(const void *, const void *, uint64_t,
     uint64_t, const void *, uint64_t, uint64_t);
 
-#endif /* APPLE_PVG_H */
+#endif /* UNIQ_VGPU_H */

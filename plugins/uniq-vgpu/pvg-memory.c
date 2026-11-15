@@ -1,5 +1,5 @@
 /*
- * apple-pvg plugin: guest memory over the host's DMA regions.
+ * uniq-vgpu plugin: guest memory over the host's DMA regions.
  *
  * Replaces the fork's QEMU memory-API leaves (include/hw/display/
  * apple-gfx-ml-memory.h and the memory callbacks of apple-gfx-ml.c at

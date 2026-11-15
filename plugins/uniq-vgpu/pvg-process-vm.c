@@ -1,5 +1,5 @@
 /*
- * apple-pvg plugin: EEEE process-VM provider (eeee_task_* callbacks), the
+ * uniq-vgpu plugin: EEEE process-VM provider (eeee_task_* callbacks), the
  * native CPU facilities context, and the ordinary physical capture V2.
  *
  * Port of hw/display/apple-gfx-eeee-process-vm.c and the context code of

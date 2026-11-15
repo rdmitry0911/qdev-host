@@ -1570,7 +1570,7 @@ static void format_cpulist(const cpu_set_t *set, char *buf, size_t len)
 }
 
 /* On a hybrid Intel CPU, run the device process on the performance cores. A GPU
- * plugin's translator thread (apple-pvg's P0) is on the guest's per-frame
+ * plugin's translator thread (uniq-vgpu's P0) is on the guest's per-frame
  * critical path, and under load the scheduler puts it and the plugin's other
  * threads on the E-cores for a large share of their time. Called before any
  * thread exists, so every host and plugin thread inherits the set. A process

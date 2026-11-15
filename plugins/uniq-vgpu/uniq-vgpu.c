@@ -1,8 +1,8 @@
 /*
- * apple-pvg plugin for qdev-host: Apple ParavirtualizedGraphics (PVG) PCI
+ * uniq-vgpu plugin for qdev-host: Apple ParavirtualizedGraphics (PVG) PCI
  * personality 106b:eeee (class 03.80), optionally 106b:eee1, served to a
  * stock QEMU through vfio-user-pci. Port of the apple-gfx-ml device of the
- * apple-virgl QEMU fork (hw/display/apple-gfx-ml.c at c43589029b) without its
+ * uniq-vgpu QEMU fork (hw/display/apple-gfx-ml.c at c43589029b) without its
  * env-gated guest-scheduler diagnostics (vCPU state, breakpoints).
  *
  *   PCI   106b:eeee rev 0, no subsystem IDs, class 03.80, PCIe config space,
@@ -510,7 +510,7 @@ static int pvg_scanout_init(PvgState *s, size_t max_frame)
     sc->front = -1;
     sc->held = -1;
     sc->nslots = PVG_SCANOUT_SLOTS;
-    sc->fd = memfd_create("apple-pvg-scanout", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    sc->fd = memfd_create("uniq-vgpu-scanout", MFD_CLOEXEC | MFD_ALLOW_SEALING);
     if (sc->fd < 0 || ftruncate(sc->fd, (off_t)(slot * sc->nslots)) < 0) {
         return -errno;
     }
@@ -2925,7 +2925,7 @@ static int pvg_ui_info(void *priv, const qdp_ui_info *info)
 
 static const qdp_device_ops ops = {
     .abi_version = QDP_ABI_VERSION,
-    .name = "apple-pvg",
+    .name = "uniq-vgpu",
     .version = "0.1",
     .setup = pvg_setup,
     .teardown = pvg_teardown,

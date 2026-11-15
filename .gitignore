@@ -1,7 +1,7 @@
 qdev-host
 plugins/*.so
 plugins/*/*.so
-plugins/apple-pvg/selftest
+plugins/uniq-vgpu/selftest
 dbus/dbus-display1.c
 dbus/dbus-display1.h
 results/

@@ -1,5 +1,5 @@
 /*
- * apple-pvg plugin: saved physical backings and their dma-buf export.
+ * uniq-vgpu plugin: saved physical backings and their dma-buf export.
  *
  * Port of hw/display/apple-gfx-eeee-process-vm.h and
  * apple-gfx-eeee-source-dmabuf.h (QEMU fork c43589029b). A source backing is
@@ -9,8 +9,8 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
-#ifndef APPLE_PVG_PROCESS_VM_H
-#define APPLE_PVG_PROCESS_VM_H
+#ifndef UNIQ_VGPU_PROCESS_VM_H
+#define UNIQ_VGPU_PROCESS_VM_H
 
 #include "pvg.h"
 
@@ -70,4 +70,4 @@ void agfx_eeee_source_dmabuf_ref(AgfxEeeeSourceDmaBuf *export);
 void agfx_eeee_source_dmabuf_unref(AgfxEeeeSourceDmaBuf *export);
 int agfx_eeee_source_dmabuf_fd(const AgfxEeeeSourceDmaBuf *export);
 
-#endif /* APPLE_PVG_PROCESS_VM_H */
+#endif /* UNIQ_VGPU_PROCESS_VM_H */

@@ -10,7 +10,7 @@ Window size -> guest display size: the viewer asks qdev-host for a display of
 the window's size in device pixels (`uiinfo W H WMM HMM` on the control
 socket, as a Display1 SetUIInfo) once the size has not changed for 1 s; F11
 toggles fullscreen and asks at once. The guest re-lays out at that size (an
-ABI 3 plugin such as apple-pvg offers it as the guest's mode); until the guest
+ABI 3 plugin such as uniq-vgpu offers it as the guest's mode); until the guest
 presents at the new size the frame is shown scaled with its aspect kept
 (letterbox), and the pointer maps through the same rectangle. Physical size
 sent: device pixels / (4.8 x scale factor) mm, a provisional policy (4.8 px/mm
@@ -35,7 +35,7 @@ ap.add_argument('--size', default='1600x900'); ap.add_argument('--title', defaul
 ap.add_argument('--guest-size', default=None); ap.add_argument('--no-resize', action='store_true')
 a = ap.parse_args()
 W, H = (int(v) for v in a.size.split('x'))
-MIN_W, MIN_H = 800, 600          # device pixels; the apple-pvg plugin refuses less
+MIN_W, MIN_H = 800, 600          # device pixels; the uniq-vgpu plugin refuses less
 SETTLE_S = 1.0                   # quiet time before a window size is requested
 
 # evdev keycode -> QEMU qnum (AT set 1; extended keys get 0x80|code)

@@ -1,5 +1,5 @@
 /*
- * Self-test of the apple-pvg plugin without a VM.
+ * Self-test of the uniq-vgpu plugin without a VM.
  *
  * Loads the shipped plugin (dlopen, as qdev-host does), runs its setup() on a
  * real libvfio-user context with a host-services double, and acts as the
@@ -206,7 +206,7 @@ static bool wait_reg(uint32_t off, uint32_t want, double timeout_s)
 
 int main(int argc, char **argv)
 {
-    const char *plugin = argc > 1 ? argv[1] : "plugins/apple-pvg/apple-pvg.so";
+    const char *plugin = argc > 1 ? argv[1] : "plugins/uniq-vgpu/uniq-vgpu.so";
     unsigned personality = 0;
     bool fw_identity = false;
     char sock[256], args[1024], cache[256];
@@ -252,8 +252,8 @@ int main(int argc, char **argv)
           "v2 ops and the v3 ui_info present, QDP_F_PLUGIN_DAMAGE set");
 
     /* 2. setup on a real vfu context */
-    snprintf(sock, sizeof(sock), "/tmp/apple-pvg-selftest-%d.sock", getpid());
-    snprintf(cache, sizeof(cache), "/tmp/apple-pvg-selftest-%d.cache", getpid());
+    snprintf(sock, sizeof(sock), "/tmp/uniq-vgpu-selftest-%d.sock", getpid());
+    snprintf(cache, sizeof(cache), "/tmp/uniq-vgpu-selftest-%d.cache", getpid());
     mkdir(cache, 0700);
     ctx = vfu_create_ctx(VFU_TRANS_SOCK, sock, LIBVFIO_USER_FLAG_ATTACH_NB, NULL,
                          VFU_DEV_TYPE_PCI);

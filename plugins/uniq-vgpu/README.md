@@ -1,11 +1,12 @@
-# apple-pvg plugin
+# uniq-vgpu plugin
 
-Apple ParavirtualizedGraphics (PVG) GPU for `qdev-host`: the macOS guest's stock
-`AppleParavirtGPU` binds it as on Apple's hypervisor. Out-of-process port of the
-`apple-gfx-ml` device of the apple-virgl QEMU fork (`hw/display/apple-gfx-ml.c`
-at `c43589029b`), without the fork's env-gated guest-scheduler diagnostics
-(they read vCPU state). Rendering, FIFOs and the guest protocol are in QMetal
-(`libmlapi.so`, unchanged); the plugin is the device glue. Needs a qdp v2 host.
+A GPU for `qdev-host` on the Apple ParavirtualizedGraphics (PVG) protocol: the
+macOS guest's stock `AppleParavirtGPU` binds it as on Apple's hypervisor.
+Out-of-process port of the `apple-gfx-ml` device of the uniq-vgpu QEMU fork
+(`hw/display/apple-gfx-ml.c` at `c43589029b`), without the fork's env-gated
+guest-scheduler diagnostics (they read vCPU state). Rendering, FIFOs and the
+guest protocol are in QMetal (`libmlapi.so`, unchanged); the plugin is the
+device glue. Needs a qdp v2 host.
 
 Guest view: PCI `106b:eeee` rev 0 (or `eee1`), no subsystem IDs, class 03.80,
 PCIe config space with one capability, MSI (1 vector, 64-bit, no mask), no
@@ -29,7 +30,13 @@ Plugin args (`--plugin-args`; the fork's property names are accepted):
 
 Build (QMetal headers and the libmlapi to link against):
 
-    make QMETAL_INCLUDE=<qmetal>/include QMETAL_LIBDIR=<dir of libmlapi.so> plugins/apple-pvg/apple-pvg.so
+    make QMETAL_INCLUDE=<qmetal>/include QMETAL_LIBDIR=<dir of libmlapi.so> plugins/uniq-vgpu/uniq-vgpu.so
+
+The plugin was called `apple-pvg` before. For one release `make` also creates
+`plugins/uniq-vgpu/apple-pvg.so`, a symlink to `uniq-vgpu.so`; install it next
+to `uniq-vgpu.so` (as a symlink, or the same file under the old name) so that
+device definitions and scripts that load `apple-pvg.so` keep working. Loaded
+under either name the plugin reports itself as `uniq-vgpu`.
 
 The plugin gets `QMETAL_LIBDIR` as rpath (`QMETAL_RPATH=` to override or drop).
 `libmlapi.so` itself needs `libair2spirv.so.1`: start qdev-host with the
@@ -59,10 +66,10 @@ cursor (`get_cursor()`) is the fork's ARGB conversion of the guest glyph.
 
 Self-test without a VM (real libmlapi on the GPU; lavapipe cannot open QMetal):
 
-    make QMETAL_INCLUDE=... QMETAL_LIBDIR=... plugins/apple-pvg/apple-pvg.so plugins/apple-pvg/selftest
+    make QMETAL_INCLUDE=... QMETAL_LIBDIR=... plugins/uniq-vgpu/uniq-vgpu.so plugins/uniq-vgpu/selftest
     LD_LIBRARY_PATH=PKG/runtime/lib:PKG/lib VK_ICD_FILENAMES=PKG/runtime/amd/radv-icd.json \
-        plugins/apple-pvg/selftest plugins/apple-pvg/apple-pvg.so
-    ... plugins/apple-pvg/selftest plugins/apple-pvg/apple-pvg.so --personality 0xeee1
+        plugins/uniq-vgpu/selftest plugins/uniq-vgpu/uniq-vgpu.so
+    ... plugins/uniq-vgpu/selftest plugins/uniq-vgpu/uniq-vgpu.so --personality 0xeee1
 
 It loads the plugin on a libvfio-user context with a host-services double,
 checks config space, drives BAR0 (init registers, FIFO setup, a root-FIFO NOP
