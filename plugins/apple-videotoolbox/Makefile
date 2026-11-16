@@ -47,6 +47,13 @@ $(BUILD)/test-aw-session: $(AW_CORE) test_aw_session.c | $(BUILD)
 $(BUILD)/test-aw-bplist: aw_bplist.c aw_bplist.h test_aw_bplist.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ aw_bplist.c test_aw_bplist.c
 
+# debug: emit the engine's real decs ,dec bplist to a file for an independent
+# CF-equivalent parse (python3 -c 'import plistlib; plistlib.load(...)').
+#   make dump-decs && ./build/dump-decs /tmp/dec.plist
+dump-decs: $(BUILD)/dump-decs
+$(BUILD)/dump-decs: aw_wire.c aw_sbuf.c aw_bplist.c aw_session.c dump_decs.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ aw_wire.c aw_sbuf.c aw_bplist.c aw_session.c dump_decs.c
+
 $(BUILD)/test-virtq: vtpv_virtq.c vtpv_proto.c test_virtq.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ vtpv_virtq.c vtpv_proto.c test_virtq.c
 

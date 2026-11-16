@@ -19,7 +19,7 @@ static int g_fail;
 
 /* ---- captured queue-1 emissions ------------------------------------- */
 #define MAXE 32
-static uint8_t g_e[MAXE][1024];
+static uint8_t g_e[MAXE][2048];
 static size_t  g_el[MAXE];
 static int     g_ne;
 static void cap_emit(void *ctx, const uint8_t *m, size_t n) {

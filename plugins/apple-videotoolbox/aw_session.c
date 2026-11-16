@@ -150,9 +150,9 @@ static int build_profile_array(aw_bplist *b, const int *profs, int n)
     return aw_bpl_array(b, refs, n);
 }
 
-/* One decoder-list entry: CMClassImplementationID/Name, VTCodecType [fourcc],
- * VTDecoderCapabilities {VTPerProfileDetails, VTSupportedProfileArray},
- * VTRating 400 (devices.md "What an entry holds"). */
+/* One decoder-list entry: CMClassImplementationID/Name, IsPreferredInternalPlugin
+ * false, VTCodecType [fourcc], VTDecoderCapabilities {VTPerProfileDetails,
+ * VTSupportedProfileArray}, VTRating 400 (devices.md "What an entry holds"). */
 static int build_decoder_entry(aw_bplist *b, uint32_t codec)
 {
     const int *profs; int np, level;
@@ -166,15 +166,17 @@ static int build_decoder_entry(aw_bplist *b, uint32_t codec)
                    build_profile_array(b, profs, np) };
     int dcaps = aw_bpl_dict(b, dck, dcv, 2);
 
-    int ek[5] = { aw_bpl_string(b, "CMClassImplementationID"),
+    int ek[6] = { aw_bpl_string(b, "CMClassImplementationID"),
                   aw_bpl_string(b, "CMClassImplementationName"),
+                  aw_bpl_string(b, "IsPreferredInternalPlugin"),
                   aw_bpl_string(b, "VTCodecType"),
                   aw_bpl_string(b, "VTDecoderCapabilities"),
                   aw_bpl_string(b, "VTRating") };
-    int ev[5] = { aw_bpl_string(b, codec_id(codec)),
+    int ev[6] = { aw_bpl_string(b, codec_id(codec)),
                   aw_bpl_string(b, codec_name(codec)),
+                  aw_bpl_bool(b, 0),            /* IsPreferredInternalPlugin false */
                   vtct, dcaps, aw_bpl_int(b, 400) };
-    return aw_bpl_dict(b, ek, ev, 5);
+    return aw_bpl_dict(b, ek, ev, 6);
 }
 
 /* ,dec: an array of decoder entries, one per codec the backend decodes. */
