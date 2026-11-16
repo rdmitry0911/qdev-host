@@ -49,8 +49,10 @@ endif
 #   make VIDEOTOOLBOX=1
 # Its module unit tests (no VM) run with: make apple-videotoolbox-test
 VT_DIR := plugins/apple-videotoolbox
-VT_SRC := $(addprefix $(VT_DIR)/,apple-videotoolbox.c vtpv_proto.c vtpv_vaapi.c vtpv_h264.c vtpv_virtq.c)
-VT_HDR := $(VT_DIR)/vtpv_proto.h $(VT_DIR)/vtpv_vaapi.h $(VT_DIR)/vtpv_h264.h $(VT_DIR)/vtpv_virtq.h
+VT_SRC := $(addprefix $(VT_DIR)/,apple-videotoolbox.c vtpv_vaapi.c vtpv_h264.c vtpv_virtq.c \
+          aw_wire.c aw_sbuf.c aw_bplist.c aw_session.c)
+VT_HDR := $(addprefix $(VT_DIR)/,vtpv_proto.h vtpv_vaapi.h vtpv_h264.h vtpv_virtq.h \
+          aw_wire.h aw_sbuf.h aw_bplist.h aw_session.h)
 VT_VA_CFLAGS := $(shell pkg-config --cflags libva libva-drm 2>/dev/null)
 VT_VA_LIBS   := $(shell pkg-config --libs libva libva-drm 2>/dev/null)
 ifneq ($(VIDEOTOOLBOX),)
