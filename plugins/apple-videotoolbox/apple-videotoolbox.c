@@ -152,6 +152,16 @@ typedef struct vt_dev {
  * as the other plugins (test-v2) do. */
 static vt_dev *g_dev;
 
+/* format a FourCC as 4 printable chars for logging */
+static void vt_fourcc(uint32_t v, char out[5])
+{
+    for (int i = 0; i < 4; i++) {
+        uint8_t c = (uint8_t)(v >> (24 - 8 * i));
+        out[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+    }
+    out[4] = 0;
+}
+
 static void vt_log(vt_dev *d, int level, const char *fmt, ...)
 {
     va_list ap;
@@ -197,15 +207,21 @@ static void vt_emit(void *ctx, const uint8_t *msg, size_t len)
     vt_dev *d = ctx;
     vtpv_virtq *hq = &d->queues[1];
     uint16_t head = 0; uint32_t written = 0;
+    char fc[5] = "????";
+    if (len >= 8) {
+        uint32_t first = aw_get_be32(msg + 4);
+        if (first == AW_ATOM_RELS) memcpy(fc, "rels", 5);
+        else if (first == AW_ATOM_VTPV && len >= 12) vt_fourcc(aw_get_be32(msg + 8), fc);
+    }
     int rc = vtpv_virtq_put_writable(hq, vt_map, d, msg, len, &head, &written);
     if (rc == 1) {
         vtpv_virtq_retire(hq, vt_map, d, head, written);
         vt_raise(d, 1);
+        vt_log(d, 2, "q1 '%s' (%zu B) -> guest", fc, len);
         if (written < len)
-            vt_log(d, 1, "host->guest message truncated %u/%zu (guest buffer too small)",
-                   written, len);
+            vt_log(d, 1, "q1 '%s' truncated %u/%zu (guest buffer too small)", fc, written, len);
     } else if (rc == 0) {
-        vt_log(d, 1, "host->guest message dropped: no posted queue-1 buffer");
+        vt_log(d, 1, "q1 '%s' DROPPED: no posted queue-1 buffer (guest must pre-post 0x4000 bufs before dsta)", fc);
     } else {
         d->needs_reset = 1;
     }
@@ -244,10 +260,13 @@ static int vt_resolve_buffer(void *ctx, const uint8_t uuid[16], uint64_t mapping
     size_t   csize   = (size_t)ystride * ((h + 1u) / 2u); /* NV12 interleaved UV   */
     uint8_t *p = vt_map(d, mapping_id, ysize + csize);
     if (!p) {
-        vt_log(d, 1, "Dbuf surface %#llx: no guest pages for the lent buffer",
-               (unsigned long long)mapping_id);
+        vt_log(d, 1, "Dbuf surface gpa %#llx: NO guest pages (%zu B) in the DMA regions "
+               "- is the lent buffer in memfd-shared guest RAM?",
+               (unsigned long long)mapping_id, ysize + csize);
         return -1;
     }
+    vt_log(d, 2, "Dbuf surface gpa %#llx resolved: %ux%u NV12, y_stride %u, %zu B",
+           (unsigned long long)mapping_id, w, h, ystride, ysize + csize);
     memset(out, 0, sizeof *out);
     memcpy(out->uuid, uuid, 16);
     out->mapping_id = mapping_id;
@@ -285,6 +304,10 @@ static void vt_process_submission(vt_dev *d)
                                       &wptr, &wcap, &head);
         if (rc != 1) { d->needs_reset = 1; break; } /* malformed ring */
         int32_t status = aw_engine_deliver(d->engine, msg, len); /* emits on q1 */
+        { aw_msg_view mv; char fc[5] = "????";
+          if (aw_parse(msg, len, &mv) == AW_PARSE_OK) vt_fourcc(mv.type, fc);
+          vt_log(d, 2, "q0 '%s' (%zu B, flags %#x) -> status %d", fc, len,
+                 (aw_parse(msg, len, &mv) == AW_PARSE_OK) ? mv.flags : 0, status); }
         uint32_t written = 0;
         if (wptr && wcap >= 4) { memcpy(wptr, &status, 4); written = 4; } /* native i32 */
         vtpv_virtq_retire(sq, vt_map, d, head, written);
