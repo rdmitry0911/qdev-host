@@ -378,8 +378,19 @@ static uint64_t next_req_id(aw_engine *e) { return e->next_reply_id++; }
  * The codec-list dictionaries are binary plists (H4); here we emit a structurally
  * valid reply carrying ,ver 6 and an empty =pls list, which H4 fills from the
  * live VA-API caps. The routing + reply framing are what this slice proves. */
+/* The ,ver to reply with: echo the request's ,ver (the protocol version the
+ * guest speaks), defaulting to 6. Apple's 26.7 host replies a fixed 6, but the
+ * 26.2 guest sends ,ver 5; echoing avoids any "host ver must be <= guest ver"
+ * gate in the guest's registration path. */
+static uint32_t reply_ver(const aw_msg_view *v)
+{
+    uint32_t ver;
+    if (aw_get_u32(v, AW_KEY_VER, &ver) == AW_PARSE_OK) return ver;
+    return 6;
+}
+
 /* Emit a list-style reply: a single `=pls` list/dict body under `list_key`, plus
- * ,ver 6. `pls`/`pls_len` may be an empty list or NULL (pls_len 0). */
+ * ,ver. `pls`/`pls_len` may be an empty list or NULL (pls_len 0). */
 static void emit_list_reply(aw_engine *e, const aw_msg_view *v, uint32_t list_key,
                             const uint8_t *pls, size_t pls_len)
 {
@@ -388,7 +399,7 @@ static void emit_list_reply(aw_engine *e, const aw_msg_view *v, uint32_t list_ke
     aw_builder_init(&b, buf, sizeof buf);
     aw_build_header(&b, v->type, AW_FLAG_HOST_REPLY, v->uuid, v->reply_id);
     aw_put_bytes(&b, list_key, AW_VT_PLS, pls, pls_len);
-    aw_put_u32(&b, AW_KEY_VER, 6);
+    aw_put_u32(&b, AW_KEY_VER, reply_ver(v));
     size_t n = aw_build_finalize(&b);
     if (n) emit(e, buf, n);
 }
@@ -447,7 +458,7 @@ static int32_t handle_opendec(aw_engine *e, const aw_msg_view *v)
     size_t hin_len = build_hin_plist(hin, sizeof hin);
     aw_build_header(&b, v->type, AW_FLAG_HOST_REPLY, v->uuid, v->reply_id);
     aw_put_s32(&b, AW_KEY_ERR, AW_NOERR);  /* codec creation status (deferred to dsta) */
-    aw_put_u32(&b, AW_KEY_VER, 6);
+    aw_put_u32(&b, AW_KEY_VER, reply_ver(v));
     aw_put_bytes(&b, AW_KEY_HIN, AW_VT_PLS, hin, hin_len); /* {VTHostBuildVersion} */
     size_t n = aw_build_finalize(&b);
     if (n) emit(e, buf, n);
