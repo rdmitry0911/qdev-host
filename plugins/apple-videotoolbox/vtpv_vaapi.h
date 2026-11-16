@@ -48,6 +48,16 @@ int vtpv_vaapi_read_luma(vtpv_vaapi *v, uint32_t surface_id,
                          uint8_t *dst, size_t dst_stride,
                          uint32_t width, uint32_t height);
 
+/*
+ * Copy the interleaved NV12 chroma (UV) plane of a decoded surface into dst:
+ * ceil(height/2) rows of `width` bytes (w/2 UV pairs), dst_stride apart. Returns
+ * 0, -ENOTSUP if the surface is not NV12, or <0. Pairs with read_luma to land a
+ * full NV12 frame into the guest's biplanar buffer.
+ */
+int vtpv_vaapi_read_chroma(vtpv_vaapi *v, uint32_t surface_id,
+                           uint8_t *dst, size_t dst_stride,
+                           uint32_t width, uint32_t height);
+
 #ifdef __cplusplus
 }
 #endif

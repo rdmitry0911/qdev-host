@@ -61,6 +61,8 @@ static int resolvebuf(void *c, const uint8_t uuid[16], uint64_t mapid,
 static int copyframe(void *c, const vtpv_decoded_frame *f, const aw_out_buffer *o) {
     bufctx *b = c;
     int rc = vtpv_vaapi_read_luma(b->v, f->surface_id, o->y, o->y_stride, f->width, f->height);
+    if (rc == 0 && o->uv)   /* land the interleaved NV12 chroma too (full frame) */
+        rc = vtpv_vaapi_read_chroma(b->v, f->surface_id, o->uv, o->uv_stride, f->width, f->height);
     if (rc == 0) b->copied = 1;
     return rc;
 }

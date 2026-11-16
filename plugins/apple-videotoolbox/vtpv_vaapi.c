@@ -502,6 +502,37 @@ int vtpv_vaapi_read_luma(vtpv_vaapi *v, uint32_t surface_id,
     return 0;
 }
 
+int vtpv_vaapi_read_chroma(vtpv_vaapi *v, uint32_t surface_id,
+                           uint8_t *dst, size_t dst_stride,
+                           uint32_t width, uint32_t height)
+{
+    surf_entry *e = surf_find(v, surface_id);
+    VAImage image;
+    void *base = NULL;
+    VAStatus st;
+    uint32_t crows = (height + 1) / 2;   /* NV12: ceil(h/2) interleaved UV rows   */
+    uint32_t row;
+
+    if (!e) return -ENOENT;
+    vaSyncSurface(v->dpy, e->va);
+    st = vaDeriveImage(v->dpy, e->va, &image);
+    if (st != VA_STATUS_SUCCESS) return -EIO;
+    /* NV12: plane 1 is the interleaved UV, `width` bytes per row (w/2 UV pairs). */
+    if (image.format.fourcc != VA_FOURCC_NV12 || image.num_planes < 2) {
+        vaDestroyImage(v->dpy, image.image_id);
+        return -ENOTSUP;
+    }
+    st = vaMapBuffer(v->dpy, image.buf, &base);
+    if (st != VA_STATUS_SUCCESS) { vaDestroyImage(v->dpy, image.image_id); return -EIO; }
+    for (row = 0; row < crows; row++)
+        memcpy(dst + row * dst_stride,
+               (uint8_t *)base + image.offsets[1] + row * image.pitches[1],
+               width);
+    vaUnmapBuffer(v->dpy, image.buf);
+    vaDestroyImage(v->dpy, image.image_id);
+    return 0;
+}
+
 void vtpv_vaapi_close(vtpv_vaapi *v)
 {
     if (!v) return;

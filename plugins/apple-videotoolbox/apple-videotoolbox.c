@@ -216,9 +216,11 @@ static int vt_copy_frame(void *ctx, const vtpv_decoded_frame *f, const aw_out_bu
 {
     vt_dev *d = ctx;
     if (!d->va || !b->y) return -1;
-    /* land the luma plane into the guest's buffer (pixel-verified path). The NV12
-     * chroma readback is a one-helper backend follow-on (vtpv_vaapi_read_chroma). */
-    return vtpv_vaapi_read_luma(d->va, f->surface_id, b->y, b->y_stride, f->width, f->height);
+    /* land the full NV12 frame: Y plane, then the interleaved UV plane. */
+    int rc = vtpv_vaapi_read_luma(d->va, f->surface_id, b->y, b->y_stride, f->width, f->height);
+    if (rc == 0 && b->uv)
+        rc = vtpv_vaapi_read_chroma(d->va, f->surface_id, b->uv, b->uv_stride, f->width, f->height);
+    return rc;
 }
 static void vt_put_buffer(void *ctx, const aw_out_buffer *b) { (void)ctx; (void)b; }
 
