@@ -74,8 +74,16 @@
 #define VIRTIO_F_RING_EVENT_IDX (1ull << 29)
 #define VIRTIO_F_VERSION_1      (1ull << 32)
 #define VIRTIO_F_RING_PACKED    (1ull << 34)
+/* NOTE: we do NOT advertise VIRTIO_F_RING_EVENT_IDX (29). We never maintain the
+ * used-ring `avail_event` field (vtpv_virtq_retire does not write it), so under
+ * EVENT_IDX the guest's stock AppleVirtIO transport uses a stale avail_event and
+ * suppresses the 2nd queue-0 notification. Proven live on macOS 26.2 (25C56):
+ * with EVENT_IDX offered, the VTDecoderXPCService's own `decs` query (spawned by
+ * a require-hw VTDecompressionSessionCreate) never kicks the host and times out
+ * (kIOReturnTimeout 0xe00002d6); with it dropped, both decs round-trips land.
+ * (Re-add only together with a correct avail_event write in vtpv_virtq_retire.) */
 #define VT_DEVICE_FEATURES \
-    (VIRTIO_F_INDIRECT_DESC | VIRTIO_F_RING_EVENT_IDX | VIRTIO_F_VERSION_1)
+    (VIRTIO_F_INDIRECT_DESC | VIRTIO_F_VERSION_1)
 
 /* virtio-modern PCI capability list (virtio 1.x §4.1.4). A virtio-modern driver
  * (Apple's AppleVirtIOPCITransport) reads these vendor caps to LOCATE the
