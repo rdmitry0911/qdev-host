@@ -757,7 +757,9 @@ int32_t aw_engine_deliver(aw_engine *e, const uint8_t *msg, size_t len)
     case AW_MSG_DFRM: return handle_dfrm(e, s, &v);
     case AW_MSG_DCAN: return handle_dcan(e, s, &v);
     case AW_MSG_DINV: return handle_dinv(e, s, &v);
-    case AW_MSG_DFIN: return reply_err(e, &v, AW_ERR_UNIMPLEMENTED); /* -12782    */
+    case AW_MSG_DFIN: return reply_err(e, &v, AW_NOERR); /* finish/flush: frames
+                                        complete synchronously on the Dbuf reply,
+                                        so a drain has nothing outstanding -> noErr */
     case AW_MSG_DSUP: return reply_err(e, &v, AW_NOERR);
     case AW_MSG_DCOP:
     case AW_MSG_DSET: return reply_err(e, &v, AW_NOERR);

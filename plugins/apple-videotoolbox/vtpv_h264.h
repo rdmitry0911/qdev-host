@@ -78,6 +78,22 @@ typedef struct h264_nal {
 /* Split Annex-B bytes into NAL units. Returns the count (<= H264_MAX_NALS). */
 int h264_split_nals(const uint8_t *buf, size_t len, h264_nal *out, int max);
 
+/* Split an avcC/ISO-BMFF length-prefixed access unit (each NAL is a
+ * `nal_length_size`-byte big-endian length then that many NAL bytes) into NAL
+ * units (pointers into the input, length prefix excluded). Returns the count. */
+int h264_split_avcc_nals(const uint8_t *buf, size_t len, int nal_length_size,
+                         h264_nal *out, int max);
+
+/* 1 if `buf` begins with an Annex-B start code (00 00 01 or 00 00 00 01). */
+int h264_is_annexb(const uint8_t *buf, size_t len);
+
+/* Parse an avcC decoder-configuration record (the avcC/hvcC box payload the
+ * guest's ImageDescription carries). On success returns 0, points `*sps`/`*pps`
+ * at the first SPS and PPS NAL bytes inside `avcc` (NAL header first, no length
+ * prefix) and sets `*nal_length_size` (1..4). <0 if not a well-formed avcC. */
+int h264_parse_avcc(const uint8_t *avcc, size_t len,
+                    h264_nal *sps, h264_nal *pps, int *nal_length_size);
+
 /* Parse. Each returns 0 on success, <0 on malformed. `nal` points at the NAL
  * header byte (start code excluded). */
 int h264_parse_sps(const h264_nal *nal, h264_sps *sps);

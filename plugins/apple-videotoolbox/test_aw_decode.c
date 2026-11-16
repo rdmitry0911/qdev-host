@@ -245,6 +245,83 @@ int main(int argc, char **argv) {
         CHECK(bad == 0, "decoded luma landed in the guest buffer, byte-exact");
     }
 
+    /* ---- LIVE-WIRE FRAMING: avcC param sets + length-prefixed slice-only AU.
+     * The in-guest VideoToolbox does NOT inline SPS/PPS in the access unit; it
+     * sends them once in the dsta avcC and then delivers slice-only, 4-byte
+     * length-prefixed (avcC/ISO) access units in dfrm. Exercise exactly that so
+     * the live wire->VA-API assembly stays covered (regression for
+     * L-GVA-DECODECONTENT). */
+    {
+        /* extract the IDR slice NAL from the Annex-B stream and reframe it as a
+         * single 4-byte-length-prefixed avcC AU (no SPS/PPS, no start codes) */
+        h264_nal nals[H264_MAX_NALS];
+        int nn = h264_split_nals(bs, bslen, nals, H264_MAX_NALS);
+        const h264_nal *slice = NULL;
+        for (int i = 0; i < nn; i++) {
+            int t = nals[i].data[0] & 0x1f;
+            if (t == 5 || t == 1) { slice = &nals[i]; break; }
+        }
+        CHECK(slice != NULL, "found the IDR slice NAL to reframe as avcC");
+
+        uint8_t uuid2[16]; memset(uuid2, 0x7b, 16);
+
+        /* +dec */
+        aw_builder_init(&b, msg, (1u << 20) + 512);
+        aw_build_header(&b, AW_MSG_PDEC, AW_FLAG_GUEST_REQ, uuid2, 20);
+        aw_put_s32(&b, AW_KEY_COD, (int32_t)AW_4CC('a','v','c','1'));
+        aw_put_u32(&b, AW_KEY_VER, 6);
+        n = aw_build_finalize(&b);
+        CHECK(aw_engine_deliver(e, msg, n) == AW_NOERR, "avcC: +dec accepted");
+
+        /* dsta: the SAME fds/avcC (carries SPS/PPS) */
+        aw_builder_init(&b, msg, (1u << 20) + 512);
+        aw_build_header(&b, AW_MSG_DSTA, AW_FLAG_GUEST_REQ, uuid2, 21);
+        aw_put_bytes(&b, AW_KEY_FDS, AW_VT_FDS, fds, fds_len);
+        n = aw_build_finalize(&b);
+        CHECK(aw_engine_deliver(e, msg, n) == AW_NOERR, "avcC: dsta accepted");
+
+        /* dfrm: sdat = [4-byte BE length][slice NAL], slice only */
+        uint8_t *au = malloc(slice->size + 4);
+        if (!au) { printf("OOM\n"); return 1; }
+        aw_put_be32(au, (uint32_t)slice->size);
+        memcpy(au + 4, slice->data, slice->size);
+        size_t sbf2_len = aw_sbuf_write(sbf, (1u << 20) + 64, NULL, au, slice->size + 4);
+        CHECK(sbf2_len > 0, "avcC: built sbuf{sdat=length-prefixed slice} (%zu B)", sbf2_len);
+
+        aw_builder_init(&b, msg, (1u << 20) + 512);
+        aw_build_header(&b, AW_MSG_DFRM, AW_FLAG_GUEST_REQ, uuid2, 22);
+        aw_put_s64(&b, AW_KEY_FRM, 0);
+        aw_put_bytes(&b, AW_KEY_SBF, AW_VT_SBF, sbf, sbf2_len);
+        aw_put_u32(&b, AW_KEY_DFL, 1);
+        n = aw_build_finalize(&b);
+        CHECK(aw_engine_deliver(e, msg, n) == AW_NOERR, "avcC: dfrm accepted");
+
+        /* Dbuf reply -> decode into a fresh guest offset */
+        const uint64_t OFF2 = 0x40000;
+        bc.copied = 0;
+        n = guest_dbuf_reply(msg, (1u << 20) + 512, uuid2, OFF2);
+        aw_engine_deliver(e, msg, n);
+        CHECK(bc.copied == 1, "avcC: live-framed AU decoded into the guest buffer");
+        if (bc.copied) {
+            const uint8_t *gy = guest_ram + OFF2;
+            uint32_t ys = bc.ystride;
+            size_t bad = 0;
+            for (int y = 0; y < H; y++)
+                for (int x = 0; x < W; x++)
+                    if (gy[(size_t)y * ys + x] != luma_ref[y * W + x]) bad++;
+            printf("  avcC live-framing -> NV12 luma: %zu/%d mismatches\n", bad, W * H);
+            CHECK(bad == 0, "avcC live-framed decode byte-exact to reference");
+        }
+        /* Demt + close */
+        n = guest_demt_reply(msg, (1u << 20) + 512, uuid2);
+        aw_engine_deliver(e, msg, n);
+        aw_builder_init(&b, msg, (1u << 20) + 512);
+        aw_build_header(&b, AW_MSG_MDEC, AW_FLAG_GUEST_REQ, uuid2, 23);
+        n = aw_build_finalize(&b);
+        aw_engine_deliver(e, msg, n);
+        free(au);
+    }
+
     /* -dec (close) */
     aw_builder_init(&b, msg, (1u << 20) + 512);
     aw_build_header(&b, AW_MSG_MDEC, AW_FLAG_GUEST_REQ, uuid, 13);

@@ -62,6 +62,13 @@ typedef struct vaapi_dec {
     VASurfaceID pool[DEC_POOL];
     int         n_pool;
     int         next;
+    /* H.264 config param sets from the avcC the ImageDescription carried at
+     * dsta (the live wire delivers SPS/PPS here, NOT inline in the access unit).
+     * nal_length_size is the avcC length-prefix width for the access unit. */
+    h264_sps    cfg_sps;
+    h264_pps    cfg_pps;
+    int         have_cfg_sps, have_cfg_pps;
+    int         nal_length_size;
 } vaapi_dec;
 
 static int g_debug; /* VTPV_DEBUG=1 logs VA errors to stderr */
@@ -179,7 +186,6 @@ static int va_open_decoder(void *ctx, uint32_t codec, uint32_t w, uint32_t h,
     vaapi_dec *d;
     VAConfigAttrib attrib;
     VAStatus st;
-    (void)extradata; (void)ed_len;
 
     if ((codec == VTPV_CODEC_H264 && !v->has_h264) ||
         (codec == VTPV_CODEC_HEVC && !v->has_hevc))
@@ -190,6 +196,25 @@ static int va_open_decoder(void *ctx, uint32_t codec, uint32_t w, uint32_t h,
     d->v = v; d->codec = codec; d->width = w; d->height = h;
     d->profile = pick_profile(codec);
     d->config = VA_INVALID_ID; d->context = VA_INVALID_ID;
+    d->nal_length_size = 4; /* avcC default (lengthSizeMinusOne=3) */
+
+    /* Capture the SPS/PPS the avcC carries. On the live wire the guest's
+     * VideoToolbox puts the parameter sets ONLY in this ImageDescription avcC
+     * and delivers slice-only, length-prefixed access units in dfrm; nothing
+     * inline in the AU. Parse+keep them so h264_decode can build the VA picture
+     * parameters even when the AU has no inline SPS/PPS. */
+    if (codec == VTPV_CODEC_H264 && extradata && ed_len > 0) {
+        h264_nal sps_nal, pps_nal;
+        int nls = 4;
+        if (h264_parse_avcc(extradata, ed_len, &sps_nal, &pps_nal, &nls) == 0) {
+            d->nal_length_size = nls;
+            if (h264_parse_sps(&sps_nal, &d->cfg_sps) == 0) {
+                d->have_cfg_sps = 1;
+                if (h264_parse_pps(&pps_nal, &d->cfg_sps, &d->cfg_pps) == 0)
+                    d->have_cfg_pps = 1;
+            }
+        }
+    }
 
     attrib.type = VAConfigAttribRTFormat;
     attrib.value = 0;
@@ -260,16 +285,29 @@ static int h264_decode(vaapi_dec *d, const uint8_t *sample, size_t len,
     VABufferID buf[4] = { VA_INVALID_ID, VA_INVALID_ID, VA_INVALID_ID, VA_INVALID_ID };
     VAStatus st;
 
-    nn = h264_split_nals(sample, len, nals, H264_MAX_NALS);
+    /* The access unit is either Annex-B (start codes, e.g. a hand-built stream
+     * that inlines its own SPS/PPS) or avcC/ISO length-prefixed (the live wire:
+     * slice-only NALs, parameter sets delivered out of band in the dsta avcC).
+     * Split by the framing actually present. */
+    if (h264_is_annexb(sample, len))
+        nn = h264_split_nals(sample, len, nals, H264_MAX_NALS);
+    else
+        nn = h264_split_avcc_nals(sample, len,
+                                  d->nal_length_size ? d->nal_length_size : 4,
+                                  nals, H264_MAX_NALS);
     for (i = 0; i < nn; i++) {
         int t = nals[i].size ? (nals[i].data[0] & 0x1f) : 0;
         if (t == 7 && h264_parse_sps(&nals[i], &sps) == 0) have_sps = 1;
         else if (t == 8 && have_sps && h264_parse_pps(&nals[i], &sps, &pps) == 0) have_pps = 1;
         else if ((t == 5 || t == 1) && slice_idx < 0) slice_idx = i;
     }
+    /* Fall back to the avcC-configured parameter sets for anything the access
+     * unit did not carry inline. */
+    if (!have_sps && d->have_cfg_sps) { sps = d->cfg_sps; have_sps = 1; }
+    if (!have_pps && d->have_cfg_pps) { pps = d->cfg_pps; have_pps = 1; }
     if (!have_sps || !have_pps || slice_idx < 0) {
-        VDBG("h264: missing sps/pps/slice (sps=%d pps=%d slice=%d)",
-             have_sps, have_pps, slice_idx);
+        VDBG("h264: missing sps/pps/slice (sps=%d pps=%d slice=%d, nals=%d)",
+             have_sps, have_pps, slice_idx, nn);
         return VTPV_ERR_MALFORMED;
     }
     if (h264_parse_slice_header(&nals[slice_idx], &sps, &pps, &sh) != 0) {

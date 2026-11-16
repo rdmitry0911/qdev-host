@@ -70,6 +70,14 @@ $(BUILD)/test-h264: $(BACKEND) h264_gen.c test_h264.c | $(BUILD)
 $(BUILD)/test-aw-decode: $(AW_CORE) $(BACKEND) h264_gen.c test_aw_decode.c | $(BUILD)
 	$(CC) $(CFLAGS) $(VA_CFLAGS) -o $@ $(AW_CORE) $(BACKEND) h264_gen.c test_aw_decode.c $(VA_LIBS)
 
+# L-GVA-DECODECONTENT: replay LIVE-captured Apple-wire bytes (avcC param sets +
+# avcC-framed slice-only AU) through the engine + live VA-API. Not in `make test`
+# (needs the captured fixtures); run manually:
+#   make build/test-aw-replay && ./build/test-aw-replay \
+#     /dev/dri/renderD128 <avcc.bin> <sample.bin> <luma_ref.bin> 352 288
+$(BUILD)/test-aw-replay: $(AW_CORE) $(BACKEND) test_aw_replay.c | $(BUILD)
+	$(CC) $(CFLAGS) $(VA_CFLAGS) -o $@ $(AW_CORE) $(BACKEND) test_aw_replay.c $(VA_LIBS)
+
 $(BUILD)/apple-videotoolbox.so: apple-videotoolbox.c $(AW_CORE) $(BACKEND) | $(BUILD)
 	$(CC) $(CFLAGS) -Wno-unused-parameter -fPIC -shared $(QDP_INC) $(VFU_INC) $(VA_CFLAGS) \
 	    -o $@ apple-videotoolbox.c $(AW_CORE) $(BACKEND) $(VA_LIBS)

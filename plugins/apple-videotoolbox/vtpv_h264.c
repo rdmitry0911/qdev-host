@@ -88,6 +88,68 @@ int h264_split_nals(const uint8_t *buf, size_t len, h264_nal *out, int max)
     return n;
 }
 
+int h264_is_annexb(const uint8_t *buf, size_t len)
+{
+    if (len >= 3 && buf[0] == 0 && buf[1] == 0 && buf[2] == 1) return 1;
+    if (len >= 4 && buf[0] == 0 && buf[1] == 0 && buf[2] == 0 && buf[3] == 1) return 1;
+    return 0;
+}
+
+int h264_split_avcc_nals(const uint8_t *buf, size_t len, int nal_length_size,
+                         h264_nal *out, int max)
+{
+    int n = 0;
+    size_t i = 0;
+    if (nal_length_size < 1 || nal_length_size > 4) return 0;
+    while (i + (size_t)nal_length_size <= len && n < max) {
+        size_t sz = 0;
+        for (int k = 0; k < nal_length_size; k++)
+            sz = (sz << 8) | buf[i + k];
+        i += (size_t)nal_length_size;
+        if (sz == 0 || i + sz > len) break;   /* truncated / malformed length */
+        out[n].data = buf + i;
+        out[n].size = sz;
+        n++;
+        i += sz;
+    }
+    return n;
+}
+
+/* avcC record: [1]configurationVersion [1]profile [1]compat [1]level
+ * [1](6 reserved | 2 lengthSizeMinusOne) [1](3 reserved | 5 numSPS)
+ * then numSPS * ([2]len [len]SPS), [1]numPPS, then numPPS * ([2]len [len]PPS). */
+int h264_parse_avcc(const uint8_t *avcc, size_t len,
+                    h264_nal *sps, h264_nal *pps, int *nal_length_size)
+{
+    if (!avcc || len < 7 || avcc[0] != 1) return -1;
+    if (nal_length_size) *nal_length_size = (avcc[4] & 3) + 1;
+    size_t off = 5;
+    int num_sps = avcc[off++] & 0x1f;
+    if (sps) { sps->data = NULL; sps->size = 0; }
+    if (pps) { pps->data = NULL; pps->size = 0; }
+    for (int i = 0; i < num_sps; i++) {
+        if (off + 2 > len) return -1;
+        size_t sl = ((size_t)avcc[off] << 8) | avcc[off + 1];
+        off += 2;
+        if (off + sl > len) return -1;
+        if (i == 0 && sps) { sps->data = avcc + off; sps->size = sl; }
+        off += sl;
+    }
+    if (off >= len) return -1;
+    int num_pps = avcc[off++];
+    for (int i = 0; i < num_pps; i++) {
+        if (off + 2 > len) return -1;
+        size_t pl = ((size_t)avcc[off] << 8) | avcc[off + 1];
+        off += 2;
+        if (off + pl > len) return -1;
+        if (i == 0 && pps) { pps->data = avcc + off; pps->size = pl; }
+        off += pl;
+    }
+    if (sps && !sps->data) return -1;
+    if (pps && !pps->data) return -1;
+    return 0;
+}
+
 /* ---- parsers -------------------------------------------------------- */
 
 int h264_parse_sps(const h264_nal *nal, h264_sps *sps)
