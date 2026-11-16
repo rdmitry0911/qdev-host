@@ -167,27 +167,57 @@ static void vt_emit(void *ctx, const uint8_t *msg, size_t len)
     }
 }
 
-/* ---- the decoded-output buffer seam (the guest lends it via Dbuf) ---- *
- * resolve_buffer turns a guest-lent surface (its mapping id) into host-addressable
- * NV12 planes. The guest->host IOSurface mapping is the QMetal surface-sharing
- * seam, deferred (FIX-CANDIDATE §4.7 / H2): until it lands the host cannot write
- * into a real guest buffer, so this returns <0 and the engine drops the frame
- * after emitting the Dbuf request + the early dfrm reply. Everything up to that
- * point (decs/dcap/+dec/dsta->Dpba, the Dbuf request, the inline statuses, the
- * queue-1 ring) runs end to end on the real queues. */
+/* ---- H2: the decoded-output buffer seam (the guest lends it via Dbuf) --- *
+ * resolve_buffer turns the guest-lent output surface (named by the Dbuf reply's
+ * `subs` mapping id) into host-addressable NV12 planes, so the host can land the
+ * decoded frame into the guest's own buffer.
+ *
+ * Guest-memory channel. The only guest memory this plugin can reach is the qdp
+ * DMA-region table (iova/GPA -> host vaddr or fd+offset; qdp.h), the same guest
+ * RAM the paravirtual-GPU path shares as udmabuf-backed buffers. We reuse it via
+ * vt_map rather than inventing a second channel.
+ *
+ * BRING-UP CONVENTION (host <-> guest kext): the guest lends its output IOSurface
+ * by the surface's guest-physical base address as the `subs` mapping id, with an
+ * NV12 (biplanar 420v) layout at the Dpba alignment (BytesPerRowAlignment 64).
+ * The host maps those pages through the DMA-region table.
+ *
+ * FAITHFUL PATH / PRECISE QMETAL API ASK (for L-M2V03; see
+ * evidence/runs/applegva-realproto-20261116/H2-QMETAL-SURFACE-MAPPER-ASK.md):
+ * Apple resolves the mapping id through a shared IOSurface mapper (reims'
+ * retain_io_surface_with_mapping_id / address_ranges_for_virtual_page). That
+ * mapper lives inside apple-pvg/qmu (using_iosurface_mapper = 0 today) and is
+ * NOT reachable from this plugin. To make the id a true opaque mapper token
+ * (not a GPA), the plugin needs a plugin-boundary resolver
+ * `map_guest_surface(mapper_ctx, mapping_id) -> {dma-buf fd or host ptr + plane
+ * layout}`. Until that lands, the GPA convention above is the bring-up path. */
 static int vt_resolve_buffer(void *ctx, const uint8_t uuid[16], uint64_t mapping_id,
                              uint32_t w, uint32_t h, aw_out_buffer *out)
 {
     vt_dev *d = ctx;
-    (void)uuid; (void)mapping_id; (void)w; (void)h; (void)out;
-    vt_log(d, 2, "Dbuf buffer %#llx unresolved: IOSurface mapper (H2/QMetal) pending",
-           (unsigned long long)mapping_id);
-    return -1;
+    uint32_t ystride = (w + 63u) & ~63u;          /* Dpba BytesPerRowAlignment 64 */
+    size_t   ysize   = (size_t)ystride * h;
+    size_t   csize   = (size_t)ystride * ((h + 1u) / 2u); /* NV12 interleaved UV   */
+    uint8_t *p = vt_map(d, mapping_id, ysize + csize);
+    if (!p) {
+        vt_log(d, 1, "Dbuf surface %#llx: no guest pages for the lent buffer",
+               (unsigned long long)mapping_id);
+        return -1;
+    }
+    memset(out, 0, sizeof *out);
+    memcpy(out->uuid, uuid, 16);
+    out->mapping_id = mapping_id;
+    out->y = p;             out->y_stride = ystride;
+    out->uv = p + ysize;    out->uv_stride = ystride;
+    out->width = w;         out->height = h;
+    return 0;
 }
 static int vt_copy_frame(void *ctx, const vtpv_decoded_frame *f, const aw_out_buffer *b)
 {
     vt_dev *d = ctx;
     if (!d->va || !b->y) return -1;
+    /* land the luma plane into the guest's buffer (pixel-verified path). The NV12
+     * chroma readback is a one-helper backend follow-on (vtpv_vaapi_read_chroma). */
     return vtpv_vaapi_read_luma(d->va, f->surface_id, b->y, b->y_stride, f->width, f->height);
 }
 static void vt_put_buffer(void *ctx, const aw_out_buffer *b) { (void)ctx; (void)b; }

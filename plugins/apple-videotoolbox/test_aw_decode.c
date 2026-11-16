@@ -35,15 +35,27 @@ static void cap_emit(void *ctx, const uint8_t *m, size_t n) {
     g_ne++;
 }
 
-/* ---- the guest buffer seam, backed by a host NV12 luma buffer ------- */
-typedef struct { vtpv_vaapi *v; uint8_t *luma; uint32_t w, h; int copied; } bufctx;
+/* ---- H2 real-guest-buffer seam: resolve the lent surface into (simulated)
+ * guest RAM, exactly as the device's vt_resolve_buffer maps the mapping id
+ * through the qdp DMA-region table. The mapping id is an offset into guest RAM;
+ * the NV12 Y stride is the Dpba alignment (align(w,64)). This stands in for the
+ * host-side QMetal page resolution. */
+typedef struct { vtpv_vaapi *v; uint8_t *guest_ram; size_t ram_len;
+                 uint32_t ystride; int copied; } bufctx;
 static int resolvebuf(void *c, const uint8_t uuid[16], uint64_t mapid,
                       uint32_t w, uint32_t h, aw_out_buffer *o) {
     bufctx *b = c; (void)uuid;
+    uint32_t ystride = (w + 63u) & ~63u;
+    size_t ysize = (size_t)ystride * h;
+    size_t csize = (size_t)ystride * ((h + 1u) / 2u);
+    if (mapid + ysize + csize > b->ram_len) return -1;   /* unmapped / too small */
+    b->ystride = ystride;
     memset(o, 0, sizeof *o);
     memset(o->uuid, 0xC0, 16);
     o->mapping_id = mapid;
-    o->y = b->luma; o->y_stride = w; o->width = w; o->height = h;
+    o->y = b->guest_ram + mapid;  o->y_stride = ystride;
+    o->uv = o->y + ysize;         o->uv_stride = ystride;
+    o->width = w; o->height = h;
     return 0;
 }
 static int copyframe(void *c, const vtpv_decoded_frame *f, const aw_out_buffer *o) {
@@ -113,10 +125,13 @@ int main(int argc, char **argv) {
         printf("SKIP: VA-API unavailable: %s\n", err); return 77;
     }
 
+    /* simulated guest RAM; the guest lends its output surface at GUEST_OFF */
+    const uint64_t GUEST_OFF = 0x3000;
+    const size_t RAM = 1u << 20;
     uint8_t *bs = malloc(1u << 20), *luma_ref = malloc((size_t)W * H);
-    uint8_t *luma_out = malloc((size_t)W * H), *msg = malloc((1u << 20) + 512);
+    uint8_t *guest_ram = malloc(RAM), *msg = malloc((1u << 20) + 512);
     uint8_t avcc[512], fds[768];
-    if (!bs || !luma_ref || !luma_out || !msg) { printf("OOM\n"); return 1; }
+    if (!bs || !luma_ref || !guest_ram || !msg) { printf("OOM\n"); return 1; }
 
     size_t bslen = h264_gen_ipcm_frame(W, H, bs, 1u << 20, luma_ref);
     CHECK(bslen > 0, "generated I_PCM bitstream (%zu bytes)", bslen);
@@ -128,8 +143,8 @@ int main(int argc, char **argv) {
                                       AW_4CC('a','v','c','C'), avcc, avcc_len);
     CHECK(fds_len > 0, "built =fds ImageDescription (%zu bytes)", fds_len);
 
-    memset(luma_out, 0, (size_t)W * H);
-    bufctx bc = { v, luma_out, (uint32_t)W, (uint32_t)H, 0 };
+    memset(guest_ram, 0, RAM);
+    bufctx bc = { v, guest_ram, RAM, 0, 0 };
     aw_session_cfg cfg;
     memset(&cfg, 0, sizeof cfg);
     cfg.be = be; cfg.be_ctx = vtpv_vaapi_ctx(v);
@@ -186,12 +201,14 @@ int main(int argc, char **argv) {
         CHECK(bc.copied == 0, "no decode before the Dbuf reply");
     }
 
-    /* the (synthetic) guest replies Dbuf, lending a buffer (mapping id 0x4200) */
+    /* the (synthetic) guest replies Dbuf, lending its output surface at GUEST_OFF
+     * in guest RAM (the mapping id = the surface's guest offset; H2 resolves it
+     * through the DMA-region path, here the guest_ram model) */
     g_ne = 0;
-    n = guest_dbuf_reply(msg, (1u << 20) + 512, uuid, 0x4200);
+    n = guest_dbuf_reply(msg, (1u << 20) + 512, uuid, GUEST_OFF);
     st = aw_engine_deliver(e, msg, n);
     CHECK(st == AW_NOERR, "Dbuf reply accepted (status=%d)", st);
-    CHECK(bc.copied == 1, "decoded frame copied into the lent buffer on the Dbuf reply");
+    CHECK(bc.copied == 1, "decoded frame landed in the guest buffer on the Dbuf reply");
     {
         aw_msg_view mv;
         CHECK(g_ne == 2, "Dbuf reply emitted dfrm-reply + Demt (%d)", g_ne);
@@ -206,17 +223,24 @@ int main(int argc, char **argv) {
     aw_engine_deliver(e, msg, n);
     CHECK(g_ne == 1 && aw_get_be32(g_e[0] + 4) == AW_ATOM_RELS, "Demt reply -> rels");
 
-    /* THE PROOF: the NV12 luma out equals the encoded samples, byte-exact. */
+    /* THE PROOF: the decoded luma landed in GUEST RAM at the lent surface's
+     * offset, byte-exact, at the Dpba-aligned stride. */
     if (g_fail == 0) {
+        const uint8_t *gy = guest_ram + GUEST_OFF;   /* the lent Y plane          */
+        uint32_t ys = bc.ystride;                    /* align(W,64)               */
         size_t bad = 0, first = 0;
         for (int y = 0; y < H; y++)
             for (int x = 0; x < W; x++)
-                if (luma_out[y * W + x] != luma_ref[y * W + x]) { if (!bad) first = (size_t)y * W + x; bad++; }
-        printf("  Apple-wire -> NV12 luma: %zu/%d mismatches; pixel0 got=%u want=%u\n",
-               bad, W * H, luma_out[0], luma_ref[0]);
+                if (gy[(size_t)y * ys + x] != luma_ref[y * W + x]) {
+                    if (!bad) first = (size_t)y * W + x;
+                    bad++;
+                }
+        printf("  Apple-wire -> guest NV12 luma @off %#llx stride %u: %zu/%d mismatches; pixel0 got=%u want=%u\n",
+               (unsigned long long)GUEST_OFF, ys, bad, W * H, gy[0], luma_ref[0]);
         if (bad) printf("  first mismatch at (%d,%d) got=%u want=%u\n",
-                        (int)(first % W), (int)(first / W), luma_out[first], luma_ref[first]);
-        CHECK(bad == 0, "decoded NV12 luma matches the encoded I_PCM samples");
+                        (int)(first % W), (int)(first / W),
+                        gy[(first / W) * ys + (first % W)], luma_ref[first]);
+        CHECK(bad == 0, "decoded luma landed in the guest buffer, byte-exact");
     }
 
     /* -dec (close) */
@@ -228,7 +252,7 @@ int main(int argc, char **argv) {
 
     aw_engine_destroy(e);
     vtpv_vaapi_close(v);
-    free(bs); free(luma_ref); free(luma_out); free(msg); free(sbf);
+    free(bs); free(luma_ref); free(guest_ram); free(msg); free(sbf);
     printf("%s: Apple-wire bytes in -> NV12 out (real contract-B framing + live VA-API)\n",
            g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;
