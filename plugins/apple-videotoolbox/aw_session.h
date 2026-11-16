@@ -51,12 +51,23 @@ typedef struct aw_out_buffer {
  * rels box). Must copy/queue and return. */
 typedef void (*aw_emit_fn)(void *ctx, const uint8_t *msg, size_t len);
 
-/* Ask the guest for an output buffer sized w x h (models Dbuf + the guest reply).
- * Returns 0 and fills *out, or <0 to fail the frame. */
-typedef int (*aw_get_buffer_fn)(void *ctx, uint32_t w, uint32_t h, aw_out_buffer *out);
+/* EVENT-DRIVEN async (H7). The engine never blocks for the guest: on dfrm it
+ * emits Dbuf and returns; the guest's Dbuf reply (flag 0x8, with the lent
+ * surface's mapping id in a subs prefix and the buffer UUID in ,uui) is
+ * delivered back through aw_engine_deliver, and THAT is when the engine resolves
+ * the buffer, decodes, copies and emits Demt. This matches the single-threaded
+ * device: the queue-0 notify that carries the reply cannot block on itself.
+ *
+ * resolve_buffer turns a guest-lent buffer (its ,uui + the subs mapping id) into
+ * host-addressable planes. In the device this maps the guest IOSurface's pages;
+ * in host tests it returns plain host memory. Returns 0 and fills *out, or <0 to
+ * fail the frame. */
+typedef int (*aw_resolve_buffer_fn)(void *ctx, const uint8_t uuid[16],
+                                    uint64_t mapping_id, uint32_t w, uint32_t h,
+                                    aw_out_buffer *out);
 
-/* Copy a decoded backend frame into the lent buffer (models the host writing NV12
- * into the guest's IOSurface between Dbuf's reply and Demt). Returns 0 or <0. */
+/* Copy a decoded backend frame into the lent buffer (the host writing NV12 into
+ * the guest's IOSurface between Dbuf's reply and Demt). Returns 0 or <0. */
 typedef int (*aw_copy_frame_fn)(void *ctx, const vtpv_decoded_frame *f,
                                 const aw_out_buffer *b);
 
@@ -66,12 +77,12 @@ typedef void (*aw_put_buffer_fn)(void *ctx, const aw_out_buffer *b);
 typedef struct aw_session_cfg {
     const vtpv_decoder_backend *be;
     void                       *be_ctx;
-    aw_emit_fn       emit;
-    void            *emit_ctx;
-    aw_get_buffer_fn get_buffer;
-    aw_copy_frame_fn copy_frame;
-    aw_put_buffer_fn put_buffer;
-    void            *buf_ctx;
+    aw_emit_fn           emit;
+    void                *emit_ctx;
+    aw_resolve_buffer_fn resolve_buffer;
+    aw_copy_frame_fn     copy_frame;
+    aw_put_buffer_fn     put_buffer;
+    void                *buf_ctx;
 } aw_session_cfg;
 
 typedef struct aw_engine aw_engine;

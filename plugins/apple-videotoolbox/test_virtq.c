@@ -153,6 +153,39 @@ int main(void)
         CHECK(rc < 0, "cyclic descriptor chain refused (rc=%d)", rc);
     }
 
+    /* 8. H7: queue-0 asymmetric pop_inout — one chain = a readable message +
+     * a writable 4-byte status tail. Gather the message, write the i32 status
+     * into the tail, retire. (Fresh ring at 0x3000 to avoid the above state.) */
+    {
+#define Q0_DESC  0x3000
+#define Q0_AVAIL 0x3200
+#define Q0_USED  0x3400
+#define Q0_MSG   0x3600
+#define Q0_STAT  0x3700
+        vtpv_virtq q0 = {0};
+        q0.size = QSZ; q0.ready = 1; q0.desc = Q0_DESC; q0.avail = Q0_AVAIL; q0.used = Q0_USED;
+        memcpy(g_mem + Q0_MSG, "APPLEMSG", 8);              /* a stand-in message   */
+        put_desc(Q0_DESC, 0, Q0_MSG, 8, VTPV_VQ_DESC_F_NEXT, 1);        /* readable */
+        put_desc(Q0_DESC, 1, Q0_STAT, 4, VTPV_VQ_DESC_F_WRITE, 0);      /* status tail */
+        put16(Q0_AVAIL + 2, 1); put16(Q0_AVAIL + 4, 0);
+
+        uint8_t rbuf[64]; size_t rlen = 0; uint16_t head = 0xffff;
+        uint8_t *wptr = NULL; uint32_t wcap = 0;
+        int rc = vtpv_virtq_pop_inout(&q0, map_mem, NULL, rbuf, sizeof rbuf,
+                                      &rlen, &wptr, &wcap, &head);
+        CHECK(rc == 1 && head == 0, "pop_inout popped head 0 (rc=%d)", rc);
+        CHECK(rlen == 8 && memcmp(rbuf, "APPLEMSG", 8) == 0, "gathered the readable message");
+        CHECK(wptr == g_mem + Q0_STAT && wcap == 4, "exposed the 4-byte writable status tail");
+
+        int32_t status = -19094;                 /* a representative device status  */
+        memcpy(wptr, &status, 4);                 /* native i32, as the device writes */
+        vtpv_virtq_retire(&q0, map_mem, NULL, head, 4);
+        int32_t back; memcpy(&back, g_mem + Q0_STAT, 4);
+        CHECK(back == -19094, "status i32 written to the tail (got %d)", back);
+        vtpv_vq_used_elem ue; memcpy(&ue, g_mem + Q0_USED + 4, 8);
+        CHECK(get16(Q0_USED + 2) == 1 && ue.id == 0 && ue.len == 4, "retired {head 0, len 4}");
+    }
+
     vtpv_proto_destroy(p);
     printf("%s: virtqueue mechanics (submission->handler->completion round-trip)\n",
            g_fail ? "FAIL" : "PASS");

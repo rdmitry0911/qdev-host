@@ -50,13 +50,15 @@ static void mock_close(void *dec){ (void)dec; g_close_calls++; }
 static const vtpv_decoder_backend MOCK = {
     mock_query, mock_open, mock_decode, mock_close };
 
-/* ---- mock guest buffer provider ------------------------------------- */
-static int g_getbuf_calls, g_copy_calls, g_putbuf_calls;
-static int mock_getbuf(void *c, uint32_t w, uint32_t h, aw_out_buffer *o){
-    (void)c; g_getbuf_calls++;
+/* ---- mock guest buffer provider (resolve a lent surface) ------------ */
+static int g_resolve_calls, g_copy_calls, g_putbuf_calls;
+static uint64_t g_last_mapid;
+static int mock_resolve(void *c, const uint8_t uuid[16], uint64_t mapid,
+                        uint32_t w, uint32_t h, aw_out_buffer *o){
+    (void)c;(void)uuid; g_resolve_calls++; g_last_mapid = mapid;
     memset(o, 0, sizeof *o);
     memset(o->uuid, 0xB0, 16);
-    o->mapping_id = 0x9000; o->width = w; o->height = h;
+    o->mapping_id = mapid; o->width = w; o->height = h;
     return 0;
 }
 static int mock_copy(void *c, const vtpv_decoded_frame *f, const aw_out_buffer *b){
@@ -69,8 +71,28 @@ static aw_engine *mk(void) {
     memset(&cfg, 0, sizeof cfg);
     cfg.be = &MOCK; cfg.be_ctx = NULL;
     cfg.emit = cap_emit;
-    cfg.get_buffer = mock_getbuf; cfg.copy_frame = mock_copy; cfg.put_buffer = mock_putbuf;
+    cfg.resolve_buffer = mock_resolve; cfg.copy_frame = mock_copy; cfg.put_buffer = mock_putbuf;
     return aw_engine_create(&cfg);
+}
+
+/* a guest Dbuf reply (flag 0x8): a subs prefix carrying the lent mapping id,
+ * then a Dbuf vtpv with ,uui (the buffer id) + ,err 0 */
+static size_t build_dbuf_reply(uint8_t *m, const uint8_t *uuid, uint64_t mapid) {
+    uint64_t ids[AW_SUBS_IDS] = { mapid, 0, 0, 0, 0 };
+    size_t sl = aw_subs_write(m, 256, ids);
+    uint8_t bu[16]; memset(bu, 0xB0, 16);
+    aw_builder b; aw_builder_init(&b, m + sl, 256 - sl);
+    aw_build_header(&b, AW_MSG_DBUF, AW_FLAG_GUEST_REPLY, uuid, 100);
+    aw_put_s32(&b, AW_KEY_ERR, 0);
+    aw_put_uui(&b, AW_KEY_UUI, bu);
+    return sl + aw_build_finalize(&b);
+}
+/* a guest Demt reply (flag 0x8): the frame was consumed */
+static size_t build_demt_reply(uint8_t *m, const uint8_t *uuid) {
+    aw_builder b; aw_builder_init(&b, m, 256);
+    aw_build_header(&b, AW_MSG_DEMT, AW_FLAG_GUEST_REPLY, uuid, 101);
+    aw_put_s32(&b, AW_KEY_ERR, 0);
+    return aw_build_finalize(&b);
 }
 
 /* build a minimal vtpv message with no params */
@@ -173,24 +195,34 @@ static void test_decode_exchange(void) {
     CHECK(e_type(0, &v) == AW_PARSE_OK && v.type == AW_MSG_DPBA && v.flags == AW_FLAG_HOST_REQ, "1st emission = Dpba (0x2)");
     CHECK(e_type(1, &v) == AW_PARSE_OK && v.type == AW_MSG_DSTA && v.flags == AW_FLAG_HOST_REPLY, "2nd emission = dsta reply (0x4)");
 
-    /* async dfrm: Dbuf(0x2), dfrm reply early(,inf 0x1), Demt(0x2), rels */
+    /* async dfrm (event-driven): deliver(dfrm) emits only Dbuf and returns */
     static const uint8_t au[12] = { 0,0,0,1, 0x67, 1,2,3, 0,0,0,1 };
     ereset();
     CHECK(aw_engine_deliver(e, m, build_dfrm(m, uuid, au, sizeof au)) == AW_NOERR, "dfrm status 0");
-    CHECK(g_decode_calls == 1 && g_copy_calls == 1, "backend decode + copy ran");
-    CHECK(g_getbuf_calls == 1 && g_putbuf_calls == 1, "buffer got + released");
-    CHECK(g_ne == 4, "dfrm emits Dbuf + reply + Demt + rels (got %d)", g_ne);
+    CHECK(g_ne == 1 && e_type(0, &v) == AW_PARSE_OK && v.type == AW_MSG_DBUF
+          && v.flags == AW_FLAG_HOST_REQ, "dfrm emits Dbuf (0x2) and parks");
+    CHECK(g_decode_calls == 0, "no decode until the Dbuf reply");
 
-    CHECK(e_type(0, &v) == AW_PARSE_OK && v.type == AW_MSG_DBUF && v.flags == AW_FLAG_HOST_REQ, "1: Dbuf (0x2)");
-    CHECK(e_type(1, &v) == AW_PARSE_OK && v.type == AW_MSG_DFRM && v.flags == AW_FLAG_HOST_REPLY, "2: dfrm reply (0x4, early)");
+    /* the guest replies Dbuf (lends a buffer, mapping id 0x9000) -> reply early, decode, copy, Demt */
+    ereset();
+    CHECK(aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0x9000)) == AW_NOERR, "Dbuf reply status 0");
+    CHECK(g_resolve_calls == 1 && g_last_mapid == 0x9000, "resolved the lent mapping id");
+    CHECK(g_decode_calls == 1 && g_copy_calls == 1, "backend decode + copy ran on the Dbuf reply");
+    CHECK(g_ne == 2, "Dbuf reply emits dfrm-reply + Demt (got %d)", g_ne);
+    CHECK(e_type(0, &v) == AW_PARSE_OK && v.type == AW_MSG_DFRM && v.flags == AW_FLAG_HOST_REPLY, "1: dfrm reply early (0x4)");
     uint32_t inf = 0;
     CHECK(aw_get_u32(&v, AW_KEY_INF, &inf) == AW_PARSE_OK && (inf & 1u), "dfrm reply ,inf async 0x1");
-    CHECK(e_type(2, &v) == AW_PARSE_OK && v.type == AW_MSG_DEMT && v.flags == AW_FLAG_HOST_REQ, "3: Demt (0x2)");
+    CHECK(e_type(1, &v) == AW_PARSE_OK && v.type == AW_MSG_DEMT && v.flags == AW_FLAG_HOST_REQ, "2: Demt (0x2)");
     uint8_t got[16];
     CHECK(aw_get_uui(&v, AW_KEY_UUI, got) == AW_PARSE_OK, "Demt carries ,uui");
-    CHECK(e_is_rels(3), "4: rels box (bare, not vtpv)");
+
+    /* the guest replies Demt -> rels */
+    ereset();
+    CHECK(aw_engine_deliver(e, m, build_demt_reply(m, uuid)) == AW_NOERR, "Demt reply status 0");
+    CHECK(g_putbuf_calls == 1, "buffer released after Demt reply");
+    CHECK(g_ne == 1 && e_is_rels(0), "Demt reply emits the rels box");
     uint64_t rid[4]; unsigned nr = 0;
-    CHECK(aw_rels_read(g_e[3], g_el[3], rid, 4, &nr) == AW_PARSE_OK && nr == 1 && rid[0] == 0x9000, "rels names the lent mapping id");
+    CHECK(aw_rels_read(g_e[0], g_el[0], rid, 4, &nr) == AW_PARSE_OK && nr == 1 && rid[0] == 0x9000, "rels names the lent mapping id");
 
     /* a dfrm with no decode session (fresh UUID, never dsta) -> 311 */
     uint8_t u2[16]; memset(u2, 0x44, 16);

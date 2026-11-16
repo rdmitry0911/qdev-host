@@ -17,6 +17,11 @@
 #define AW_EXT_HVCC   AW_4CC('h','v','c','C')
 #define AW_PIXFMT_420V AW_4CC('4','2','0','v')
 
+/* a session's in-flight frame (one at a time in this slice; up to ~3 is a later
+ * refinement) progresses: IDLE -> AWAIT_DBUF (Dbuf sent) -> AWAIT_DEMT (frame
+ * copied, Demt sent) -> IDLE. */
+enum { AW_FRM_IDLE = 0, AW_FRM_AWAIT_DBUF, AW_FRM_AWAIT_DEMT };
+
 typedef struct aw_dsession {
     int      used;
     int      invalidated;
@@ -25,6 +30,15 @@ typedef struct aw_dsession {
     void    *dec;            /* backend decoder handle                           */
     uint32_t codec, width, height;
     uint64_t next_mapping_id;
+
+    /* parked frame (event-driven dfrm, H7) */
+    int          pend_state;
+    uint8_t     *pend_au;    /* the access-unit bytes, kept until the Dbuf reply */
+    size_t       pend_au_cap, pend_au_len;
+    int64_t      pend_frm;
+    uint32_t     pend_inf;   /* async flag echoed into the dfrm reply / Demt      */
+    uint64_t     pend_dfrm_reply_id;
+    aw_out_buffer pend_buf;  /* the lent buffer, held from Dbuf reply to rels     */
 } aw_dsession;
 
 struct aw_engine {
@@ -104,6 +118,9 @@ aw_engine *aw_engine_create(const aw_session_cfg *cfg)
 
 static void close_session(aw_engine *e, aw_dsession *s)
 {
+    if (s->pend_state == AW_FRM_AWAIT_DEMT && e->cfg.put_buffer)
+        e->cfg.put_buffer(e->cfg.buf_ctx, &s->pend_buf); /* let a held buffer go */
+    if (s->pend_au) free(s->pend_au);
     if (s->dec && e->cfg.be && e->cfg.be->close_decoder)
         e->cfg.be->close_decoder(s->dec);
     memset(s, 0, sizeof(*s));
@@ -336,63 +353,100 @@ static void emit_dfrm_reply(aw_engine *e, aw_dsession *s, const aw_msg_view *v,
     if (n) emit(e, buf, n);
 }
 
+/* dfrm: park the access unit, emit Dbuf, and RETURN. The decode continues when
+ * the guest's Dbuf reply arrives (handle_guest_reply). Async-only, one frame in
+ * flight per session in this slice. */
 static int32_t handle_dfrm(aw_engine *e, aw_dsession *s, const aw_msg_view *v)
 {
     if (!s->started) {
-        /* frame with no decode session: 311, nothing else emitted */
-        emit_dfrm_reply(e, s, v, AW_ERR_BAD_DATA, 0);
+        emit_dfrm_reply(e, s, v, AW_ERR_BAD_DATA, 0);   /* 311, nothing else       */
         return AW_NOERR;
     }
+    if (s->pend_state != AW_FRM_IDLE)
+        return AW_ERR_MALFUNCTION;   /* a second frame before the last finished   */
 
     const uint8_t *sbf; size_t sbf_len;
     if (aw_get_bytes(v, AW_KEY_SBF, AW_VT_SBF, &sbf, &sbf_len) != AW_PARSE_OK)
         return AW_ERR_MALFORMED;     /* ,sbf required                             */
-
     const uint8_t *au; size_t au_len;
     if (aw_sbuf_read(sbf, sbf_len, &au, &au_len, NULL, NULL) < 0)
         return AW_ERR_MALFORMED;
 
-    int64_t frm64 = 0;
-    (void)aw_get_s64(v, AW_KEY_FRM, &frm64);
+    /* keep the AU bytes until the Dbuf reply lets us decode into a lent buffer */
+    if (s->pend_au_cap < au_len) {
+        uint8_t *n = realloc(s->pend_au, au_len);
+        if (!n) return AW_ERR_MALFUNCTION;
+        s->pend_au = n; s->pend_au_cap = au_len;
+    }
+    memcpy(s->pend_au, au, au_len);
+    s->pend_au_len = au_len;
+
+    int64_t frm64 = 0; (void)aw_get_s64(v, AW_KEY_FRM, &frm64);
     uint32_t dfl = 0; aw_get_u32(v, AW_KEY_DFL, &dfl);
-    uint32_t inf = (dfl & 1u) ? 0x1u : 0u; /* kVTDecodeInfo_Asynchronous          */
+    s->pend_frm = frm64;
+    s->pend_inf = (dfl & 1u) ? 0x1u : 0u; /* kVTDecodeInfo_Asynchronous           */
+    s->pend_dfrm_reply_id = v->reply_id;
+    s->pend_state = AW_FRM_AWAIT_DBUF;
 
-    /* 1. Ask the guest for an output buffer (Dbuf + its reply). */
-    emit_dbuf(e, s, frm64);
-    aw_out_buffer ob;
-    memset(&ob, 0, sizeof ob);
-    int got = e->cfg.get_buffer
-                ? e->cfg.get_buffer(e->cfg.buf_ctx, s->width, s->height, &ob) : -1;
-
-    /* 2. Async: the dfrm reply goes EARLY, before Demt. */
-    emit_dfrm_reply(e, s, v, AW_NOERR, inf);
-
-    if (got != 0) {                  /* no buffer: drop the frame                 */
-        return AW_NOERR;
-    }
-
-    /* 3. Decode the access unit on the backend. */
-    vtpv_decoded_frame f;
-    memset(&f, 0, sizeof f);
-    int dr = e->cfg.be->decode(s->dec, au, au_len, &f);
-    if (dr != 0) {
-        /* a frame that fails: Demt with -12909 and no buffer, Dfub, rels */
-        emit_demt(e, s, frm64, AW_ERR_MALFUNCTION, inf, ob.uuid);
-        emit_dfub(e, s, ob.uuid);
-        emit_rels(e, ob.mapping_id);
-        if (e->cfg.put_buffer) e->cfg.put_buffer(e->cfg.buf_ctx, &ob);
-        return AW_NOERR;
-    }
-
-    /* 4. Copy the decoded NV12 into the lent buffer (between Dbuf reply and Demt). */
-    int cr = e->cfg.copy_frame ? e->cfg.copy_frame(e->cfg.buf_ctx, &f, &ob) : -1;
-
-    /* 5. Emit, then release. */
-    emit_demt(e, s, frm64, cr == 0 ? AW_NOERR : AW_ERR_MALFUNCTION,
-              inf | 1u /* kVTDecodeInfo_FrameDecoded tracking */, ob.uuid);
-    emit_rels(e, ob.mapping_id);
-    if (e->cfg.put_buffer) e->cfg.put_buffer(e->cfg.buf_ctx, &ob);
+    emit_dbuf(e, s, frm64);          /* -> guest replies Dbuf with a lent buffer   */
     return AW_NOERR;
+}
+
+/* A guest reply (flag 0x8). `msg`/`len` are the raw message so a Dbuf reply's
+ * subs-prefixed mapping id can be read. */
+static int32_t handle_guest_reply(aw_engine *e, aw_dsession *s,
+                                  const aw_msg_view *v, const uint8_t *msg, size_t len)
+{
+    if (v->type == AW_MSG_DBUF && s->pend_state == AW_FRM_AWAIT_DBUF) {
+        /* the lent surface: ,uui (buffer id) + a subs-prefixed mapping id */
+        uint8_t bu[16]; memset(bu, 0, 16);
+        (void)aw_get_uui(v, AW_KEY_UUI, bu);
+        uint64_t ids[AW_SUBS_IDS]; uint64_t mapid = 0;
+        if (aw_subs_read(msg, len, ids) == AW_PARSE_OK) mapid = ids[0];
+
+        aw_out_buffer ob; memset(&ob, 0, sizeof ob);
+        int got = e->cfg.resolve_buffer
+            ? e->cfg.resolve_buffer(e->cfg.buf_ctx, bu, mapid, s->width, s->height, &ob) : -1;
+
+        /* async: the dfrm reply goes EARLY, right after the Dbuf reply */
+        {
+            aw_msg_view fv = *v; fv.reply_id = s->pend_dfrm_reply_id;
+            emit_dfrm_reply(e, s, &fv, AW_NOERR, s->pend_inf);
+        }
+
+        if (got != 0) {              /* guest lent nothing usable: drop the frame */
+            s->pend_state = AW_FRM_IDLE;
+            return AW_NOERR;
+        }
+
+        vtpv_decoded_frame f; memset(&f, 0, sizeof f);
+        int dr = e->cfg.be->decode(s->dec, s->pend_au, s->pend_au_len, &f);
+        if (dr != 0) {               /* failed frame: Demt -12909, Dfub, rels     */
+            emit_demt(e, s, s->pend_frm, AW_ERR_MALFUNCTION, s->pend_inf, ob.uuid);
+            emit_dfub(e, s, ob.uuid);
+            emit_rels(e, ob.mapping_id);
+            if (e->cfg.put_buffer) e->cfg.put_buffer(e->cfg.buf_ctx, &ob);
+            s->pend_state = AW_FRM_IDLE;
+            return AW_NOERR;
+        }
+
+        int cr = e->cfg.copy_frame ? e->cfg.copy_frame(e->cfg.buf_ctx, &f, &ob) : -1;
+        s->pend_buf = ob;
+        emit_demt(e, s, s->pend_frm, cr == 0 ? AW_NOERR : AW_ERR_MALFUNCTION,
+                  s->pend_inf | 1u, ob.uuid);
+        s->pend_state = AW_FRM_AWAIT_DEMT; /* -> guest replies Demt                */
+        return AW_NOERR;
+    }
+
+    if (v->type == AW_MSG_DEMT && s->pend_state == AW_FRM_AWAIT_DEMT) {
+        emit_rels(e, s->pend_buf.mapping_id);  /* the frame is done; release it    */
+        if (e->cfg.put_buffer) e->cfg.put_buffer(e->cfg.buf_ctx, &s->pend_buf);
+        s->pend_state = AW_FRM_IDLE;
+        return AW_NOERR;
+    }
+
+    /* a reply to no pending request */
+    return AW_ERR_MALFORMED;
 }
 
 /* dcan / dinv / dfin / dsup / dcop / dset: minimal correct replies for routing. */
@@ -450,6 +504,10 @@ int32_t aw_engine_deliver(aw_engine *e, const uint8_t *msg, size_t len)
     aw_dsession *s = find_session(e, v.uuid);
     if (!s)              return AW_ERR_UNKNOWN_UUID; /* -19094                     */
     if (s->invalidated)  return AW_ERR_INVALIDATED;  /* -19098                     */
+
+    /* a guest reply (flag 0x8) to one of our host requests (Dbuf / Demt) */
+    if (v.flags & AW_FLAG_GUEST_REPLY)
+        return handle_guest_reply(e, s, &v, msg, len);
 
     switch (v.type) {
     case AW_MSG_DSTA: return handle_dsta(e, s, &v);

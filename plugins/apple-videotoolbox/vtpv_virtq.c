@@ -129,6 +129,49 @@ int vtpv_virtq_put_writable(vtpv_virtq *vq, vtpv_map_fn map, void *ctx,
     return 1;
 }
 
+int vtpv_virtq_pop_inout(vtpv_virtq *vq, vtpv_map_fn map, void *ctx,
+                         uint8_t *buf, size_t cap, size_t *rlen,
+                         uint8_t **wptr, uint32_t *wcap, uint16_t *head)
+{
+    uint16_t i, chain = 0, h;
+    size_t got = 0;
+    int rc;
+    if (!ready(vq) || !buf || !rlen || !wptr || !wcap || !head) return -1;
+    rc = peek_head(vq, map, ctx, &h);
+    if (rc <= 0) return rc;
+
+    *wptr = NULL;
+    *wcap = 0;
+    i = h;
+    for (;;) {
+        vtpv_vq_desc d;
+        if (rd(map, ctx, vq->desc + (uint64_t)16 * i, &d, sizeof(d))) return -1;
+        if (d.flags & VTPV_VQ_DESC_F_INDIRECT) return -1;
+        if (d.flags & VTPV_VQ_DESC_F_WRITE) {
+            if (!*wptr && d.len) {           /* first writable segment = status tail */
+                void *p = map(ctx, d.addr, d.len);
+                if (!p) return -1;
+                *wptr = p;
+                *wcap = d.len;
+            }
+        } else {
+            void *p;
+            if ((size_t)d.len > cap - got) return -1;
+            p = map(ctx, d.addr, d.len);
+            if (!p) return -1;
+            memcpy(buf + got, p, d.len);
+            got += d.len;
+        }
+        if (!(d.flags & VTPV_VQ_DESC_F_NEXT)) break;
+        i = d.next;
+        if (i >= vq->size || ++chain >= vq->size) return -1;
+    }
+    *rlen = got;
+    *head = h;
+    vq->last_avail++;
+    return 1;
+}
+
 /* used ring: le16 flags; le16 idx; vtpv_vq_used_elem ring[size]; le16 avail_event. */
 int vtpv_virtq_retire(vtpv_virtq *vq, vtpv_map_fn map, void *ctx,
                       uint16_t head, uint32_t written)

@@ -37,11 +37,12 @@ static void cap_emit(void *ctx, const uint8_t *m, size_t n) {
 
 /* ---- the guest buffer seam, backed by a host NV12 luma buffer ------- */
 typedef struct { vtpv_vaapi *v; uint8_t *luma; uint32_t w, h; int copied; } bufctx;
-static int getbuf(void *c, uint32_t w, uint32_t h, aw_out_buffer *o) {
-    bufctx *b = c;
+static int resolvebuf(void *c, const uint8_t uuid[16], uint64_t mapid,
+                      uint32_t w, uint32_t h, aw_out_buffer *o) {
+    bufctx *b = c; (void)uuid;
     memset(o, 0, sizeof *o);
     memset(o->uuid, 0xC0, 16);
-    o->mapping_id = 0x4200;
+    o->mapping_id = mapid;
     o->y = b->luma; o->y_stride = w; o->width = w; o->height = h;
     return 0;
 }
@@ -52,6 +53,24 @@ static int copyframe(void *c, const vtpv_decoded_frame *f, const aw_out_buffer *
     return rc;
 }
 static void putbuf(void *c, const aw_out_buffer *o) { (void)c; (void)o; }
+
+/* synthetic guest: a Dbuf reply (subs prefix with the mapping id + ,uui) */
+static size_t guest_dbuf_reply(uint8_t *m, size_t cap, const uint8_t *uuid, uint64_t mapid) {
+    uint64_t ids[AW_SUBS_IDS] = { mapid, 0, 0, 0, 0 };
+    size_t sl = aw_subs_write(m, cap, ids);
+    uint8_t bu[16]; memset(bu, 0xC0, 16);
+    aw_builder b; aw_builder_init(&b, m + sl, cap - sl);
+    aw_build_header(&b, AW_MSG_DBUF, AW_FLAG_GUEST_REPLY, uuid, 100);
+    aw_put_s32(&b, AW_KEY_ERR, 0);
+    aw_put_uui(&b, AW_KEY_UUI, bu);
+    return sl + aw_build_finalize(&b);
+}
+static size_t guest_demt_reply(uint8_t *m, size_t cap, const uint8_t *uuid) {
+    aw_builder b; aw_builder_init(&b, m, cap);
+    aw_build_header(&b, AW_MSG_DEMT, AW_FLAG_GUEST_REPLY, uuid, 101);
+    aw_put_s32(&b, AW_KEY_ERR, 0);
+    return aw_build_finalize(&b);
+}
 
 /* build an avcC record from the SPS and PPS NALs in an Annex-B stream */
 static size_t build_avcc(const uint8_t *bs, size_t bslen, uint8_t *out, size_t cap) {
@@ -115,7 +134,7 @@ int main(int argc, char **argv) {
     memset(&cfg, 0, sizeof cfg);
     cfg.be = be; cfg.be_ctx = vtpv_vaapi_ctx(v);
     cfg.emit = cap_emit;
-    cfg.get_buffer = getbuf; cfg.copy_frame = copyframe; cfg.put_buffer = putbuf;
+    cfg.resolve_buffer = resolvebuf; cfg.copy_frame = copyframe; cfg.put_buffer = putbuf;
     cfg.buf_ctx = &bc;
     aw_engine *e = aw_engine_create(&cfg);
 
@@ -159,18 +178,33 @@ int main(int argc, char **argv) {
     n = aw_build_finalize(&b);
     st = aw_engine_deliver(e, msg, n);
     CHECK(st == AW_NOERR, "dfrm accepted (status=%d)", st);
-    CHECK(bc.copied == 1, "decoded frame copied into the lent buffer");
-
-    /* verify the wire exchange: Dbuf(0x2) -> dfrm reply(early) -> Demt(0x2) -> rels */
+    /* event-driven: dfrm emits Dbuf and parks (no decode yet) */
     {
         aw_msg_view mv;
-        CHECK(g_ne == 4, "dfrm emitted Dbuf+reply+Demt+rels (%d)", g_ne);
-        CHECK(aw_parse(g_e[0], g_el[0], &mv) == AW_PARSE_OK && mv.type == AW_MSG_DBUF, "Dbuf first");
-        CHECK(aw_parse(g_e[1], g_el[1], &mv) == AW_PARSE_OK && mv.type == AW_MSG_DFRM
-              && mv.flags == AW_FLAG_HOST_REPLY, "dfrm reply early");
-        CHECK(aw_parse(g_e[2], g_el[2], &mv) == AW_PARSE_OK && mv.type == AW_MSG_DEMT, "Demt");
-        CHECK(aw_get_be32(g_e[3] + 4) == AW_ATOM_RELS, "rels box last");
+        CHECK(g_ne == 1 && aw_parse(g_e[0], g_el[0], &mv) == AW_PARSE_OK
+              && mv.type == AW_MSG_DBUF && mv.flags == AW_FLAG_HOST_REQ, "dfrm emits Dbuf, parks");
+        CHECK(bc.copied == 0, "no decode before the Dbuf reply");
     }
+
+    /* the (synthetic) guest replies Dbuf, lending a buffer (mapping id 0x4200) */
+    g_ne = 0;
+    n = guest_dbuf_reply(msg, (1u << 20) + 512, uuid, 0x4200);
+    st = aw_engine_deliver(e, msg, n);
+    CHECK(st == AW_NOERR, "Dbuf reply accepted (status=%d)", st);
+    CHECK(bc.copied == 1, "decoded frame copied into the lent buffer on the Dbuf reply");
+    {
+        aw_msg_view mv;
+        CHECK(g_ne == 2, "Dbuf reply emitted dfrm-reply + Demt (%d)", g_ne);
+        CHECK(aw_parse(g_e[0], g_el[0], &mv) == AW_PARSE_OK && mv.type == AW_MSG_DFRM
+              && mv.flags == AW_FLAG_HOST_REPLY, "dfrm reply early");
+        CHECK(aw_parse(g_e[1], g_el[1], &mv) == AW_PARSE_OK && mv.type == AW_MSG_DEMT, "Demt");
+    }
+
+    /* the guest replies Demt -> rels names the lent surface */
+    g_ne = 0;
+    n = guest_demt_reply(msg, (1u << 20) + 512, uuid);
+    aw_engine_deliver(e, msg, n);
+    CHECK(g_ne == 1 && aw_get_be32(g_e[0] + 4) == AW_ATOM_RELS, "Demt reply -> rels");
 
     /* THE PROOF: the NV12 luma out equals the encoded samples, byte-exact. */
     if (g_fail == 0) {

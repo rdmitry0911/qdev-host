@@ -58,9 +58,9 @@ $(BUILD)/test-h264: $(BACKEND) h264_gen.c test_h264.c | $(BUILD)
 $(BUILD)/test-aw-decode: $(AW_CORE) $(BACKEND) h264_gen.c test_aw_decode.c | $(BUILD)
 	$(CC) $(CFLAGS) $(VA_CFLAGS) -o $@ $(AW_CORE) $(BACKEND) h264_gen.c test_aw_decode.c $(VA_LIBS)
 
-$(BUILD)/apple-videotoolbox.so: apple-videotoolbox.c $(BACKEND) | $(BUILD)
+$(BUILD)/apple-videotoolbox.so: apple-videotoolbox.c $(AW_CORE) $(BACKEND) | $(BUILD)
 	$(CC) $(CFLAGS) -Wno-unused-parameter -fPIC -shared $(QDP_INC) $(VFU_INC) $(VA_CFLAGS) \
-	    -o $@ apple-videotoolbox.c $(BACKEND) $(VA_LIBS)
+	    -o $@ apple-videotoolbox.c $(AW_CORE) $(BACKEND) $(VA_LIBS)
 
 $(BUILD)/test-plugin: test_plugin.c $(BUILD)/apple-videotoolbox.so | $(BUILD)
 	$(CC) $(CFLAGS) $(QDP_INC) $(VFU_INC) -o $@ test_plugin.c -ldl

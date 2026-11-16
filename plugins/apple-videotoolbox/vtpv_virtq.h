@@ -83,6 +83,19 @@ int vtpv_virtq_put_writable(vtpv_virtq *vq, vtpv_map_fn map, void *ctx,
                             uint16_t *head, uint32_t *written);
 
 /*
+ * Queue-0 ASYMMETRIC pop (Apple's model, H7): a single chain carries BOTH the
+ * guest->host message (device-readable) AND a device-writable tail for the i32
+ * status the host returns. Gathers the readable bytes into buf[cap] (*rlen), and
+ * exposes the chain's FIRST writable segment as a host pointer *wptr with *wcap
+ * bytes (the 4-byte status fits in one descriptor; *wcap may be 0 if the guest
+ * posted no writable tail). Sets *head for retiring. Returns 1, 0 (none), or <0
+ * on a malformed chain. Advances last_avail on success.
+ */
+int vtpv_virtq_pop_inout(vtpv_virtq *vq, vtpv_map_fn map, void *ctx,
+                         uint8_t *buf, size_t cap, size_t *rlen,
+                         uint8_t **wptr, uint32_t *wcap, uint16_t *head);
+
+/*
  * Retire a consumed chain on the USED ring: publish {head, written} and bump
  * the used index. Returns 0 or <0 on an unmapped used ring.
  */

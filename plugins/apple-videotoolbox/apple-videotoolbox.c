@@ -44,9 +44,9 @@
 #include <libvfio-user.h>
 
 #include "qdp.h"
-#include "vtpv_proto.h"
 #include "vtpv_vaapi.h"
 #include "vtpv_virtq.h"
+#include "aw_session.h"   /* the Apple contract-B wire session engine (H5/H6/H7) */
 
 /* ---- device constants ---------------------------------------------- */
 
@@ -78,7 +78,7 @@ typedef struct vt_dev {
 
     vtpv_vaapi              *va;
     const vtpv_decoder_backend *be;
-    vtpv_proto              *proto;
+    aw_engine               *engine;   /* contract-B wire session engine          */
 
     pthread_mutex_t m;
 
@@ -142,31 +142,61 @@ static void vt_raise(vt_dev *d, unsigned queue)
         (void)d->host->irq_trigger(d->host->host, vec);
 }
 
-/* ---- completion sink: place a completion on the completion vq -------- *
- * Called by the protocol handler (under d->m, from vt_process_submission).
- * Takes a pre-posted queue-1 writable buffer, copies `cmpl` into it, retires
- * it on the used ring and raises the completion vector. A completion with no
- * posted buffer is dropped (as a real device would, until the guest reposts). */
-static void vt_emit(void *ctx, const uint8_t *cmpl, size_t len)
+/* ---- queue 1 (host->guest) emit sink -------------------------------- *
+ * The aw_session engine's emit callback (under d->m). Apple's queue 1 is a
+ * host->guest message stream: the guest pre-posts 0x4000-byte writable buffers,
+ * and the host writes each outbound message (a reply, or a Dpba/Dbuf/Demt/rels
+ * request) into one and retires it. A message with no posted buffer is dropped
+ * (as a real device would, until the guest reposts). */
+static void vt_emit(void *ctx, const uint8_t *msg, size_t len)
 {
     vt_dev *d = ctx;
-    vtpv_virtq *cq = &d->queues[1];
+    vtpv_virtq *hq = &d->queues[1];
     uint16_t head = 0; uint32_t written = 0;
-    int rc = vtpv_virtq_put_writable(cq, vt_map, d, cmpl, len, &head, &written);
+    int rc = vtpv_virtq_put_writable(hq, vt_map, d, msg, len, &head, &written);
     if (rc == 1) {
-        vtpv_virtq_retire(cq, vt_map, d, head, written);
+        vtpv_virtq_retire(hq, vt_map, d, head, written);
         vt_raise(d, 1);
         if (written < len)
-            vt_log(d, 1, "completion truncated %u/%zu (guest buffer too small)",
+            vt_log(d, 1, "host->guest message truncated %u/%zu (guest buffer too small)",
                    written, len);
     } else if (rc == 0) {
-        vt_log(d, 1, "completion dropped: no posted completion-queue buffer");
+        vt_log(d, 1, "host->guest message dropped: no posted queue-1 buffer");
     } else {
         d->needs_reset = 1;
     }
 }
 
-/* ---- submission: drain the submission vq into the protocol handler --- */
+/* ---- the decoded-output buffer seam (the guest lends it via Dbuf) ---- *
+ * resolve_buffer turns a guest-lent surface (its mapping id) into host-addressable
+ * NV12 planes. The guest->host IOSurface mapping is the QMetal surface-sharing
+ * seam, deferred (FIX-CANDIDATE §4.7 / H2): until it lands the host cannot write
+ * into a real guest buffer, so this returns <0 and the engine drops the frame
+ * after emitting the Dbuf request + the early dfrm reply. Everything up to that
+ * point (decs/dcap/+dec/dsta->Dpba, the Dbuf request, the inline statuses, the
+ * queue-1 ring) runs end to end on the real queues. */
+static int vt_resolve_buffer(void *ctx, const uint8_t uuid[16], uint64_t mapping_id,
+                             uint32_t w, uint32_t h, aw_out_buffer *out)
+{
+    vt_dev *d = ctx;
+    (void)uuid; (void)mapping_id; (void)w; (void)h; (void)out;
+    vt_log(d, 2, "Dbuf buffer %#llx unresolved: IOSurface mapper (H2/QMetal) pending",
+           (unsigned long long)mapping_id);
+    return -1;
+}
+static int vt_copy_frame(void *ctx, const vtpv_decoded_frame *f, const aw_out_buffer *b)
+{
+    vt_dev *d = ctx;
+    if (!d->va || !b->y) return -1;
+    return vtpv_vaapi_read_luma(d->va, f->surface_id, b->y, b->y_stride, f->width, f->height);
+}
+static void vt_put_buffer(void *ctx, const aw_out_buffer *b) { (void)ctx; (void)b; }
+
+/* ---- queue 0 (guest->host): drain into the session engine ----------- *
+ * Apple's queue 0 is asymmetric: each chain is one message plus a 4-byte i32
+ * writable status tail. Gather the message, run it through the engine, write the
+ * returned status into the tail, retire. Replies/requests go out on queue 1 via
+ * vt_emit. */
 static void vt_process_submission(vt_dev *d)
 {
     vtpv_virtq *sq = &d->queues[0];
@@ -174,12 +204,16 @@ static void vt_process_submission(vt_dev *d)
     static uint8_t msg[VTPV_MAX_SAMPLE_BYTES + 4096];
     while (budget-- && vtpv_virtq_has_avail(sq, vt_map, d) == 1) {
         size_t len = 0; uint16_t head = 0;
-        int rc = vtpv_virtq_get_readable(sq, vt_map, d, msg, sizeof(msg), &len, &head);
+        uint8_t *wptr = NULL; uint32_t wcap = 0;
+        int rc = vtpv_virtq_pop_inout(sq, vt_map, d, msg, sizeof(msg), &len,
+                                      &wptr, &wcap, &head);
         if (rc != 1) { d->needs_reset = 1; break; } /* malformed ring */
-        (void)vtpv_proto_submit(d->proto, msg, len); /* emits completions via vt_emit */
-        vtpv_virtq_retire(sq, vt_map, d, head, 0);   /* submission buffers are read-only */
+        int32_t status = aw_engine_deliver(d->engine, msg, len); /* emits on q1 */
+        uint32_t written = 0;
+        if (wptr && wcap >= 4) { memcpy(wptr, &status, 4); written = 4; } /* native i32 */
+        vtpv_virtq_retire(sq, vt_map, d, head, written);
     }
-    vt_raise(d, 0); /* the submission chains are now free on the used ring */
+    vt_raise(d, 0); /* the queue-0 chains are now free on the used ring */
 }
 
 /* ---- BAR0: virtio-modern common config + notify --------------------- */
@@ -310,9 +344,19 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
                      "advertise no codecs", node, err);
         d->va = NULL; d->be = NULL;
     }
-    d->proto = vtpv_proto_create(d->be, d->va ? vtpv_vaapi_ctx(d->va) : NULL,
-                                 vt_emit, d);
-    if (!d->proto) {
+    {
+        aw_session_cfg cfg;
+        memset(&cfg, 0, sizeof cfg);
+        cfg.be = d->be;
+        cfg.be_ctx = d->va ? vtpv_vaapi_ctx(d->va) : NULL;
+        cfg.emit = vt_emit; cfg.emit_ctx = d;
+        cfg.resolve_buffer = vt_resolve_buffer;
+        cfg.copy_frame = vt_copy_frame;
+        cfg.put_buffer = vt_put_buffer;
+        cfg.buf_ctx = d;
+        d->engine = aw_engine_create(&cfg);
+    }
+    if (!d->engine) {
         if (d->va) vtpv_vaapi_close(d->va);
         free(d);
         return -ENOMEM;
@@ -348,7 +392,7 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
     return 0;
 
 fail:
-    vtpv_proto_destroy(d->proto);
+    aw_engine_destroy(d->engine);
     if (d->va) vtpv_vaapi_close(d->va);
     free(d);
     return -errno ? -errno : -EINVAL;
@@ -359,7 +403,7 @@ static void vt_teardown(void *priv)
     vt_dev *d = priv;
     if (!d) return;
     if (g_dev == d) g_dev = NULL;
-    vtpv_proto_destroy(d->proto);
+    aw_engine_destroy(d->engine);
     if (d->va) vtpv_vaapi_close(d->va);
     pthread_mutex_destroy(&d->m);
     free(d);
