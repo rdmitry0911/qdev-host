@@ -36,7 +36,7 @@ scoped it.
 | file | role | state |
 |---|---|---|
 | `vtpv_proto.{h,c}` | codec-session **protocol handler**: parse submission messages (QUERY_CAPS / SESSION_CREATE / DECODE_FRAME / SESSION_END), enforce the transport limits, dispatch to a decoder-backend vtable, emit completions | **complete + unit-tested** (`test_proto.c`, 13 cases) |
-| `vtpv_vaapi.{h,c}` | **VA-API decode backend** over libva on a DRM render node: display open, capability enumeration (→ D-GVA-2), decode config/context/surface pool, surface readback | **complete + tested live** on `/dev/dri/renderD128` (`test_vaapi.c`); the per-frame bitstream decode is the next stage (below) |
+| `vtpv_vaapi.{h,c}` + `vtpv_h264.{h,c}` | **VA-API decode backend** over libva on a DRM render node: display open, capability enumeration (→ D-GVA-2), decode config/context/surface pool, **real H.264 decode** (SPS/PPS/slice parse → VA parameter buffers → `vaBeginPicture`/`RenderPicture`/`EndPicture`), surface readback | **complete + tested live** on `/dev/dri/renderD128`: `test_vaapi.c` (lifecycle + caps) and `test_h264.c` (a minimal I\_PCM I-frame decoded and its luma verified byte-exact, 0/101376 mismatches on radeonsi) |
 | `apple-videotoolbox.c` | **qdp plugin**: presents PCI `106b:1a03` as a virtio-1.x device, lays out BAR0 (common/ISR/notify/device cfg), MSI-X (per-queue + config), the two virtqueues (0 submission, 1 completion), and instantiates the handler over the backend | **compiles + registers + loadable** (`test_plugin.c` ABI smoke); the virtio ring state machine is the next increment |
 
 ### The wire (D-GVA-2)
@@ -62,13 +62,10 @@ test's readback of it.
    semantics are laid out in `apple-videotoolbox.c`; walking a live guest's
    rings is guest-blocked (no guest consumer). The message protocol the rings
    carry is already complete and tested.
-2. **The per-frame bitstream decode** — `vtpv_vaapi`'s `decode` has the VA
-   object lifecycle and the surface hand-off wired and returns a real
-   render-target surface, but the H.264/HEVC access-unit → VA-buffer mapping
-   (`vaBeginPicture`/`vaRenderPicture`/`vaEndPicture` over a parse) is the next
-   stage; until then the surface content is undefined. (A minimal I\_PCM
-   I-frame fixture is the intended first decode-verify; radeonsi I\_PCM support
-   to be confirmed.)
+2. **HEVC per-frame decode** — H.264 decode is real and pixel-verified (above).
+   HEVC's session lifecycle + surface hand-off are wired, but the HEVC
+   access-unit → VA-buffer parse (`vtpv_h264.c`'s HEVC sibling) is the next
+   codec increment.
 3. **Encode** (this GPU exposes `VAEntrypointEncSlice` for H.264/HEVC),
    **NVDEC/NVENC** and **VideoToolbox** backends, the **M2 scaler** device
    (`106b:1a0b`), and the **conformance** suite — all later increments.
@@ -88,7 +85,8 @@ Host dependency: `libva-dev` (VA-API headers; the runtime `libva2` +
 `radeonsi_drv_video.so` were already present). Installed 2.22.0-3 to match.
 
 ```
-# module unit tests (no VM): protocol handler, VA-API backend (live), plugin ABI
+# module unit tests (no VM): protocol handler, VA-API backend (live), H.264
+# I_PCM decode (live, pixel-verified), plugin ABI smoke
 make -C plugins/apple-videotoolbox test        # or: make apple-videotoolbox-test
 
 # build the plugin into the qdev-host tree (needs the vendored libvfio-user)

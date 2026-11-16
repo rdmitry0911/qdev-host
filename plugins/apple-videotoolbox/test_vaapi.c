@@ -44,18 +44,6 @@ static size_t mk_create(uint8_t *b, uint32_t codec, uint32_t w, uint32_t h, uint
     rq->codec = codec; rq->width = w; rq->height = h; rq->extradata_len = 0;
     return hd->length;
 }
-static size_t mk_decode(uint8_t *b, uint32_t sess, uint32_t slen, uint8_t seed, uint64_t tag)
-{
-    vtpv_submit_hdr *hd = (vtpv_submit_hdr *)b;
-    vtpv_decode_req *rq = (vtpv_decode_req *)(b + sizeof(*hd));
-    memset(hd, 0, sizeof(*hd));
-    hd->magic = VTPV_SUBMIT_MAGIC; hd->abi = VTPV_ABI;
-    hd->type = VTPV_MSG_DECODE_FRAME; hd->session = sess; hd->tag = tag;
-    hd->length = sizeof(*hd) + sizeof(*rq) + slen;
-    rq->pts = 42; rq->flags = 0; rq->sample_len = slen;
-    memset(b + sizeof(*hd) + sizeof(*rq), seed, slen);
-    return hd->length;
-}
 static size_t mk_simple(uint8_t *b, uint16_t type, uint32_t sess, uint64_t tag)
 {
     vtpv_submit_hdr *hd = (vtpv_submit_hdr *)b;
@@ -73,7 +61,7 @@ int main(int argc, char **argv)
     uint8_t msg[4096];
     vtpv_proto *p;
     int rc;
-    uint32_t sid = 0, surface_id = 0;
+    uint32_t sid = 0;
     const uint32_t W = 352, H = 288; /* CIF: a size every H.264 decoder serves */
 
     g_node = (argc > 1) ? argv[1] : "/dev/dri/renderD128";
@@ -111,31 +99,11 @@ int main(int argc, char **argv)
     sid = ((const vtpv_create_desc *)(g_buf + sizeof(vtpv_cmpl_hdr)))->session;
     CHECK(sid != 0, "create: session id");
 
-    /* 3. DECODE_FRAME -> a decoded NV12 surface of the right size. */
-    g_n = 0;
-    { size_t n = mk_decode(msg, sid, 256, 0x10, 0x33); vtpv_proto_submit(p, msg, n); }
-    {
-        const vtpv_decoded_desc *d = (const vtpv_decoded_desc *)(g_buf + sizeof(vtpv_cmpl_hdr));
-        CHECK(g_n == 1 && hdr()->status == VTPV_OK, "decode: ok (status=%d)", g_n ? hdr()->status : 99);
-        CHECK(d->width == W && d->height == H && d->pixfmt == VTPV_PIXFMT_NV12,
-              "decode: NV12 %ux%u descriptor", d->width, d->height);
-        surface_id = d->surface_id;
-        CHECK(surface_id != 0, "decode: surface id");
-    }
+    /* (decode + pixel readback are covered by test_h264, which runs a real
+     * I_PCM H.264 frame through vaBeginPicture/Render/End and verifies the
+     * decoded luma. This test stays on the backend lifecycle + D-GVA-2 caps.) */
 
-    /* 4. The decoded surface is derivable + mappable (the readback contract):
-     *    read its luma plane off the live driver. Stage 1 verifies the path
-     *    (vaDeriveImage + vaMapBuffer + row copy) succeeds for a real
-     *    render-target surface of the right size; the pixel *content* becomes
-     *    defined once the real bitstream decode lands (next stage). */
-    {
-        uint8_t luma[352 * 288];
-        memset(luma, 0xCC, sizeof(luma));
-        rc = vtpv_vaapi_read_luma(v, surface_id, luma, W, W, H);
-        CHECK(rc == 0, "readback: surface luma derivable+mappable (rc=%d)", rc);
-    }
-
-    /* 5. SESSION_END tears the VA objects down. */
+    /* 3. SESSION_END tears the VA objects down. */
     g_n = 0;
     { size_t n = mk_simple(msg, VTPV_MSG_SESSION_END, sid, 0x44); vtpv_proto_submit(p, msg, n); }
     CHECK(g_n == 1 && hdr()->status == VTPV_OK, "end: ok");
@@ -143,7 +111,7 @@ int main(int argc, char **argv)
     vtpv_proto_destroy(p);
     vtpv_vaapi_close(v);
 
-    printf("%s: VA-API backend (stage 1: display+caps+pipeline+surface)\n",
+    printf("%s: VA-API backend (display + caps + session lifecycle)\n",
            g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;
 }

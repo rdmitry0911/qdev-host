@@ -3,16 +3,17 @@
  * vtpv_vaapi.c - VA-API decode backend for the AppleGVA host device.
  * CLEAN-ROOM (see vtpv_vaapi.h). Increment 1, lane L-M2V03, 2026-11-16.
  *
- * Stage boundaries (increment 1):
+ * State (increment 1):
  *   - display open, capability enumeration (-> D-GVA-2), decode-pipeline
  *     setup (config/context/surface) and surface readback are REAL libva
  *     against the host render node.
- *   - the per-frame bitstream decode (open_decoder/decode) has the VA object
- *     lifecycle and the surface handoff wired; the H.264 access-unit ->
- *     VA-buffer mapping is in vtpv_h264.c (a minimal I-frame path). Until a
- *     backend decode path is proven on this GPU, `decode` fills the surface
- *     deterministically so the surface + readback contract is testable; the
- *     real path replaces that fill (guarded by VTPV_VAAPI_REAL_DECODE).
+ *   - H.264 decode is REAL: the in-band SPS/PPS/slice are parsed (vtpv_h264.c)
+ *     into the VA parameter buffers and run through vaBeginPicture /
+ *     vaRenderPicture / vaEndPicture into a render-target surface. Verified on
+ *     radeonsi with a minimal I_PCM I-frame: the decoded luma matches the
+ *     encoded samples exactly (test_h264.c).
+ *   - HEVC: the session lifecycle + surface handoff are wired; the HEVC
+ *     bitstream -> VA-buffer parse is the next codec increment.
  */
 #include "vtpv_vaapi.h"
 
@@ -26,6 +27,8 @@
 
 #include <va/va.h>
 #include <va/va_drm.h>
+
+#include "vtpv_h264.h"
 
 #define MAX_SURFACES 64
 
@@ -231,6 +234,154 @@ static void surf_forget_va(vtpv_vaapi *v, VASurfaceID va)
             v->surfaces[i].id = 0;
 }
 
+/* Release a list of VA buffers. */
+static void destroy_bufs(VADisplay dpy, VABufferID *b, int n)
+{
+    int i;
+    for (i = 0; i < n; i++)
+        if (b[i] != VA_INVALID_ID) vaDestroyBuffer(dpy, b[i]);
+}
+
+/*
+ * Real H.264 intra decode: parse the in-band SPS/PPS/slice, build the VA
+ * parameter buffers, and run vaBeginPicture/vaRenderPicture/vaEndPicture into
+ * `surf`. Returns VTPV_OK (surf holds the decoded frame) or VTPV_ERR_*.
+ */
+static int h264_decode(vaapi_dec *d, const uint8_t *sample, size_t len,
+                       VASurfaceID surf)
+{
+    vtpv_vaapi *v = d->v;
+    h264_nal nals[H264_MAX_NALS];
+    h264_sps sps; h264_pps pps; h264_slice sh;
+    int nn, i, have_sps = 0, have_pps = 0, slice_idx = -1;
+    VAPictureParameterBufferH264 pp;
+    VASliceParameterBufferH264 spar;
+    VAIQMatrixBufferH264 iq;
+    VABufferID buf[4] = { VA_INVALID_ID, VA_INVALID_ID, VA_INVALID_ID, VA_INVALID_ID };
+    VAStatus st;
+
+    nn = h264_split_nals(sample, len, nals, H264_MAX_NALS);
+    for (i = 0; i < nn; i++) {
+        int t = nals[i].size ? (nals[i].data[0] & 0x1f) : 0;
+        if (t == 7 && h264_parse_sps(&nals[i], &sps) == 0) have_sps = 1;
+        else if (t == 8 && have_sps && h264_parse_pps(&nals[i], &sps, &pps) == 0) have_pps = 1;
+        else if ((t == 5 || t == 1) && slice_idx < 0) slice_idx = i;
+    }
+    if (!have_sps || !have_pps || slice_idx < 0) {
+        VDBG("h264: missing sps/pps/slice (sps=%d pps=%d slice=%d)",
+             have_sps, have_pps, slice_idx);
+        return VTPV_ERR_MALFORMED;
+    }
+    if (h264_parse_slice_header(&nals[slice_idx], &sps, &pps, &sh) != 0) {
+        VDBG("h264: slice header parse failed");
+        return VTPV_ERR_MALFORMED;
+    }
+
+    /* picture parameter buffer */
+    memset(&pp, 0, sizeof(pp));
+    pp.CurrPic.picture_id = surf;
+    pp.CurrPic.frame_idx = (uint32_t)sh.frame_num;
+    pp.CurrPic.flags = 0;
+    pp.CurrPic.TopFieldOrderCnt = sh.pic_order_cnt_lsb;
+    pp.CurrPic.BottomFieldOrderCnt = sh.pic_order_cnt_lsb;
+    for (i = 0; i < 16; i++) {
+        pp.ReferenceFrames[i].picture_id = VA_INVALID_SURFACE;
+        pp.ReferenceFrames[i].flags = VA_PICTURE_H264_INVALID;
+    }
+    pp.picture_width_in_mbs_minus1 = (uint16_t)(sps.pic_width_in_mbs - 1);
+    pp.picture_height_in_mbs_minus1 = (uint16_t)(sps.pic_height_in_map_units - 1);
+    pp.bit_depth_luma_minus8 = (uint8_t)(sps.bit_depth_luma - 8);
+    pp.bit_depth_chroma_minus8 = (uint8_t)(sps.bit_depth_chroma - 8);
+    pp.num_ref_frames = (uint8_t)sps.max_num_ref_frames;
+    pp.seq_fields.bits.chroma_format_idc = sps.chroma_format_idc;
+    pp.seq_fields.bits.residual_colour_transform_flag = 0;
+    pp.seq_fields.bits.gaps_in_frame_num_value_allowed_flag =
+        sps.gaps_in_frame_num_value_allowed_flag;
+    pp.seq_fields.bits.frame_mbs_only_flag = sps.frame_mbs_only_flag;
+    pp.seq_fields.bits.mb_adaptive_frame_field_flag = sps.mb_adaptive_frame_field_flag;
+    pp.seq_fields.bits.direct_8x8_inference_flag = sps.direct_8x8_inference_flag;
+    pp.seq_fields.bits.MinLumaBiPredSize8x8 = 0;
+    pp.seq_fields.bits.log2_max_frame_num_minus4 = sps.log2_max_frame_num - 4;
+    pp.seq_fields.bits.pic_order_cnt_type = sps.pic_order_cnt_type;
+    pp.seq_fields.bits.log2_max_pic_order_cnt_lsb_minus4 =
+        sps.pic_order_cnt_type == 0 ? sps.log2_max_pic_order_cnt_lsb - 4 : 0;
+    pp.seq_fields.bits.delta_pic_order_always_zero_flag = 0;
+    pp.pic_init_qp_minus26 = (int8_t)(pps.pic_init_qp - 26);
+    pp.chroma_qp_index_offset = (int8_t)pps.chroma_qp_index_offset;
+    pp.second_chroma_qp_index_offset = (int8_t)pps.second_chroma_qp_index_offset;
+    pp.pic_fields.bits.entropy_coding_mode_flag = pps.entropy_coding_mode_flag;
+    pp.pic_fields.bits.weighted_pred_flag = pps.weighted_pred_flag;
+    pp.pic_fields.bits.weighted_bipred_idc = pps.weighted_bipred_idc;
+    pp.pic_fields.bits.transform_8x8_mode_flag = pps.transform_8x8_mode_flag;
+    pp.pic_fields.bits.field_pic_flag = 0;
+    pp.pic_fields.bits.constrained_intra_pred_flag = pps.constrained_intra_pred_flag;
+    pp.pic_fields.bits.pic_order_present_flag =
+        pps.bottom_field_pic_order_in_frame_present_flag;
+    pp.pic_fields.bits.deblocking_filter_control_present_flag =
+        pps.deblocking_filter_control_present_flag;
+    pp.pic_fields.bits.redundant_pic_cnt_present_flag = pps.redundant_pic_cnt_present_flag;
+    pp.pic_fields.bits.reference_pic_flag = sh.nal_ref_idc != 0;
+    pp.frame_num = (uint16_t)sh.frame_num;
+
+    /* flat (unscaled) quant matrices */
+    memset(&iq, 16, sizeof(iq));
+
+    /* slice parameter + data: the slice data buffer is the slice NAL bytes
+     * (start code excluded), slice_data_bit_offset measured from its first
+     * byte (the NAL header), which is what the parser reports. */
+    memset(&spar, 0, sizeof(spar));
+    spar.slice_data_size = (uint32_t)nals[slice_idx].size;
+    spar.slice_data_offset = 0;
+    spar.slice_data_flag = VA_SLICE_DATA_FLAG_ALL;
+    spar.slice_data_bit_offset = (uint16_t)sh.data_bit_offset;
+    spar.first_mb_in_slice = (uint16_t)sh.first_mb_in_slice;
+    spar.slice_type = (uint8_t)sh.slice_type;
+    spar.slice_qp_delta = (int8_t)(sh.slice_qp - pps.pic_init_qp);
+    spar.num_ref_idx_l0_active_minus1 = 0;
+    spar.num_ref_idx_l1_active_minus1 = 0;
+    for (i = 0; i < 32; i++) {
+        spar.RefPicList0[i].picture_id = VA_INVALID_SURFACE;
+        spar.RefPicList0[i].flags = VA_PICTURE_H264_INVALID;
+        spar.RefPicList1[i].picture_id = VA_INVALID_SURFACE;
+        spar.RefPicList1[i].flags = VA_PICTURE_H264_INVALID;
+    }
+
+    st = vaCreateBuffer(v->dpy, d->context, VAPictureParameterBufferType,
+                        sizeof(pp), 1, &pp, &buf[0]);
+    if (st == VA_STATUS_SUCCESS)
+        st = vaCreateBuffer(v->dpy, d->context, VAIQMatrixBufferType,
+                            sizeof(iq), 1, &iq, &buf[1]);
+    if (st == VA_STATUS_SUCCESS)
+        st = vaCreateBuffer(v->dpy, d->context, VASliceParameterBufferType,
+                            sizeof(spar), 1, &spar, &buf[2]);
+    if (st == VA_STATUS_SUCCESS)
+        st = vaCreateBuffer(v->dpy, d->context, VASliceDataBufferType,
+                            (unsigned)nals[slice_idx].size, 1,
+                            (void *)nals[slice_idx].data, &buf[3]);
+    if (st != VA_STATUS_SUCCESS) {
+        VDBG("h264: vaCreateBuffer: %s", vaErrorStr(st));
+        destroy_bufs(v->dpy, buf, 4);
+        return VTPV_ERR_BACKEND;
+    }
+
+    st = vaBeginPicture(v->dpy, d->context, surf);
+    if (st == VA_STATUS_SUCCESS)
+        st = vaRenderPicture(v->dpy, d->context, buf, 4);
+    if (st == VA_STATUS_SUCCESS)
+        st = vaEndPicture(v->dpy, d->context);
+    destroy_bufs(v->dpy, buf, 4);
+    if (st != VA_STATUS_SUCCESS) {
+        VDBG("h264: begin/render/end: %s", vaErrorStr(st));
+        return VTPV_ERR_BACKEND;
+    }
+    st = vaSyncSurface(v->dpy, surf);
+    if (st != VA_STATUS_SUCCESS) {
+        VDBG("h264: vaSyncSurface: %s", vaErrorStr(st));
+        return VTPV_ERR_BACKEND;
+    }
+    return VTPV_OK;
+}
+
 static int va_decode(void *dec, const uint8_t *sample, size_t sample_len,
                      vtpv_decoded_frame *out)
 {
@@ -238,20 +389,24 @@ static int va_decode(void *dec, const uint8_t *sample, size_t sample_len,
     vtpv_vaapi *v = d->v;
     VASurfaceID surf;
     uint32_t sid;
-    (void)sample; (void)sample_len;
+    int rc;
 
-    /*
-     * Increment 1, stage 1: the VA decode-session lifecycle and the surface
-     * handoff are real; the per-frame bitstream -> VA-buffer decode
-     * (vaBeginPicture/vaRenderPicture/vaEndPicture over an H.264/HEVC parse)
-     * is the next stage. We hand back a real render-target surface from the
-     * pool so the surface + readback contract (vaDeriveImage/map) is exercised
-     * now; its pixel content is defined once the real decode lands.
-     */
     if (d->n_pool <= 0) return VTPV_ERR_BACKEND;
     surf = d->pool[d->next % d->n_pool];
     d->next++;
     surf_forget_va(v, surf); /* reuse: drop a prior registration of it */
+
+    if (d->codec == VTPV_CODEC_H264) {
+        rc = h264_decode(d, sample, sample_len, surf);
+        if (rc != VTPV_OK) return rc;
+    } else {
+        /*
+         * HEVC decode (parse + VA-buffer mapping) is the next codec increment;
+         * the session lifecycle + surface handoff are exercised here. Return
+         * the render-target surface (content defined once HEVC parse lands).
+         */
+        (void)sample; (void)sample_len;
+    }
 
     sid = surf_register(v, surf, d->width, d->height);
     if (sid == 0)

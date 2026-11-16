@@ -31,12 +31,17 @@ $(BUILD):
 $(BUILD)/test-proto: vtpv_proto.c vtpv_proto.h test_proto.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ vtpv_proto.c test_proto.c
 
-$(BUILD)/test-vaapi: vtpv_proto.c vtpv_vaapi.c test_vaapi.c | $(BUILD)
-	$(CC) $(CFLAGS) $(VA_CFLAGS) -o $@ vtpv_proto.c vtpv_vaapi.c test_vaapi.c $(VA_LIBS)
+BACKEND := vtpv_proto.c vtpv_vaapi.c vtpv_h264.c
 
-$(BUILD)/apple-videotoolbox.so: apple-videotoolbox.c vtpv_proto.c vtpv_vaapi.c | $(BUILD)
+$(BUILD)/test-vaapi: $(BACKEND) test_vaapi.c | $(BUILD)
+	$(CC) $(CFLAGS) $(VA_CFLAGS) -o $@ $(BACKEND) test_vaapi.c $(VA_LIBS)
+
+$(BUILD)/test-h264: $(BACKEND) h264_gen.c test_h264.c | $(BUILD)
+	$(CC) $(CFLAGS) $(VA_CFLAGS) -o $@ $(BACKEND) h264_gen.c test_h264.c $(VA_LIBS)
+
+$(BUILD)/apple-videotoolbox.so: apple-videotoolbox.c $(BACKEND) | $(BUILD)
 	$(CC) $(CFLAGS) -Wno-unused-parameter -fPIC -shared $(QDP_INC) $(VFU_INC) $(VA_CFLAGS) \
-	    -o $@ apple-videotoolbox.c vtpv_proto.c vtpv_vaapi.c $(VA_LIBS)
+	    -o $@ apple-videotoolbox.c $(BACKEND) $(VA_LIBS)
 
 $(BUILD)/test-plugin: test_plugin.c $(BUILD)/apple-videotoolbox.so | $(BUILD)
 	$(CC) $(CFLAGS) $(QDP_INC) $(VFU_INC) -o $@ test_plugin.c -ldl
@@ -46,10 +51,14 @@ plugin: $(BUILD)/apple-videotoolbox.so
 test: $(BUILD)/test-proto
 	@echo "== protocol handler =="; $(BUILD)/test-proto
 ifeq ($(HAVE_VA),1)
-	@$(MAKE) --no-print-directory $(BUILD)/test-vaapi $(BUILD)/test-plugin
+	@$(MAKE) --no-print-directory $(BUILD)/test-vaapi $(BUILD)/test-h264 $(BUILD)/test-plugin
 	@echo "== VA-API backend (live render node) =="; \
 	 $(BUILD)/test-vaapi; rc=$$?; \
 	 if [ $$rc = 77 ]; then echo "(vaapi test skipped: no usable render node)"; \
+	 elif [ $$rc != 0 ]; then exit $$rc; fi
+	@echo "== H.264 I_PCM decode (live, pixel-verified) =="; \
+	 $(BUILD)/test-h264; rc=$$?; \
+	 if [ $$rc = 77 ]; then echo "(h264 test skipped: no usable render node)"; \
 	 elif [ $$rc != 0 ]; then exit $$rc; fi
 	@echo "== plugin ABI smoke =="; $(BUILD)/test-plugin $(BUILD)/apple-videotoolbox.so
 else
