@@ -65,11 +65,51 @@
 #define VT_QUEUE_MAX    256u     /* Apple's descriptor cap                    */
 #define VT_MSIX_VECTORS (VT_QUEUES + 1) /* per-queue + config                 */
 
-/* virtio feature bits this device offers / requires. Apple's base offers
- * indirect descriptors, event index, VERSION_1 and packed ring, and requires
- * VERSION_1 alone (devices.md "Transport"). Increment 1 advertises VERSION_1
- * only; the richer features come with the ring state machine. */
-#define VIRTIO_F_VERSION_1  (1ull << 32)
+/* virtio feature bits. Apple's base offers indirect-desc (28), event-idx (29),
+ * VERSION_1 (32) and packed-ring (34), and requires VERSION_1 alone (devices.md
+ * "Transport"). We advertise 28/29/32 and keep the SPLIT ring the plugin
+ * implements; we do NOT yet offer packed (34), so the guest driver negotiates
+ * split. (Packed is a follow-on if a real guest rejects the split ring.) */
+#define VIRTIO_F_INDIRECT_DESC  (1ull << 28)
+#define VIRTIO_F_RING_EVENT_IDX (1ull << 29)
+#define VIRTIO_F_VERSION_1      (1ull << 32)
+#define VIRTIO_F_RING_PACKED    (1ull << 34)
+#define VT_DEVICE_FEATURES \
+    (VIRTIO_F_INDIRECT_DESC | VIRTIO_F_RING_EVENT_IDX | VIRTIO_F_VERSION_1)
+
+/* virtio-modern PCI capability list (virtio 1.x §4.1.4). A virtio-modern driver
+ * (Apple's AppleVirtIOPCITransport) reads these vendor caps to LOCATE the
+ * common/notify/isr/device config structures in the BARs; without them it cannot
+ * bring the device up (it resets before queue-enable). */
+#define VIRTIO_PCI_CAP_COMMON_CFG 1
+#define VIRTIO_PCI_CAP_NOTIFY_CFG 2
+#define VIRTIO_PCI_CAP_ISR_CFG    3
+#define VIRTIO_PCI_CAP_DEVICE_CFG 4
+#define VIRTIO_PCI_CAP_PCI_CFG    5
+#ifndef PCI_CAP_ID_VNDR
+#define PCI_CAP_ID_VNDR 0x09
+#endif
+
+struct virtio_pci_cap {               /* starts with a struct cap_hdr {id,next}  */
+    uint8_t  cap_vndr;                /* PCI_CAP_ID_VNDR (== cap_hdr.id)         */
+    uint8_t  cap_next;                /* == cap_hdr.next (set by libvfio-user)   */
+    uint8_t  cap_len;                 /* size of this capability                 */
+    uint8_t  cfg_type;                /* VIRTIO_PCI_CAP_*                        */
+    uint8_t  bar;                     /* which BAR                               */
+    uint8_t  id;                      /* multiple caps of the same type          */
+    uint8_t  padding[2];
+    uint32_t offset;                  /* little-endian offset within the BAR     */
+    uint32_t length;                  /* little-endian length of the structure   */
+} __attribute__((packed));
+struct virtio_pci_notify_cap {
+    struct virtio_pci_cap cap;
+    uint32_t notify_off_multiplier;   /* little-endian                           */
+} __attribute__((packed));
+
+#define VT_BAR2_SIZE       0x1000u    /* MSI-X table + PBA                       */
+#define VT_MSIX_TABLE_OFF  0x0u
+#define VT_MSIX_PBA_OFF    0x800u
+#define VT_MSIX_BAR        2u
 
 #define VT_MAX_REGIONS 64
 
@@ -97,6 +137,10 @@ typedef struct vt_dev {
     /* guest DMA regions (from the host's dma_register/unregister). */
     qdp_dma_region regions[VT_MAX_REGIONS];
     int n_regions;
+
+    /* BAR2 backing for the MSI-X table + PBA (accesses the client doesn't
+     * intercept land here; libvfio-user owns the MSI-X cap itself). */
+    uint8_t msix_bar[VT_BAR2_SIZE];
 } vt_dev;
 
 /* the completion vq's MSI-X vector (set by the driver; config vector fallback) */
@@ -344,6 +388,62 @@ static ssize_t vt_bar0(vfu_ctx_t *ctx, char *buf, size_t count, loff_t off,
     return (ssize_t)count;
 }
 
+/* ---- BAR2: MSI-X table + PBA backing -------------------------------- *
+ * libvfio-user owns the MSI-X capability (enable/mask) and vector delivery; this
+ * region just backs any table/PBA access that reaches the device. */
+static ssize_t vt_bar2(vfu_ctx_t *ctx, char *buf, size_t count, loff_t off,
+                       bool is_write)
+{
+    vt_dev *d = g_dev;
+    (void)ctx;
+    if (!d || off < 0 || (size_t)off + count > VT_BAR2_SIZE)
+        return is_write ? (ssize_t)count : -1;
+    pthread_mutex_lock(&d->m);
+    if (is_write) memcpy(d->msix_bar + off, buf, count);
+    else          memcpy(buf, d->msix_bar + off, count);
+    pthread_mutex_unlock(&d->m);
+    return (ssize_t)count;
+}
+
+/* Add the MSI-X capability and the virtio-modern config-structure capabilities
+ * so a virtio-modern guest driver can locate the config windows and MSI-X. */
+static int vt_add_caps(vfu_ctx_t *ctx)
+{
+    struct msixcap msix;
+    memset(&msix, 0, sizeof msix);
+    msix.hdr.id = PCI_CAP_ID_MSIX;
+    msix.mxc.ts = VT_MSIX_VECTORS - 1;        /* table size - 1                  */
+    msix.mtab.tbir = VT_MSIX_BAR;
+    msix.mtab.to   = VT_MSIX_TABLE_OFF >> 3;
+    msix.mpba.pbir = VT_MSIX_BAR;
+    msix.mpba.pbao = VT_MSIX_PBA_OFF >> 3;
+    if (vfu_pci_add_capability(ctx, 0, 0, &msix) < 0) return -1;
+
+    struct virtio_pci_cap c;
+#define VCAP(type, boff, blen) do {                                            \
+        memset(&c, 0, sizeof c);                                              \
+        c.cap_vndr = PCI_CAP_ID_VNDR; c.cap_len = sizeof c;                    \
+        c.cfg_type = (type); c.bar = 0;                                        \
+        c.offset = (uint32_t)(boff); c.length = (uint32_t)(blen);             \
+        if (vfu_pci_add_capability(ctx, 0, 0, &c) < 0) return -1;             \
+    } while (0)
+    VCAP(VIRTIO_PCI_CAP_COMMON_CFG, VT_CFG_COMMON, 0x1000);
+    VCAP(VIRTIO_PCI_CAP_ISR_CFG,    VT_CFG_ISR,    0x1000);
+
+    struct virtio_pci_notify_cap ncap;
+    memset(&ncap, 0, sizeof ncap);
+    ncap.cap.cap_vndr = PCI_CAP_ID_VNDR; ncap.cap.cap_len = sizeof ncap;
+    ncap.cap.cfg_type = VIRTIO_PCI_CAP_NOTIFY_CFG; ncap.cap.bar = 0;
+    ncap.cap.offset = VT_CFG_NOTIFY; ncap.cap.length = 0x1000;
+    ncap.notify_off_multiplier = 4;           /* notify @ BAR0:0x4000 + q*4       */
+    if (vfu_pci_add_capability(ctx, 0, 0, &ncap) < 0) return -1;
+
+    VCAP(VIRTIO_PCI_CAP_DEVICE_CFG, VT_CFG_DEVICE, 0x1000);
+    VCAP(VIRTIO_PCI_CAP_PCI_CFG,    0, 0);     /* the alternate PCI-config access  */
+#undef VCAP
+    return 0;
+}
+
 /* ---- qdp_device_ops ------------------------------------------------- */
 
 static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
@@ -367,7 +467,7 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
     if (!d) return -ENOMEM;
     d->host = env->host_ops;
     pthread_mutex_init(&d->m, NULL);
-    d->device_features = VIRTIO_F_VERSION_1;
+    d->device_features = VT_DEVICE_FEATURES;
 
     /* bring up the VA-API decode backend + the protocol handler */
     rc = vtpv_vaapi_open(node, &d->va, &d->be, NULL, err, sizeof(err));
@@ -400,8 +500,18 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
     vfu_pci_set_id(ctx, VT_PCI_VENDOR, VT_PCI_DEVICE, VT_PCI_VENDOR, VT_PCI_DEVICE);
     vfu_pci_set_class(ctx, VT_PCI_CLASS, VT_PCI_SUBCLASS, 0x00);
 
+    /* MSI-X + the virtio-modern PCI capability list (so the guest driver can find
+     * the config windows). Must be added before the device is realized. */
+    if (vt_add_caps(ctx) < 0)
+        goto fail;
+
     /* BAR0: virtio-modern config window (common/ISR/notify/device). */
     if (vfu_setup_region(ctx, VFU_PCI_DEV_BAR0_REGION_IDX, VT_BAR0_SIZE, vt_bar0,
+                         VFU_REGION_FLAG_RW | VFU_REGION_FLAG_MEM, NULL, 0, -1, 0) < 0)
+        goto fail;
+
+    /* BAR2: the MSI-X table + PBA. */
+    if (vfu_setup_region(ctx, VFU_PCI_DEV_BAR2_REGION_IDX, VT_BAR2_SIZE, vt_bar2,
                          VFU_REGION_FLAG_RW | VFU_REGION_FLAG_MEM, NULL, 0, -1, 0) < 0)
         goto fail;
 
