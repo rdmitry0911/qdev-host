@@ -218,9 +218,10 @@ int aw_bplist_check(const uint8_t *buf, size_t len)
         for (int k = 0; k < off_size; k++) o = (o << 8) | buf[table + i * off_size + k];
         if (o < 8 || o >= table) return -1;
     }
-    /* the top object must be a dict (marker nibble 0xd) */
+    /* the top object must be a container: a dict (0xd) or an array (0xa) */
     uint64_t toff = 0;
     for (int k = 0; k < off_size; k++) toff = (toff << 8) | buf[table + top * off_size + k];
-    if ((buf[toff] >> 4) != 0xd) return -1;
+    uint8_t top_nibble = buf[toff] >> 4;
+    if (top_nibble != 0xd && top_nibble != 0xa) return -1;
     return 0;
 }

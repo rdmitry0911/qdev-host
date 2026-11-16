@@ -6,6 +6,7 @@
 #include "aw_sbuf.h"
 #include "aw_bplist.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -54,8 +55,9 @@ struct aw_engine {
 /* Dpba: {PixelFormatType [420v], Width, Height, IOSurfaceProperties {},
  * BytesPerRowAlignment 64, PlaneAlignment 256,
  * PreferRealTimeCacheModeIfEveryoneDoes true}. PixelFormatType is an array of
- * one OSType number ('420v'); if a guest shows it wants a string, swap
- * aw_bpl_int -> aw_bpl_string (a guest-confirm point, FIX-CANDIDATE §4.4). */
+ * one OSType NUMBER ('420v') — confirmed by L-GUEST-KEXT as the CoreVideo
+ * kCVPixelBufferPixelFormatTypeKey convention (CFNumber); keep NUMBER unless the
+ * shipping framework rejects it at dsta. */
 static size_t build_dpba_plist(uint8_t *out, size_t cap, uint32_t w, uint32_t h)
 {
     aw_bplist *b = aw_bplist_new();
@@ -100,18 +102,142 @@ static size_t build_hin_plist(uint8_t *out, size_t cap)
     return n;
 }
 
-/* A codec-list reply body (,dec / ,dca / ,enc). The decoder dictionaries built
- * from the live VA-API caps (CMClassImplementationID/Name, VTCodecType,
- * VTRating 400, VTPerProfileDetails) are a content follow-on; this emits a
- * well-formed (currently empty) bplist dict so the reply carries real plist
- * bytes the framework parses. */
-static size_t build_codeclist_plist(uint8_t *out, size_t cap)
+/* ---- codec metadata (our IDs/names; VA-API reports no level, so Apple's
+ * per-codec level is used, per devices.md "This host") ---------------------- */
+static const char *codec_fourcc_str(uint32_t codec)
+{
+    return codec == AW_CODEC_AVC1 ? "avc1" : codec == AW_CODEC_HVC1 ? "hvc1" : NULL;
+}
+static const char *codec_id(uint32_t codec)
+{
+    return codec == AW_CODEC_AVC1 ? "applegva-video.videodecoder.avc"
+         : codec == AW_CODEC_HVC1 ? "applegva-video.videodecoder.hevc" : NULL;
+}
+static const char *codec_name(uint32_t codec)
+{
+    return codec == AW_CODEC_AVC1 ? "AppleGVA Video Decoder - AVC"
+         : codec == AW_CODEC_HVC1 ? "AppleGVA Video Decoder - HEVC" : NULL;
+}
+/* profiles (as the bitstream's profile_idc / HEVC profile) and the decode level
+ * to advertise for each. */
+static void codec_profiles(uint32_t codec, const int **profs, int *n, int *level)
+{
+    static const int avc[]  = { 66, 77, 100 };    /* Baseline, Main, High        */
+    static const int hevc[] = { 1, 2, 3, 4 };
+    if (codec == AW_CODEC_AVC1) { *profs = avc;  *n = 3; *level = 80;  }
+    else if (codec == AW_CODEC_HVC1) { *profs = hevc; *n = 4; *level = 186; }
+    else { *profs = NULL; *n = 0; *level = 0; }
+}
+
+/* VTPerProfileDetails { "<profile>": { VTMaxDecodeLevel: level } } and the
+ * VTSupportedProfileArray, shared by ,dec and ,dca. */
+static int build_profile_details(aw_bplist *b, const int *profs, int n, int level)
+{
+    int keys[8], vals[8];
+    for (int i = 0; i < n && i < 8; i++) {
+        char ps[16]; snprintf(ps, sizeof ps, "%d", profs[i]);
+        int lk = aw_bpl_string(b, "VTMaxDecodeLevel");
+        int lv = aw_bpl_int(b, level);
+        keys[i] = aw_bpl_string(b, ps);
+        vals[i] = aw_bpl_dict(b, &lk, &lv, 1);
+    }
+    return aw_bpl_dict(b, keys, vals, n);
+}
+static int build_profile_array(aw_bplist *b, const int *profs, int n)
+{
+    int refs[8];
+    for (int i = 0; i < n && i < 8; i++) refs[i] = aw_bpl_int(b, profs[i]);
+    return aw_bpl_array(b, refs, n);
+}
+
+/* One decoder-list entry: CMClassImplementationID/Name, VTCodecType [fourcc],
+ * VTDecoderCapabilities {VTPerProfileDetails, VTSupportedProfileArray},
+ * VTRating 400 (devices.md "What an entry holds"). */
+static int build_decoder_entry(aw_bplist *b, uint32_t codec)
+{
+    const int *profs; int np, level;
+    codec_profiles(codec, &profs, &np, &level);
+
+    int cstr  = aw_bpl_string(b, codec_fourcc_str(codec));
+    int vtct  = aw_bpl_array(b, &cstr, 1);
+    int dck[2] = { aw_bpl_string(b, "VTPerProfileDetails"),
+                   aw_bpl_string(b, "VTSupportedProfileArray") };
+    int dcv[2] = { build_profile_details(b, profs, np, level),
+                   build_profile_array(b, profs, np) };
+    int dcaps = aw_bpl_dict(b, dck, dcv, 2);
+
+    int ek[5] = { aw_bpl_string(b, "CMClassImplementationID"),
+                  aw_bpl_string(b, "CMClassImplementationName"),
+                  aw_bpl_string(b, "VTCodecType"),
+                  aw_bpl_string(b, "VTDecoderCapabilities"),
+                  aw_bpl_string(b, "VTRating") };
+    int ev[5] = { aw_bpl_string(b, codec_id(codec)),
+                  aw_bpl_string(b, codec_name(codec)),
+                  vtct, dcaps, aw_bpl_int(b, 400) };
+    return aw_bpl_dict(b, ek, ev, 5);
+}
+
+/* ,dec: an array of decoder entries, one per codec the backend decodes. */
+static size_t build_decoder_list_plist(uint8_t *out, size_t cap,
+                                       const uint32_t *codecs, int ncodec)
 {
     aw_bplist *b = aw_bplist_new();
     if (!b) return 0;
-    int root = aw_bpl_dict(b, NULL, NULL, 0);
+    int entries[8];
+    int ne = 0;
+    for (int i = 0; i < ncodec && ne < 8; i++)
+        if (codec_fourcc_str(codecs[i])) entries[ne++] = build_decoder_entry(b, codecs[i]);
+    int root = aw_bpl_array(b, entries, ne);
     size_t n = (root >= 0) ? aw_bplist_finalize(b, root, out, cap) : 0;
     aw_bplist_free(b);
+    return n;
+}
+
+/* ,dca for one codec: {VTIsHDRAllowedOnDevice true, VTPerProfileSupport
+ * {profile: {VTIsHardwareAccelerated, VTMaxDecodeLevel, VTMaxPlaybackLevel}},
+ * VTSupportedProfiles} (devices.md "dcap for avc1"). NULL plist for an
+ * unsupported codec. */
+static size_t build_dcap_plist(uint8_t *out, size_t cap, uint32_t codec)
+{
+    const int *profs; int np, level;
+    codec_profiles(codec, &profs, &np, &level);
+    if (!np) return 0;              /* unsupported codec -> NULL (=pls no bytes)  */
+
+    aw_bplist *b = aw_bplist_new();
+    if (!b) return 0;
+    int pk[8], pv[8];
+    for (int i = 0; i < np && i < 8; i++) {
+        char ps[16]; snprintf(ps, sizeof ps, "%d", profs[i]);
+        int k[3] = { aw_bpl_string(b, "VTIsHardwareAccelerated"),
+                     aw_bpl_string(b, "VTMaxDecodeLevel"),
+                     aw_bpl_string(b, "VTMaxPlaybackLevel") };
+        int vv[3] = { aw_bpl_bool(b, 1), aw_bpl_int(b, level), aw_bpl_int(b, level) };
+        pk[i] = aw_bpl_string(b, ps);
+        pv[i] = aw_bpl_dict(b, k, vv, 3);
+    }
+    int per = aw_bpl_dict(b, pk, pv, np);
+    int rk[3] = { aw_bpl_string(b, "VTIsHDRAllowedOnDevice"),
+                  aw_bpl_string(b, "VTPerProfileSupport"),
+                  aw_bpl_string(b, "VTSupportedProfiles") };
+    int rv[3] = { aw_bpl_bool(b, 1), per, build_profile_array(b, profs, np) };
+    int root = aw_bpl_dict(b, rk, rv, 3);
+    size_t n = (root >= 0) ? aw_bplist_finalize(b, root, out, cap) : 0;
+    aw_bplist_free(b);
+    return n;
+}
+
+/* Enumerate the codecs the backend decodes into `out` (up to `max`) from the
+ * live VA-API caps; returns the count. */
+static int engine_decode_codecs(aw_engine *e, uint32_t *out, int max)
+{
+    if (!e->cfg.be || !e->cfg.be->query_caps) return 0;
+    uint8_t buf[256];
+    vtpv_caps *caps = (vtpv_caps *)buf;
+    if (e->cfg.be->query_caps(e->cfg.be_ctx, caps, sizeof buf) < 0) return 0;
+    const vtpv_codec_cap *cc = (const vtpv_codec_cap *)(buf + sizeof(vtpv_caps));
+    int n = 0;
+    for (uint16_t i = 0; i < caps->n_codecs && n < max; i++)
+        if (cc[i].can_decode) out[n++] = cc[i].codec;
     return n;
 }
 
@@ -250,29 +376,59 @@ static uint64_t next_req_id(aw_engine *e) { return e->next_reply_id++; }
  * The codec-list dictionaries are binary plists (H4); here we emit a structurally
  * valid reply carrying ,ver 6 and an empty =pls list, which H4 fills from the
  * live VA-API caps. The routing + reply framing are what this slice proves. */
-static int32_t handle_listlike(aw_engine *e, const aw_msg_view *v, uint32_t list_key)
+/* Emit a list-style reply: a single `=pls` list/dict body under `list_key`, plus
+ * ,ver 6. `pls`/`pls_len` may be an empty list or NULL (pls_len 0). */
+static void emit_list_reply(aw_engine *e, const aw_msg_view *v, uint32_t list_key,
+                            const uint8_t *pls, size_t pls_len)
 {
-    uint8_t pls[128];
-    size_t pls_len = build_codeclist_plist(pls, sizeof pls);
-    uint8_t buf[256];
+    uint8_t buf[2048];               /* a decoder list is a few hundred bytes      */
     aw_builder b;
     aw_builder_init(&b, buf, sizeof buf);
     aw_build_header(&b, v->type, AW_FLAG_HOST_REPLY, v->uuid, v->reply_id);
-    aw_put_bytes(&b, list_key, AW_VT_PLS, pls, pls_len); /* bplist dict (H4)      */
+    aw_put_bytes(&b, list_key, AW_VT_PLS, pls, pls_len);
     aw_put_u32(&b, AW_KEY_VER, 6);
     size_t n = aw_build_finalize(&b);
     if (n) emit(e, buf, n);
+}
+
+/* decs: ,dec = the decoder entries built from the live VA-API caps, + ,ver 6. */
+static int32_t handle_decs(aw_engine *e, const aw_msg_view *v)
+{
+    uint32_t codecs[8];
+    int nc = engine_decode_codecs(e, codecs, 8);
+    uint8_t pls[1536];
+    size_t pls_len = build_decoder_list_plist(pls, sizeof pls, codecs, nc);
+    emit_list_reply(e, v, AW_KEY_DEC, pls, pls_len);
     return AW_NOERR;
 }
 
+/* encs: no encoders yet -> ,enc empty list + ,ver 6. */
+static int32_t handle_encs(aw_engine *e, const aw_msg_view *v)
+{
+    uint8_t pls[64];
+    size_t pls_len = build_decoder_list_plist(pls, sizeof pls, NULL, 0); /* [] */
+    emit_list_reply(e, v, AW_KEY_ENC, pls, pls_len);
+    return AW_NOERR;
+}
+
+/* dcap: ,dca = the capabilities of the decoder for ,cod (=s32), NULL for a
+ * codec the backend lacks, + ,ver 6. */
 static int32_t handle_dcap(aw_engine *e, const aw_msg_view *v)
 {
-    int32_t cod;
+    int32_t cod = 0;
     int r = aw_get_s32(v, AW_KEY_COD, &cod);
     if (r == AW_PARSE_WRONGTYPE || r == AW_PARSE_SHORT)
         return AW_ERR_MALFORMED;     /* ,cod present with wrong type: -19093, no reply */
-    /* absent ,cod -> default; reply ,dca (NULL for an unknown codec) + ,ver 6 */
-    return handle_listlike(e, v, AW_KEY_DCA);
+
+    /* only advertise caps for a codec the backend actually decodes */
+    uint32_t codecs[8];
+    int nc = engine_decode_codecs(e, codecs, 8), served = 0;
+    for (int i = 0; i < nc; i++) if (codecs[i] == (uint32_t)cod) served = 1;
+
+    uint8_t pls[1024];
+    size_t pls_len = served ? build_dcap_plist(pls, sizeof pls, (uint32_t)cod) : 0;
+    emit_list_reply(e, v, AW_KEY_DCA, pls, pls_len);  /* NULL =pls when unserved   */
+    return AW_NOERR;
 }
 
 static int32_t handle_opendec(aw_engine *e, const aw_msg_view *v)
@@ -564,8 +720,8 @@ int32_t aw_engine_deliver(aw_engine *e, const uint8_t *msg, size_t len)
 
     switch (v.type) {
     /* session-less */
-    case AW_MSG_DECS: return handle_listlike(e, &v, AW_KEY_DEC);
-    case AW_MSG_ENCS: return handle_listlike(e, &v, AW_KEY_ENC);
+    case AW_MSG_DECS: return handle_decs(e, &v);
+    case AW_MSG_ENCS: return handle_encs(e, &v);
     case AW_MSG_DCAP: return handle_dcap(e, &v);
     case AW_MSG_PDEC: return handle_opendec(e, &v);
     case AW_MSG_MDEC:

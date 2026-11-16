@@ -34,7 +34,17 @@ static int e_type(int i, aw_msg_view *v) { return aw_parse(g_e[i], g_el[i], v); 
 
 /* ---- mock backend --------------------------------------------------- */
 static int g_open_calls, g_decode_calls, g_close_calls, g_open_fail;
-static int mock_query(void *c, vtpv_caps *o, size_t cap){ (void)c;(void)o;(void)cap; return 0; }
+static int mock_query(void *c, vtpv_caps *o, size_t cap){
+    (void)c;
+    vtpv_codec_cap *cc = (vtpv_codec_cap *)((uint8_t *)o + sizeof(*o));
+    if (cap < sizeof(*o) + 2 * sizeof(*cc)) return -1;
+    o->magic = VTPV_CAPS_MAGIC; o->abi = VTPV_ABI; o->n_codecs = 2;
+    cc[0].codec = VTPV_CODEC_H264; cc[0].can_decode = 1; cc[0].can_encode = 0;
+    cc[0].reserved = 0; cc[0].max_width = 4096; cc[0].max_height = 4096; cc[0].out_pixfmt = VTPV_PIXFMT_NV12;
+    cc[1].codec = VTPV_CODEC_HEVC; cc[1].can_decode = 1; cc[1].can_encode = 0;
+    cc[1].reserved = 0; cc[1].max_width = 8192; cc[1].max_height = 8192; cc[1].out_pixfmt = VTPV_PIXFMT_NV12;
+    return 2;
+}
 static int mock_open(void *c, uint32_t codec, uint32_t w, uint32_t h,
                      const uint8_t *ex, size_t exl, void **dec) {
     (void)c;(void)codec;(void)w;(void)h;(void)ex;(void)exl;
@@ -113,6 +123,21 @@ static void test_listlike_routing(void) {
     CHECK(e_type(0, &v) == AW_PARSE_OK && v.type == AW_MSG_DECS && v.flags == AW_FLAG_HOST_REPLY, "decs reply type/flag");
     uint32_t ver = 0;
     CHECK(aw_get_u32(&v, AW_KEY_VER, &ver) == AW_PARSE_OK && ver == 6, "decs ,ver 6");
+    /* ,dec is a real bplist decoder list built from the (mock) caps: valid, and
+     * carries the AVC/HEVC codec types, our IDs and VTRating. */
+    {
+        const uint8_t *pls; size_t pl;
+        CHECK(aw_get_bytes(&v, AW_KEY_DEC, AW_VT_PLS, &pls, &pl) == AW_PARSE_OK, "decs carries ,dec =pls");
+        CHECK(pl > 8 && aw_bplist_check(pls, pl) == 0, "decs ,dec is a valid bplist");
+        int has_avc1 = 0, has_rating = 0, has_id = 0;
+        for (size_t i = 0; i + 4 <= pl; i++) {
+            if (memcmp(pls + i, "avc1", 4) == 0) has_avc1 = 1;
+            if (i + 8 <= pl && memcmp(pls + i, "VTRating", 8) == 0) has_rating = 1;
+        }
+        for (size_t i = 0; i + 30 <= pl; i++)
+            if (memcmp(pls + i, "applegva-video.videodecoder.avc", 31 > pl - i ? pl - i : 31) == 0) { has_id = 1; break; }
+        CHECK(has_avc1 && has_rating && has_id, "decs ,dec names avc1 + VTRating + our decoder ID");
+    }
 
     /* dcap with ,cod present but WRONG value-type -> -19093, no reply */
     aw_builder b; aw_builder_init(&b, m, sizeof m);

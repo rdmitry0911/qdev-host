@@ -25,7 +25,7 @@
 extern "C" {
 #endif
 
-#define AW_BPL_MAX_OBJECTS 64
+#define AW_BPL_MAX_OBJECTS 256
 #define AW_BPL_MAX_CHILDREN 32
 
 typedef struct aw_bplist aw_bplist;
@@ -49,7 +49,8 @@ int aw_bpl_dict(aw_bplist *b, const int *key_refs, const int *val_refs, int n);
 size_t aw_bplist_finalize(aw_bplist *b, int root, uint8_t *out, size_t cap);
 
 /* Host-side proof: validate that `buf` is a structurally well-formed bplist00
- * (magic, trailer consistent, every offset/ref in range, top object a dict).
+ * (magic, trailer consistent, every offset/ref in range, top object a container
+ * — a dict or an array).
  * Returns 0 if well-formed, <0 otherwise. This stands in for a round-trip
  * through CFPropertyListCreateWithData, which is unavailable off a Mac. */
 int aw_bplist_check(const uint8_t *buf, size_t len);
