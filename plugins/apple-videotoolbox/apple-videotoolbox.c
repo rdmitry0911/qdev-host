@@ -31,6 +31,7 @@
  *     and unit-tested (vtpv_proto, test_proto.c).
  */
 #define _GNU_SOURCE
+#include <dlfcn.h>
 #include <errno.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -47,6 +48,15 @@
 #include "vtpv_vaapi.h"
 #include "vtpv_virtq.h"
 #include "aw_session.h"   /* the Apple contract-B wire session engine (H5/H6/H7) */
+#include "vtpv_backing.h" /* the warm-swap VARIABLE backing ABI                  */
+
+/* The FROZEN envelope/transport version: message framing + virtqueue layout +
+ * handshake + the capability-negotiation mechanism. Reported by abi_tag and in
+ * the caps handshake; an updater's ABI-gate compares it to decide warm-swap vs
+ * reboot. It is NOT the feature-command set version (the decs reply's ,ver),
+ * which can change under a warm swap without a reboot. */
+#define VT_ENVELOPE_VERSION "vtpv-envelope-1"
+#define VT_STACK_VERSION_DEFAULT "apple-videotoolbox 0.3-warmswap"
 
 /* ---- device constants ---------------------------------------------- */
 
@@ -169,6 +179,11 @@ typedef struct vt_dev {
     unsigned pend_head;   /* index of the oldest pending message */
     unsigned pend_count;  /* number of pending messages */
     uint64_t pend_dropped;/* diagnostics: messages lost to a full ring */
+
+    /* warm-swap VARIABLE backing (see vtpv_backing.h). */
+    void *backing_h;              /* dlopen handle of the active backing .so (NULL = builtin) */
+    char  backing_tag[32];        /* current backing tag, for logging + device-abi            */
+    char  stack_version[96];      /* host stack version advertised in the caps handshake      */
 } vt_dev;
 
 /* the completion vq's MSI-X vector (set by the driver; config vector fallback) */
@@ -597,6 +612,72 @@ static const vtpv_decoder_backend fake_h264_be = {
 
 /* ---- qdp_device_ops ------------------------------------------------- */
 
+/* ---- warm-swap VARIABLE backing ------------------------------------------
+ * "fixed resident kext / variable host backend": the guest-side kext freezes
+ * the ENVELOPE; the content it advertises (the decoder/capability set + the
+ * benign CodecName observable) lives here and is swapped under a live guest.
+ * The swap is content-only: no wire framing / virtqueue / handshake changes. */
+
+/* Built-in backings so the A/B proof and smoke tests work without an external
+ * .so. A = boot default (AVC only, stock name); B = AVC + newly-added HEVC and
+ * a changed CodecName. These mirror backing_A.c / backing_B.c. */
+static const vtpv_backing_v1 vt_builtin_A = { VTPV_BACKING_ABI, "A", AW_CONTENT_AVC, "" };
+static const vtpv_backing_v1 vt_builtin_B = { VTPV_BACKING_ABI, "B",
+                                              AW_CONTENT_AVC | AW_CONTENT_HEVC, " [warmswapB]" };
+
+/* Apply a backing descriptor to the live engine. Caller holds d->m. */
+static void vt_apply_backing(vt_dev *d, const vtpv_backing_v1 *b)
+{
+    aw_engine_set_content(d->engine, b->codec_mask, b->name_suffix);
+    strncpy(d->backing_tag, b->tag ? b->tag : "?", sizeof(d->backing_tag) - 1);
+    d->backing_tag[sizeof(d->backing_tag) - 1] = '\0';
+}
+
+/* qdp v3 swap op: resolve `arg` to a backing and apply it under d->m.
+ *   ""/"default"/"A"/"builtin:A" -> built-in A
+ *   "B"/"builtin:B"              -> built-in B
+ *   any other string            -> dlopen it as a backing .so (vtpv_backing_v1)
+ * On a successful .so swap the previous dlopen handle is closed. Returns 0 or
+ * -errno. Runs quiesced (qdev-host quiesces before calling this when the plugin
+ * has a quiesce op); it also takes d->m, so it is safe regardless. */
+static int vt_swap(void *priv, const char *arg)
+{
+    vt_dev *d = priv;
+    if (!d || !d->engine) return -EINVAL;
+    const char *a = arg ? arg : "";
+    const vtpv_backing_v1 *b = NULL;
+    void *newh = NULL;
+
+    if (*a == '\0' || !strcmp(a, "default") || !strcmp(a, "A") || !strcmp(a, "builtin:A"))
+        b = &vt_builtin_A;
+    else if (!strcmp(a, "B") || !strcmp(a, "builtin:B"))
+        b = &vt_builtin_B;
+    else {
+        newh = dlopen(a, RTLD_NOW | RTLD_LOCAL);
+        if (!newh) { vt_log(d, 1, "swap: dlopen %s: %s", a, dlerror()); return -ENOENT; }
+        vtpv_backing_fn fn = (vtpv_backing_fn)dlsym(newh, VTPV_BACKING_SYMBOL);
+        if (!fn) { vt_log(d, 1, "swap: %s: no %s symbol", a, VTPV_BACKING_SYMBOL); dlclose(newh); return -ENOEXEC; }
+        b = fn();
+        if (!b || b->abi != VTPV_BACKING_ABI) {
+            vt_log(d, 1, "swap: %s: bad backing ABI", a); dlclose(newh); return -ENOEXEC;
+        }
+    }
+
+    pthread_mutex_lock(&d->m);
+    vt_apply_backing(d, b);
+    void *oldh = d->backing_h;
+    d->backing_h = newh;   /* NULL for a builtin */
+    pthread_mutex_unlock(&d->m);
+    if (oldh) dlclose(oldh);
+    vt_log(d, 2, "WARM-SWAP backing -> tag '%s' (codec_mask 0x%x, name_suffix '%s') %s%s",
+           b->tag ? b->tag : "?", b->codec_mask, b->name_suffix ? b->name_suffix : "",
+           newh ? "from " : "(builtin)", newh ? a : "");
+    return 0;
+}
+
+/* qdp v3 abi_tag op: the FROZEN envelope/transport version. */
+static const char *vt_abi_tag(void *priv) { (void)priv; return VT_ENVELOPE_VERSION; }
+
 static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
                     void **priv)
 {
@@ -648,6 +729,47 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
         if (d->va) vtpv_vaapi_close(d->va);
         free(d);
         return -ENOMEM;
+    }
+
+    /* Version advertisement (host stack version + FROZEN envelope version),
+     * carried in the caps re-handshake so a warm swap re-advertises on resume.
+     * The host stack version is overridable via plugin-arg stack_version= (so
+     * the bundle/QMetal/air build ids can be passed in). */
+    strncpy(d->stack_version, VT_STACK_VERSION_DEFAULT, sizeof(d->stack_version) - 1);
+    if (args) {
+        const char *p = strstr(args, "stack_version=");
+        if (p) {
+            p += strlen("stack_version=");
+            size_t i = 0;
+            while (p[i] && p[i] != ',' && i < sizeof(d->stack_version) - 1) { d->stack_version[i] = p[i]; i++; }
+            d->stack_version[i] = '\0';
+        }
+    }
+    aw_engine_set_version(d->engine, d->stack_version, VT_ENVELOPE_VERSION);
+
+    /* Boot default VARIABLE backing: A (AVC only, stock CodecName), unless a
+     * plugin-arg selects another (backing=A|B|<path-to-.so>). */
+    {
+        const vtpv_backing_v1 *boot = &vt_builtin_A;
+        void *booth = NULL;
+        if (args) {
+            const char *p = strstr(args, "backing=");
+            if (p) {
+                char sel[256]; size_t i = 0; p += strlen("backing=");
+                while (p[i] && p[i] != ',' && i < sizeof(sel) - 1) { sel[i] = p[i]; i++; }
+                sel[i] = '\0';
+                if (!strcmp(sel, "B") || !strcmp(sel, "builtin:B")) boot = &vt_builtin_B;
+                else if (sel[0] && strcmp(sel, "A") && strcmp(sel, "builtin:A") && strcmp(sel, "default")) {
+                    booth = dlopen(sel, RTLD_NOW | RTLD_LOCAL);
+                    vtpv_backing_fn fn = booth ? (vtpv_backing_fn)dlsym(booth, VTPV_BACKING_SYMBOL) : NULL;
+                    const vtpv_backing_v1 *bb = fn ? fn() : NULL;
+                    if (bb && bb->abi == VTPV_BACKING_ABI) boot = bb;
+                    else { if (booth) dlclose(booth); booth = NULL; vt_log(d, 1, "backing=%s invalid; using builtin A", sel); }
+                }
+            }
+        }
+        d->backing_h = booth;
+        vt_apply_backing(d, boot);
     }
 
     /* PCI identity the guest kext matches (IOPCIPrimaryMatch 0x1a03106b) */
@@ -703,6 +825,7 @@ static void vt_teardown(void *priv)
     if (g_dev == d) g_dev = NULL;
     aw_engine_destroy(d->engine);
     if (d->va) vtpv_vaapi_close(d->va);
+    if (d->backing_h) dlclose(d->backing_h);
     pthread_mutex_destroy(&d->m);
     free(d);
 }
@@ -759,12 +882,15 @@ static void vt_dma_unregister(void *priv, const qdp_dma_region *region)
 static const qdp_device_ops ops = {
     .abi_version = QDP_ABI_VERSION,
     .name = "apple-videotoolbox",
-    .version = "0.2-inc2",
+    .version = "0.3-warmswap",
     .setup = vt_setup,
     .teardown = vt_teardown,
     .reset = vt_reset,
     .dma_register = vt_dma_register,
     .dma_unregister = vt_dma_unregister,
+    /* v3 warm-swap of the VARIABLE backing (envelope frozen). */
+    .abi_tag = vt_abi_tag,
+    .swap = vt_swap,
 };
 
 const qdp_device_ops *qdp_plugin_v1(void) { return &ops; }

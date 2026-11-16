@@ -47,7 +47,32 @@ struct aw_engine {
     aw_session_cfg cfg;
     aw_dsession    sess[AW_MAX_SESSIONS];
     uint64_t       next_reply_id; /* host reply clerk: numbers from 100          */
+    /* warm-swap VARIABLE content (see aw_session.h). */
+    uint32_t       content_mask;      /* 0 = backend caps; else AW_CONTENT_*      */
+    char           content_suffix[48];/* appended to each advertised CodecName    */
+    /* version advertisement, carried in the caps re-handshake (,hin). */
+    char           host_version[96];  /* host stack version (bundle/QMetal/air)   */
+    char           envelope[32];      /* FROZEN envelope/transport version        */
 };
+
+void aw_engine_set_version(aw_engine *e, const char *host_version, const char *envelope)
+{
+    if (!e) return;
+    e->host_version[0] = e->envelope[0] = '\0';
+    if (host_version) { strncpy(e->host_version, host_version, sizeof(e->host_version) - 1); e->host_version[sizeof(e->host_version) - 1] = '\0'; }
+    if (envelope)     { strncpy(e->envelope, envelope, sizeof(e->envelope) - 1); e->envelope[sizeof(e->envelope) - 1] = '\0'; }
+}
+
+void aw_engine_set_content(aw_engine *e, uint32_t codec_mask, const char *name_suffix)
+{
+    if (!e) return;
+    e->content_mask = codec_mask;
+    e->content_suffix[0] = '\0';
+    if (name_suffix) {
+        strncpy(e->content_suffix, name_suffix, sizeof(e->content_suffix) - 1);
+        e->content_suffix[sizeof(e->content_suffix) - 1] = '\0';
+    }
+}
 
 /* ---- binary-plist payloads (H4) ------------------------------------------ *
  * The guest's VideoToolbox parses these as bplist00 (contract-B §3). */
@@ -89,14 +114,22 @@ static size_t build_dpba_plist(uint8_t *out, size_t cap, uint32_t w, uint32_t h)
     return n;
 }
 
-/* ,hin: {VTHostBuildVersion: "<our host id>"}. */
-static size_t build_hin_plist(uint8_t *out, size_t cap)
+/* ,hin: the host version advertisement, carried on the opendec reply AND on
+ * every caps re-handshake reply (decs/dcap/encs) so a warm swap re-advertises
+ * it on resume: {VTHostBuildVersion, VTHostStackVersion, VTEnvelopeVersion}.
+ * VTEnvelopeVersion is the FROZEN transport-protocol version (the warm-vs-
+ * reboot gate); it is NOT the feature-command set version (,ver). */
+static size_t build_hin_plist(aw_engine *e, uint8_t *out, size_t cap)
 {
     aw_bplist *b = aw_bplist_new();
     if (!b) return 0;
-    int k = aw_bpl_string(b, "VTHostBuildVersion");
-    int v = aw_bpl_string(b, "applegva-video 0.1");
-    int root = aw_bpl_dict(b, &k, &v, 1);
+    const char *hv = (e && e->host_version[0]) ? e->host_version : "applegva-video 0.3-warmswap";
+    const char *ev = (e && e->envelope[0]) ? e->envelope : "vtpv-envelope-1";
+    int k[3] = { aw_bpl_string(b, "VTHostBuildVersion"),
+                 aw_bpl_string(b, "VTHostStackVersion"),
+                 aw_bpl_string(b, "VTEnvelopeVersion") };
+    int v[3] = { aw_bpl_string(b, hv), aw_bpl_string(b, hv), aw_bpl_string(b, ev) };
+    int root = aw_bpl_dict(b, k, v, 3);
     size_t n = (root >= 0) ? aw_bplist_finalize(b, root, out, cap) : 0;
     aw_bplist_free(b);
     return n;
@@ -153,10 +186,17 @@ static int build_profile_array(aw_bplist *b, const int *profs, int n)
 /* One decoder-list entry: CMClassImplementationID/Name, IsPreferredInternalPlugin
  * false, VTCodecType [fourcc], VTDecoderCapabilities {VTPerProfileDetails,
  * VTSupportedProfileArray}, VTRating 400 (devices.md "What an entry holds"). */
-static int build_decoder_entry(aw_bplist *b, uint32_t codec)
+static int build_decoder_entry(aw_bplist *b, uint32_t codec, const char *suffix)
 {
     const int *profs; int np, level;
     codec_profiles(codec, &profs, &np, &level);
+
+    /* CMClassImplementationName with the VARIABLE content suffix appended (a
+     * benign observable; the frozen wire shape is unchanged). */
+    char nbuf[96];
+    const char *base = codec_name(codec);
+    if (suffix && *suffix) snprintf(nbuf, sizeof nbuf, "%s%s", base ? base : "", suffix);
+    else { nbuf[0] = '\0'; if (base) { strncpy(nbuf, base, sizeof(nbuf) - 1); nbuf[sizeof(nbuf) - 1] = '\0'; } }
 
     int cstr  = aw_bpl_string(b, codec_fourcc_str(codec));
     int vtct  = aw_bpl_array(b, &cstr, 1);
@@ -173,7 +213,7 @@ static int build_decoder_entry(aw_bplist *b, uint32_t codec)
                   aw_bpl_string(b, "VTDecoderCapabilities"),
                   aw_bpl_string(b, "VTRating") };
     int ev[6] = { aw_bpl_string(b, codec_id(codec)),
-                  aw_bpl_string(b, codec_name(codec)),
+                  aw_bpl_string(b, nbuf),
                   aw_bpl_bool(b, 0),            /* IsPreferredInternalPlugin false */
                   vtct, dcaps, aw_bpl_int(b, 400) };
     return aw_bpl_dict(b, ek, ev, 6);
@@ -181,14 +221,15 @@ static int build_decoder_entry(aw_bplist *b, uint32_t codec)
 
 /* ,dec: an array of decoder entries, one per codec the backend decodes. */
 static size_t build_decoder_list_plist(uint8_t *out, size_t cap,
-                                       const uint32_t *codecs, int ncodec)
+                                       const uint32_t *codecs, int ncodec,
+                                       const char *suffix)
 {
     aw_bplist *b = aw_bplist_new();
     if (!b) return 0;
     int entries[8];
     int ne = 0;
     for (int i = 0; i < ncodec && ne < 8; i++)
-        if (codec_fourcc_str(codecs[i])) entries[ne++] = build_decoder_entry(b, codecs[i]);
+        if (codec_fourcc_str(codecs[i])) entries[ne++] = build_decoder_entry(b, codecs[i], suffix);
     int root = aw_bpl_array(b, entries, ne);
     size_t n = (root >= 0) ? aw_bplist_finalize(b, root, out, cap) : 0;
     aw_bplist_free(b);
@@ -232,6 +273,15 @@ static size_t build_dcap_plist(uint8_t *out, size_t cap, uint32_t codec)
  * live VA-API caps; returns the count. */
 static int engine_decode_codecs(aw_engine *e, uint32_t *out, int max)
 {
+    /* Warm-swap VARIABLE content: a nonzero content_mask overrides the backend
+     * caps, so a swapped-in backing can ADD or drop an advertised decoder under
+     * a live guest. The wire framing of the reply is identical either way. */
+    if (e->content_mask) {
+        int n = 0;
+        if ((e->content_mask & AW_CONTENT_AVC)  && n < max) out[n++] = AW_CODEC_AVC1;
+        if ((e->content_mask & AW_CONTENT_HEVC) && n < max) out[n++] = AW_CODEC_HVC1;
+        return n;
+    }
     if (!e->cfg.be || !e->cfg.be->query_caps) return 0;
     uint8_t buf[256];
     vtpv_caps *caps = (vtpv_caps *)buf;
@@ -400,6 +450,13 @@ static void emit_list_reply(aw_engine *e, const aw_msg_view *v, uint32_t list_ke
     aw_build_header(&b, v->type, AW_FLAG_HOST_REPLY, v->uuid, v->reply_id);
     aw_put_bytes(&b, list_key, AW_VT_PLS, pls, pls_len);
     aw_put_u32(&b, AW_KEY_VER, reply_ver(v));
+    /* Version advertisement rides the caps re-handshake (frozen framing: one
+     * more TLV key, not an envelope change). Re-sent on every resume. */
+    if (e->host_version[0] || e->envelope[0]) {
+        uint8_t hin[256];
+        size_t hin_len = build_hin_plist(e, hin, sizeof hin);
+        if (hin_len) aw_put_bytes(&b, AW_KEY_HIN, AW_VT_PLS, hin, hin_len);
+    }
     size_t n = aw_build_finalize(&b);
     if (n) emit(e, buf, n);
 }
@@ -410,7 +467,7 @@ static int32_t handle_decs(aw_engine *e, const aw_msg_view *v)
     uint32_t codecs[8];
     int nc = engine_decode_codecs(e, codecs, 8);
     uint8_t pls[1536];
-    size_t pls_len = build_decoder_list_plist(pls, sizeof pls, codecs, nc);
+    size_t pls_len = build_decoder_list_plist(pls, sizeof pls, codecs, nc, e->content_suffix);
     emit_list_reply(e, v, AW_KEY_DEC, pls, pls_len);
     return AW_NOERR;
 }
@@ -419,7 +476,7 @@ static int32_t handle_decs(aw_engine *e, const aw_msg_view *v)
 static int32_t handle_encs(aw_engine *e, const aw_msg_view *v)
 {
     uint8_t pls[64];
-    size_t pls_len = build_decoder_list_plist(pls, sizeof pls, NULL, 0); /* [] */
+    size_t pls_len = build_decoder_list_plist(pls, sizeof pls, NULL, 0, NULL); /* [] */
     emit_list_reply(e, v, AW_KEY_ENC, pls, pls_len);
     return AW_NOERR;
 }
@@ -451,11 +508,11 @@ static int32_t handle_opendec(aw_engine *e, const aw_msg_view *v)
     aw_dsession *s = alloc_session(e, v->uuid);
     if (!s) return AW_ERR_MALFORMED;
 
-    uint8_t buf[256];
+    uint8_t buf[512];   /* header + ,err + ,ver + ,hin (version triplet =pls)   */
     aw_builder b;
     aw_builder_init(&b, buf, sizeof buf);
-    uint8_t hin[128];
-    size_t hin_len = build_hin_plist(hin, sizeof hin);
+    uint8_t hin[256];
+    size_t hin_len = build_hin_plist(e, hin, sizeof hin);
     aw_build_header(&b, v->type, AW_FLAG_HOST_REPLY, v->uuid, v->reply_id);
     aw_put_s32(&b, AW_KEY_ERR, AW_NOERR);  /* codec creation status (deferred to dsta) */
     aw_put_u32(&b, AW_KEY_VER, reply_ver(v));

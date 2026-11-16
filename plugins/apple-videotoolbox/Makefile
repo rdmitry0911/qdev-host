@@ -78,14 +78,24 @@ $(BUILD)/test-aw-decode: $(AW_CORE) $(BACKEND) h264_gen.c test_aw_decode.c | $(B
 $(BUILD)/test-aw-replay: $(AW_CORE) $(BACKEND) test_aw_replay.c | $(BUILD)
 	$(CC) $(CFLAGS) $(VA_CFLAGS) -o $@ $(AW_CORE) $(BACKEND) test_aw_replay.c $(VA_LIBS)
 
-$(BUILD)/apple-videotoolbox.so: apple-videotoolbox.c $(AW_CORE) $(BACKEND) | $(BUILD)
+$(BUILD)/apple-videotoolbox.so: apple-videotoolbox.c $(AW_CORE) $(BACKEND) vtpv_backing.h aw_session.h | $(BUILD)
 	$(CC) $(CFLAGS) -Wno-unused-parameter -fPIC -shared $(QDP_INC) $(VFU_INC) $(VA_CFLAGS) \
-	    -o $@ apple-videotoolbox.c $(AW_CORE) $(BACKEND) $(VA_LIBS)
+	    -o $@ apple-videotoolbox.c $(AW_CORE) $(BACKEND) $(VA_LIBS) -ldl
+
+# Warm-swap VARIABLE backings (increment 1): tiny content-only .so's the plugin
+# dlopen-swaps under a live guest. See vtpv_backing.h / backing_A.c / backing_B.c.
+$(BUILD)/backing_A.so: backing_A.c vtpv_backing.h | $(BUILD)
+	$(CC) $(CFLAGS) -fPIC -shared -o $@ backing_A.c
+$(BUILD)/backing_B.so: backing_B.c vtpv_backing.h | $(BUILD)
+	$(CC) $(CFLAGS) -fPIC -shared -o $@ backing_B.c
 
 $(BUILD)/test-plugin: test_plugin.c $(BUILD)/apple-videotoolbox.so | $(BUILD)
 	$(CC) $(CFLAGS) $(QDP_INC) $(VFU_INC) -o $@ test_plugin.c -ldl
 
-plugin: $(BUILD)/apple-videotoolbox.so
+.PHONY: backings
+backings: $(BUILD)/backing_A.so $(BUILD)/backing_B.so
+
+plugin: $(BUILD)/apple-videotoolbox.so backings
 
 test: $(BUILD)/test-proto $(BUILD)/test-virtq $(BUILD)/test-aw-wire $(BUILD)/test-aw-bplist $(BUILD)/test-aw-session
 	@echo "== Apple real-wire codec =="; $(BUILD)/test-aw-wire

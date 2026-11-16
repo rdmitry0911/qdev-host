@@ -97,6 +97,28 @@ int32_t aw_engine_deliver(aw_engine *e, const uint8_t *msg, size_t len);
 
 unsigned aw_engine_open_sessions(const aw_engine *e);
 
+/* ---- warm-swap VARIABLE content (increment 1, "fixed resident / variable
+ * host backend") -------------------------------------------------------------
+ * The decoder list / capability advertisement the host sends on a decs/dcap
+ * re-handshake is the VARIABLE content behind the FROZEN wire envelope. These
+ * let the plugin swap that content under a live, un-rebooted guest without
+ * touching any framing/opcode/virtqueue/handshake behaviour.
+ *   codec_mask: bit0 = advertise AVC, bit1 = advertise HEVC; 0 = advertise
+ *     exactly what the decode backend reports (the default live-VA-API path).
+ *     A nonzero mask can ADD a capability not previously advertised (proving a
+ *     warm swap can add commands, not only change existing behaviour).
+ *   name_suffix: appended to every advertised CodecName (a benign observable
+ *     the A/B probe reads back); NULL or "" for none. */
+#define AW_CONTENT_AVC  0x1u
+#define AW_CONTENT_HEVC 0x2u
+void aw_engine_set_content(aw_engine *e, uint32_t codec_mask, const char *name_suffix);
+
+/* Version advertisement carried in the caps re-handshake (,hin on decs/dcap/
+ * encs/opendec replies): the host stack version (bundle/QMetal/air build ids)
+ * and the FROZEN envelope/transport-protocol version. Re-advertised on resume
+ * after a warm swap. */
+void aw_engine_set_version(aw_engine *e, const char *host_version, const char *envelope);
+
 /* ---- QuickTime ImageDescription (=fds) helpers (contract-B §5 / WIRE §5.2) --
  * 86-byte big-endian header, then extension atoms (avcC/hvcC), then a zero u32. */
 
