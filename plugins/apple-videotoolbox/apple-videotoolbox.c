@@ -280,6 +280,20 @@ static void vt_emit(void *ctx, const uint8_t *msg, size_t len)
 {
     vt_dev *d = ctx;
     char fc[5]; vt_msg_fourcc(msg, len, fc);
+    /* AGVA_DEBUG: ground-truth hexdump of the EXACT bytes emitted for a
+     * host->guest message (what the guest framework receives, since delivery is
+     * byte-faithful). Gated by the env var so it is off in production. Lets a
+     * disposable-guest run capture the on-wire decs reply for an independent
+     * CopyCFPropertyList/plistlib replay-parse (L-GVA-SELFIX). */
+    if (getenv("AGVA_DEBUG")) {
+        char line[VT_PENDING_MSG_MAX * 3 + 1];
+        size_t o = 0, cap = sizeof line;
+        for (size_t i = 0; i < len && o + 3 < cap; i++)
+            o += (size_t)snprintf(line + o, cap - o, "%02x%s", msg[i],
+                                  (i + 1 < len) ? " " : "");
+        line[o] = 0;
+        vt_log(d, 1, "AGVA_DEBUG q1 EMIT '%s' %zu B: %s", fc, len, line);
+    }
     if (len > VT_PENDING_MSG_MAX) {       /* must not happen for host->guest msgs */
         d->pend_dropped++;
         vt_log(d, 1, "q1 '%s' DROPPED: %zu B exceeds pending slot %u", fc, len, VT_PENDING_MSG_MAX);

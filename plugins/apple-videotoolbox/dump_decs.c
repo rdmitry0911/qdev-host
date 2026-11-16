@@ -34,6 +34,9 @@ int main(int argc, char**argv){
     int r=aw_get_bytes(&v,AW_KEY_DEC,AW_VT_PLS,&pls,&pl);
     fprintf(stderr,"decs status=%d reply=%zuB ,dec r=%d pls=%zuB\n",st,g_len,r,pl);
     if(r==0 && argc>1){ FILE*f=fopen(argv[1],"wb"); fwrite(pls,1,pl,f); fclose(f); }
+    if(argc>2){ FILE*f=fopen(argv[2],"wb"); fwrite(g_reply,1,g_len,f); fclose(f);
+        fprintf(stderr,"full reply=%zuB written; vtpv atom_size field=%u\n", g_len,
+            (unsigned)((g_reply[0]<<24)|(g_reply[1]<<16)|(g_reply[2]<<8)|g_reply[3])); }
     aw_engine_destroy(e);
     return 0;
 }

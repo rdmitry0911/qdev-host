@@ -130,7 +130,26 @@ int aw_put_bytes(aw_builder *b, uint32_t key, uint32_t vtype,
 size_t aw_build_finalize(aw_builder *b)
 {
     if (b->overflow || b->len < AW_HDR_SIZE) return 0;
-    aw_put_be32(b->buf + 0x00, (uint32_t)b->len);
+    /* The vtpv header is a 48-byte SIBLING atom; its atom_size field is the
+     * header atom's own length (AW_HDR_SIZE), NOT the whole message. The para
+     * atoms follow as siblings, and the total message length is carried by the
+     * transport (the queue element / CMBlockBuffer length), not this field.
+     *
+     * Apple's guest builds it exactly this way: FigAtomWriterBeginAtom('vtpv')
+     * + the 40 bytes of header fields + FigAtomWriterEndAtom() closes the atom
+     * at 48, then each para is appended via its own BeginAtom('para')/EndAtom
+     * (CreateMessageAndByteStream 0x7ff814d66210 / AppendUInt32 0x7ff8151582b7
+     * in 26.2 x86_64h VideoToolbox). The guest's reply param scanner
+     * (0x7ff814d66591, used by CopyCFPropertyList 0x7ff814d66730) walks the
+     * reply from offset 0 and ADVANCES past each non-'para' atom by its
+     * atom_size; if the vtpv atom_size were the whole message it would skip the
+     * entire reply and never find ',dec', so CopyCFPropertyList returns a NULL
+     * plist and no decoder registers (the live -12906 / "0 registered, no
+     * error" symptom, L-GVA-SELFIX). Emitting 48 makes the scanner land on the
+     * first para. Our own aw_parse is unaffected (it locates paras at the fixed
+     * hdr_off + AW_HDR_SIZE and never trusted this field), which is why unit
+     * tests and the dump_decs replay-parse passed despite the wrong value. */
+    aw_put_be32(b->buf + 0x00, AW_HDR_SIZE);
     return b->len;
 }
 

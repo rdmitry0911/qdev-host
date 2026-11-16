@@ -96,6 +96,34 @@ static void test_golden_header(void)
     CHECK(bytes_eq(buf, want, 48, "decs header"), "header golden");
 }
 
+/* L-GVA-SELFIX regression pin: the vtpv header is a 48-byte SIBLING atom; its
+ * atom_size field must stay 48 even when para atoms follow, because the guest's
+ * reply param scanner (CopyCFPropertyList, 26.2 x86_64h 0x7ff814d66591) advances
+ * by each atom's size — a total-length value there makes it skip the whole reply
+ * and never find ',dec' (NULL plist -> 0 decoders -> -12906). Also assert the
+ * scanner lands on the first para at offset 48. */
+static uint32_t rd_be32(const uint8_t *p)
+{
+    return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];
+}
+static void test_vtpv_atom_size_is_48(void)
+{
+    printf("-- vtpv atom_size stays 48 with params (L-GVA-SELFIX) --\n");
+    uint8_t buf[256];
+    aw_builder b;
+    aw_builder_init(&b, buf, sizeof buf);
+    aw_build_header(&b, AW_MSG_DECS, AW_FLAG_HOST_REPLY, NULL, 100);
+    aw_put_bytes(&b, AW_KEY_DEC, AW_VT_PLS, (const uint8_t *)"bplist00", 8);
+    aw_put_u32(&b, AW_KEY_VER, 5);
+    size_t len = aw_build_finalize(&b);
+    CHECK(len > 48, "reply has params, len=%zu", len);
+    CHECK(rd_be32(buf) == 48, "vtpv atom_size=%u want 48 (NOT total %zu)",
+          rd_be32(buf), len);
+    /* first sibling atom after the 48-byte vtpv atom is a 'para' */
+    CHECK(rd_be32(buf + 48 + 4) == AW_ATOM_PARA, "first sibling at off 48 is 'para'");
+    CHECK(rd_be32(buf + 48 + 8) == AW_KEY_DEC, "first para key is ',dec'");
+}
+
 static void test_golden_para(void)
 {
     printf("-- golden para bytes --\n");
@@ -353,6 +381,7 @@ int main(void)
 {
     test_layout();
     test_golden_header();
+    test_vtpv_atom_size_is_48();
     test_golden_para();
     test_subs_rels();
     test_parse_scan();
