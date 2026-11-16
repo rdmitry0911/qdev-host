@@ -36,6 +36,12 @@ $(BUILD)/test-proto: vtpv_proto.c vtpv_proto.h test_proto.c | $(BUILD)
 $(BUILD)/test-aw-wire: aw_wire.c aw_wire.h test_aw_wire.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ aw_wire.c test_aw_wire.c
 
+# Apple-wire sbuf reader (aw_sbuf, H3) + session engine (aw_session, H5+H6):
+# routing/status + decode-exchange wire ordering with a mock backend. No libva.
+AW_CORE := aw_wire.c aw_sbuf.c aw_session.c
+$(BUILD)/test-aw-session: $(AW_CORE) test_aw_session.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $(AW_CORE) test_aw_session.c
+
 $(BUILD)/test-virtq: vtpv_virtq.c vtpv_proto.c test_virtq.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ vtpv_virtq.c vtpv_proto.c test_virtq.c
 
@@ -56,8 +62,9 @@ $(BUILD)/test-plugin: test_plugin.c $(BUILD)/apple-videotoolbox.so | $(BUILD)
 
 plugin: $(BUILD)/apple-videotoolbox.so
 
-test: $(BUILD)/test-proto $(BUILD)/test-virtq $(BUILD)/test-aw-wire
+test: $(BUILD)/test-proto $(BUILD)/test-virtq $(BUILD)/test-aw-wire $(BUILD)/test-aw-session
 	@echo "== Apple real-wire codec =="; $(BUILD)/test-aw-wire
+	@echo "== Apple-wire session engine (H3/H5/H6, mock backend) =="; $(BUILD)/test-aw-session
 	@echo "== protocol handler =="; $(BUILD)/test-proto
 	@echo "== virtio virtqueue =="; $(BUILD)/test-virtq
 ifeq ($(HAVE_VA),1)
