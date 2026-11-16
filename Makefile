@@ -42,6 +42,21 @@ ifneq ($(QMETAL_INCLUDE),)
 PLUGINS += plugins/apple-pvg/apple-pvg.so
 endif
 
+# apple-videotoolbox (Apple paravirt VideoToolbox codec device, PCI 106b:1a03)
+# is the AppleGVA host backend (increment 1). It links libva (VA-API decode)
+# and is built only when VIDEOTOOLBOX=1 is given, so the default build is
+# unchanged on hosts without libva:
+#   make VIDEOTOOLBOX=1
+# Its module unit tests (no VM) run with: make apple-videotoolbox-test
+VT_DIR := plugins/apple-videotoolbox
+VT_SRC := $(addprefix $(VT_DIR)/,apple-videotoolbox.c vtpv_proto.c vtpv_vaapi.c)
+VT_HDR := $(VT_DIR)/vtpv_proto.h $(VT_DIR)/vtpv_vaapi.h
+VT_VA_CFLAGS := $(shell pkg-config --cflags libva libva-drm 2>/dev/null)
+VT_VA_LIBS   := $(shell pkg-config --libs libva libva-drm 2>/dev/null)
+ifneq ($(VIDEOTOOLBOX),)
+PLUGINS += $(VT_DIR)/apple-videotoolbox.so
+endif
+
 all: qdev-host $(PLUGINS) tools/display1-input-bench tools/vfu-test-client
 
 vfu: $(VFU_LOCAL)/lib/libvfio-user.so.0
@@ -86,6 +101,19 @@ apple-pvg-selftest: plugins/apple-pvg/apple-pvg.so plugins/apple-pvg/selftest
 	plugins/apple-pvg/selftest plugins/apple-pvg/apple-pvg.so
 	plugins/apple-pvg/selftest plugins/apple-pvg/apple-pvg.so --personality 0xeee1
 
+# apple-videotoolbox: the multi-source codec device + libva backend. Explicit
+# rule (overrides the generic plugins/%.so single-source rule).
+$(VT_DIR)/apple-videotoolbox.so: $(VT_SRC) $(VT_HDR) qdp.h $(VFU_DEP)
+	@test -n "$(VT_VA_LIBS)" || { echo "apple-videotoolbox needs libva (pkg-config libva libva-drm)" >&2; exit 1; }
+	$(CC) $(CFLAGS) -fPIC -shared -I. -I$(VT_DIR) $(VFU_CFLAGS) $(VT_VA_CFLAGS) \
+	    -o $@ $(VT_SRC) $(VFU_LIBS) $(VT_VA_LIBS) -lpthread
+
+# Module unit tests without a VM (protocol handler always; VA-API backend live
+# on a render node, skipped if none; plugin ABI smoke).
+.PHONY: apple-videotoolbox-test
+apple-videotoolbox-test:
+	$(MAKE) -C $(VT_DIR) test
+
 install: all
 	install -D -m 755 qdev-host $(DESTDIR)$(PREFIX)/bin/qdev-host
 	install -D -m 644 qdp.h $(DESTDIR)$(PREFIX)/include/qdev-host/qdp.h
@@ -94,6 +122,7 @@ install: all
 
 clean:
 	rm -f qdev-host plugins/*/*.so plugins/apple-pvg/selftest tools/display1-input-bench tools/vfu-test-client dbus/dbus-display1.c dbus/dbus-display1.h
+	rm -rf $(VT_DIR)/build
 
 distclean: clean
 	rm -rf build
