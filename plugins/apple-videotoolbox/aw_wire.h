@@ -8,11 +8,19 @@
  * Lane L-VIDEO-IMPL, 2026-11-16. This replaces the old clean-room invented
  * `vtpv` (vtpv_proto.h, "VTPV" magic + flat structs) with Apple's real wire.
  *
- * CLEAN-ROOM. Designed from the reims in-tree RE *docs*
- * (research/reims/reims-vgpu/docs/video/{devices.md,core.md}) and our own T4 B1
- * disassembly of Apple's arm64e kext. The frozen byte-exact contract is
- * evidence/runs/applegva-realproto-20261116/WIRE-CONTRACT-APPLE-VIDEOTOOLBOX.md;
- * this header is its reference implementation. NO reims source copied (GPL/LGPL).
+ * CLEAN-ROOM. The AUTHORITATIVE upstream is the guest-kext lane's closed
+ * contract-B spec, cross-witnessed from (1) disassembly of Apple's arm64e
+ * KDK_26.2 AppleVideoToolboxParavirtualization.kext and (2) the reims RE docs:
+ *   worktrees/av-applegva-kext-20261116/AppleVideoToolboxParavirtualization/
+ *     analysis/CONTRACT-B-APPLE-VT-WIRE-20261116.md   (the wire)
+ *     analysis/B1-REAL-USERCLIENT-ABI-20261116.md     (the userclient ABI)
+ * This header is the HOST-SIDE implementation of that contract-B, byte-identical
+ * to it; the host companion doc with the frozen offsets + Dpba/sbuf detail is
+ * evidence/runs/applegva-realproto-20261116/WIRE-CONTRACT-APPLE-VIDEOTOOLBOX.md.
+ * NO reims source copied (GPL/LGPL); the wire is Apple's, reims merely documents
+ * it. NB: the guest worktree's OLD core/vtpv_*.{c,h} + include/vtpv_wire.h codec
+ * is the superseded contract-A invention (VTPV/VTPC magics, numbered ops, native
+ * LE) and is NOT this wire - do not build the host plugin against it.
  *
  * ENDIANNESS (see the contract doc, §0): the `vtpv`/`para` framing, every para
  * payload scalar, `=fds`, and the `subs`/`rels` boxes and their IDs are ALL
@@ -65,11 +73,19 @@ extern "C" {
 #define AW_MSG_DINV   AW_4CC('d','i','n','v') /* invalidate                 */
 #define AW_MSG_DCAN   AW_4CC('d','c','a','n') /* can-accept probe           */
 
-/* host->guest requests (queue 1, flag AW_FLAG_HOST_REQ) */
+/* host->guest decoder requests (queue 1, flag AW_FLAG_HOST_REQ).
+ * Dpba/Dbuf/Demt/Dfub + Bye! drive the decode MVP; the rest are contract-B §5
+ * host->guest decoder messages named for the shared guest<->host catalog (tile/
+ * display/colour paths), carried but not yet acted on by the decode MVP. */
 #define AW_MSG_DPBA   AW_4CC('D','p','b','a') /* output buffer attributes   */
 #define AW_MSG_DBUF   AW_4CC('D','b','u','f') /* ask guest for a buffer     */
 #define AW_MSG_DEMT   AW_4CC('D','e','m','t') /* emit frame into buffer     */
 #define AW_MSG_DFUB   AW_4CC('D','f','u','b') /* buffer died unemitted      */
+#define AW_MSG_DDPA   AW_4CC('D','d','p','a') /* (contract-B §5, later)      */
+#define AW_MSG_DRPA   AW_4CC('D','r','p','a') /* (contract-B §5, later)      */
+#define AW_MSG_DMIF   AW_4CC('D','m','i','f') /* (contract-B §5, later)      */
+#define AW_MSG_TDSR   AW_4CC('T','D','s','r') /* (contract-B §5, tiles)      */
+#define AW_MSG_TDEM   AW_4CC('T','D','e','m') /* (contract-B §5, tiles)      */
 #define AW_MSG_BYE    AW_4CC('B','y','e','!') /* terminate-all              */
 
 /* reply + parameter keys (leading comma is literal byte 0x2c) */
