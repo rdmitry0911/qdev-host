@@ -113,6 +113,20 @@ struct virtio_pci_notify_cap {
 
 #define VT_MAX_REGIONS 64
 
+/* Host->guest pending-message ring. Apple's queue 1 is a host->guest stream:
+ * the guest posts 0x4000-byte writable buffers and "the host keeps its messages
+ * in a ring and writes them into those buffers as they come back" (reims
+ * devices.md, "The queues" -> "Queue 1, host to guest"). So a reply/request the
+ * host emits while queue 1 has no posted buffer must NOT be dropped: it is held
+ * here and delivered when the guest reposts and kicks queue 1. Dropping it (the
+ * old behaviour) loses the early `decs` reply that fires during the guest's
+ * decoder-registry dispatch_once before the kext has posted queue-1 buffers,
+ * which caches an empty decoder list and makes every later selection fail with
+ * kVTVideoDecoderNotAvailableNowErr (-12906). Biggest host->guest message is a
+ * codec-list reply (<=2 KiB); 4 KiB slots give headroom. */
+#define VT_PENDING_MSG_MAX 4096u
+#define VT_PENDING_MAX     256u
+
 typedef struct vt_dev {
     const qdp_host_ops *host;
 
@@ -141,6 +155,12 @@ typedef struct vt_dev {
     /* BAR2 backing for the MSI-X table + PBA (accesses the client doesn't
      * intercept land here; libvfio-user owns the MSI-X cap itself). */
     uint8_t msix_bar[VT_BAR2_SIZE];
+
+    /* host->guest pending-message ring (FIFO; see VT_PENDING_* above). */
+    struct { uint32_t len; uint8_t buf[VT_PENDING_MSG_MAX]; } pending[VT_PENDING_MAX];
+    unsigned pend_head;   /* index of the oldest pending message */
+    unsigned pend_count;  /* number of pending messages */
+    uint64_t pend_dropped;/* diagnostics: messages lost to a full ring */
 } vt_dev;
 
 /* the completion vq's MSI-X vector (set by the driver; config vector fallback) */
@@ -196,35 +216,79 @@ static void vt_raise(vt_dev *d, unsigned queue)
         (void)d->host->irq_trigger(d->host->host, vec);
 }
 
-/* ---- queue 1 (host->guest) emit sink -------------------------------- *
- * The aw_session engine's emit callback (under d->m). Apple's queue 1 is a
- * host->guest message stream: the guest pre-posts 0x4000-byte writable buffers,
- * and the host writes each outbound message (a reply, or a Dpba/Dbuf/Demt/rels
- * request) into one and retires it. A message with no posted buffer is dropped
- * (as a real device would, until the guest reposts). */
-static void vt_emit(void *ctx, const uint8_t *msg, size_t len)
+/* name a host->guest message's FourCC for logging (rels box or vtpv type). */
+static void vt_msg_fourcc(const uint8_t *msg, size_t len, char fc[5])
 {
-    vt_dev *d = ctx;
-    vtpv_virtq *hq = &d->queues[1];
-    uint16_t head = 0; uint32_t written = 0;
-    char fc[5] = "????";
+    memcpy(fc, "????", 5);
     if (len >= 8) {
         uint32_t first = aw_get_be32(msg + 4);
         if (first == AW_ATOM_RELS) memcpy(fc, "rels", 5);
         else if (first == AW_ATOM_VTPV && len >= 12) vt_fourcc(aw_get_be32(msg + 8), fc);
     }
-    int rc = vtpv_virtq_put_writable(hq, vt_map, d, msg, len, &head, &written);
-    if (rc == 1) {
+}
+
+/* Deliver as many pending host->guest messages as queue 1 has posted buffers,
+ * oldest first (FIFO, preserving the host's emit order). Stops at the first
+ * message with no buffer available, leaving it and the rest pending for the
+ * next queue-1 repost. Called under d->m. */
+static void vt_flush_pending(vt_dev *d)
+{
+    vtpv_virtq *hq = &d->queues[1];
+    unsigned delivered = 0;
+    while (d->pend_count) {
+        unsigned i = d->pend_head;
+        const uint8_t *msg = d->pending[i].buf;
+        uint32_t len = d->pending[i].len;
+        uint16_t head = 0; uint32_t written = 0;
+        int rc = vtpv_virtq_put_writable(hq, vt_map, d, msg, len, &head, &written);
+        if (rc == 0) break;                      /* no posted buffer yet: keep it */
+        char fc[5]; vt_msg_fourcc(msg, len, fc);
+        if (rc < 0) {                            /* malformed ring */
+            d->needs_reset = 1;
+            vt_log(d, 1, "q1 '%s' ring error, needs reset", fc);
+            break;
+        }
         vtpv_virtq_retire(hq, vt_map, d, head, written);
-        vt_raise(d, 1);
-        vt_log(d, 2, "q1 '%s' (%zu B) -> guest", fc, len);
         if (written < len)
-            vt_log(d, 1, "q1 '%s' truncated %u/%zu (guest buffer too small)", fc, written, len);
-    } else if (rc == 0) {
-        vt_log(d, 1, "q1 '%s' DROPPED: no posted queue-1 buffer (guest must pre-post 0x4000 bufs before dsta)", fc);
-    } else {
-        d->needs_reset = 1;
+            vt_log(d, 1, "q1 '%s' truncated %u/%u (guest buffer too small)", fc, written, len);
+        else
+            vt_log(d, 2, "q1 '%s' (%u B) -> guest", fc, len);
+        d->pend_head = (d->pend_head + 1) % VT_PENDING_MAX;
+        d->pend_count--;
+        delivered++;
     }
+    if (delivered) vt_raise(d, 1);
+}
+
+/* ---- queue 1 (host->guest) emit sink -------------------------------- *
+ * The aw_session engine's emit callback (under d->m). Apple's queue 1 is a
+ * host->guest message stream: the guest pre-posts 0x4000-byte writable buffers,
+ * and the host writes each outbound message (a reply, or a Dpba/Dbuf/Demt/rels
+ * request) into one and retires it. A message emitted while no buffer is posted
+ * is NOT dropped: it is appended to the pending ring and delivered when the
+ * guest reposts queue-1 buffers and kicks queue 1 (vt_flush_pending), as Apple's
+ * real host does. This closes the early-`decs` race (see VT_PENDING_* above). */
+static void vt_emit(void *ctx, const uint8_t *msg, size_t len)
+{
+    vt_dev *d = ctx;
+    char fc[5]; vt_msg_fourcc(msg, len, fc);
+    if (len > VT_PENDING_MSG_MAX) {       /* must not happen for host->guest msgs */
+        d->pend_dropped++;
+        vt_log(d, 1, "q1 '%s' DROPPED: %zu B exceeds pending slot %u", fc, len, VT_PENDING_MSG_MAX);
+        return;
+    }
+    if (d->pend_count >= VT_PENDING_MAX) { /* backlog overflow: drop oldest, log */
+        d->pend_dropped++;
+        vt_log(d, 1, "q1 pending ring full (%u): dropping oldest to queue '%s'",
+               VT_PENDING_MAX, fc);
+        d->pend_head = (d->pend_head + 1) % VT_PENDING_MAX;
+        d->pend_count--;
+    }
+    unsigned tail = (d->pend_head + d->pend_count) % VT_PENDING_MAX;
+    d->pending[tail].len = (uint32_t)len;
+    memcpy(d->pending[tail].buf, msg, len);
+    d->pend_count++;
+    vt_flush_pending(d);                  /* deliver now if a buffer is posted */
 }
 
 /* ---- H2: the decoded-output buffer seam (the guest lends it via Dbuf) --- *
@@ -303,6 +367,9 @@ static void vt_process_submission(vt_dev *d)
         int rc = vtpv_virtq_pop_inout(sq, vt_map, d, msg, sizeof(msg), &len,
                                       &wptr, &wcap, &head);
         if (rc != 1) { d->needs_reset = 1; break; } /* malformed ring */
+        { char hx[81*3]; size_t hn = len < 80 ? len : 80, o = 0;
+          for (size_t i = 0; i < hn; i++) o += (size_t)snprintf(hx+o, sizeof hx-o, "%02x ", msg[i]);
+          hx[o] = 0; vt_log(d, 2, "q0 RX len=%zu bytes: %s", len, hx); }
         int32_t status = aw_engine_deliver(d->engine, msg, len); /* emits on q1 */
         { aw_msg_view mv; char fc[5] = "????";
           if (aw_parse(msg, len, &mv) == AW_PARSE_OK) vt_fourcc(mv.type, fc);
@@ -312,7 +379,8 @@ static void vt_process_submission(vt_dev *d)
         if (wptr && wcap >= 4) { memcpy(wptr, &status, 4); written = 4; } /* native i32 */
         vtpv_virtq_retire(sq, vt_map, d, head, written);
     }
-    vt_raise(d, 0); /* the queue-0 chains are now free on the used ring */
+    vt_raise(d, 0);        /* the queue-0 chains are now free on the used ring */
+    vt_flush_pending(d);   /* deliver any replies/requests this drain queued on q1 */
 }
 
 /* ---- BAR0: virtio-modern common config + notify --------------------- */
@@ -401,7 +469,8 @@ static ssize_t vt_bar0(vfu_ctx_t *ctx, char *buf, size_t count, loff_t off,
     } else if (off >= VT_CFG_NOTIFY && off < VT_CFG_NOTIFY + VT_QUEUES * 4) {
         if (is_write) {
             uint16_t qn = (uint16_t)((off - VT_CFG_NOTIFY) / 4);
-            if (qn == 0) vt_process_submission(d); /* only the submission vq is kicked */
+            if (qn == 0) vt_process_submission(d);  /* drain guest->host submissions */
+            else if (qn == 1) vt_flush_pending(d);  /* guest reposted q1 buffers: deliver backlog */
         }
     } else if (!is_write) {
         memset(buf, 0, count);
@@ -467,6 +536,43 @@ static int vt_add_caps(vfu_ctx_t *ctx)
     return 0;
 }
 
+/* ---- test-only fallback backend (plugin arg force_h264=1) -----------
+ * Advertise a single H.264 decoder in the decs/caps reply even when no working
+ * VA-API decode backend is present (e.g. an NVIDIA-only host where libva cannot
+ * init). This exists ONLY for the decoder-SELECTION experiment (L-VIDEO-267):
+ * it lets the guest's VTDecompressionSession register + attempt to select our
+ * paravirt avc1 decoder, which is decided BEFORE any frame is decoded. Actual
+ * decode is unsupported here (open_decoder/decode return errors), so this must
+ * never be used for a real decode run. The advertised caps are byte-identical
+ * in shape to the live VA-API path (avc1, NV12, 4096x4096). */
+static int fake_query_caps(void *ctx, vtpv_caps *out, size_t cap)
+{
+    (void)ctx;
+    vtpv_codec_cap *c = (vtpv_codec_cap *)((uint8_t *)out + sizeof(*out));
+    if (cap < sizeof(*out) + sizeof(*c)) return -1;
+    out->magic = VTPV_CAPS_MAGIC;
+    out->abi = VTPV_ABI;
+    c[0].codec = VTPV_CODEC_H264; c[0].can_decode = 1; c[0].can_encode = 0;
+    c[0].reserved = 0; c[0].max_width = 4096; c[0].max_height = 4096;
+    c[0].out_pixfmt = VTPV_PIXFMT_NV12;
+    out->n_codecs = 1;
+    return 1;
+}
+static int fake_open_decoder(void *ctx, uint32_t codec, uint32_t w, uint32_t h,
+                             const uint8_t *ex, size_t exl, void **dec)
+{
+    (void)ctx; (void)codec; (void)w; (void)h; (void)ex; (void)exl;
+    if (dec) *dec = NULL;
+    return -1;   /* decode not supported in the force_h264 fallback */
+}
+static int fake_decode(void *dec, const uint8_t *s, size_t sl,
+                       vtpv_decoded_frame *o)
+{ (void)dec; (void)s; (void)sl; (void)o; return -1; }
+static void fake_close(void *dec) { (void)dec; }
+static const vtpv_decoder_backend fake_h264_be = {
+    fake_query_caps, fake_open_decoder, fake_decode, fake_close
+};
+
 /* ---- qdp_device_ops ------------------------------------------------- */
 
 static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
@@ -498,6 +604,11 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
         vt_log(d, 1, "VA-API backend unavailable on %s: %s; the device will "
                      "advertise no codecs", node, err);
         d->va = NULL; d->be = NULL;
+    }
+    if (!d->be && args && strstr(args, "force_h264=1")) {
+        vt_log(d, 1, "force_h264=1: advertising a fallback H.264 decoder "
+                     "(decode UNSUPPORTED; decoder-SELECTION experiment only)");
+        d->be = &fake_h264_be;
     }
     {
         aw_session_cfg cfg;
@@ -587,6 +698,7 @@ static int vt_reset(void *priv, vfu_reset_type_t type)
     d->queue_select = 0;
     d->needs_reset = 0;
     d->msix_config = VT_MSIX_NO_VECTOR;
+    d->pend_head = d->pend_count = 0;   /* drop any undelivered host->guest backlog */
     for (i = 0; i < VT_QUEUES; i++) {
         vtpv_virtq *vq = &d->queues[i];
         vq->ready = 0; vq->desc = vq->avail = vq->used = 0;
