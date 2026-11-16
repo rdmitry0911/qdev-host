@@ -1,11 +1,12 @@
-# apple-videotoolbox — AppleGVA host backend (increment 1)
+# apple-videotoolbox — AppleGVA host backend (increments 1-2)
 
 Host side of Apple's paravirtualized **VideoToolbox** codec device
 (PCI `106b:1a03`), as a qdev-host plugin. Lane L-M2V03, 2026-11-16.
 
-This is **increment 1** of a multi-increment effort. It moves AppleGVA from
-*no implementation* to **host device skeleton + VA-API decode backend +
-unit tests**, all buildable and tested without a VM.
+A multi-increment effort. Increment 1 brought up the host device skeleton +
+the VA-API decode backend; increment 2 implemented the virtio split-virtqueue
+ring state machine (the E2E connector the guest kext binds). All buildable and
+unit-tested without a VM.
 
 ## Clean-room
 
@@ -37,7 +38,8 @@ scoped it.
 |---|---|---|
 | `vtpv_proto.{h,c}` | codec-session **protocol handler**: parse submission messages (QUERY_CAPS / SESSION_CREATE / DECODE_FRAME / SESSION_END), enforce the transport limits, dispatch to a decoder-backend vtable, emit completions | **complete + unit-tested** (`test_proto.c`, 13 cases) |
 | `vtpv_vaapi.{h,c}` + `vtpv_h264.{h,c}` | **VA-API decode backend** over libva on a DRM render node: display open, capability enumeration (→ D-GVA-2), decode config/context/surface pool, **real H.264 decode** (SPS/PPS/slice parse → VA parameter buffers → `vaBeginPicture`/`RenderPicture`/`EndPicture`), surface readback | **complete + tested live** on `/dev/dri/renderD128`: `test_vaapi.c` (lifecycle + caps) and `test_h264.c` (a minimal I\_PCM I-frame decoded and its luma verified byte-exact, 0/101376 mismatches on radeonsi) |
-| `apple-videotoolbox.c` | **qdp plugin**: presents PCI `106b:1a03` as a virtio-1.x device, lays out BAR0 (common/ISR/notify/device cfg), MSI-X (per-queue + config), the two virtqueues (0 submission, 1 completion), and instantiates the handler over the backend | **compiles + registers + loadable** (`test_plugin.c` ABI smoke); the virtio ring state machine is the next increment |
+| `vtpv_virtq.{h,c}` | **virtio 1.x split-virtqueue mechanics**: desc table / available ring / used ring walk, chain gather (readable) + scatter (writable), retire, over a caller guest-memory map callback | **complete + unit-tested** (`test_virtq.c`): a synthetic ring drives a full submission -> handler -> completion round-trip, plus malformed-chain refusal |
+| `apple-videotoolbox.c` | **qdp plugin**: presents PCI `106b:1a03` as a virtio-1.x device; BAR0 **common-config register file** (feature negotiation, queue select/size/enable, desc/avail/used programming), ISR, notify, MSI-X; tracks guest **DMA regions** (`dma_register`/`unregister`); on a submission-queue notify drains the ring into the protocol handler and emits completions onto the completion queue with the per-queue MSI-X | **complete + loadable** (`test_plugin.c` ABI smoke); E2E (guest kext + real decode) is the separate guest session's |
 
 ### The wire (D-GVA-2)
 

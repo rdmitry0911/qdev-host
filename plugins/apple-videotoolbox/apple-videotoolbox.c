@@ -46,6 +46,7 @@
 #include "qdp.h"
 #include "vtpv_proto.h"
 #include "vtpv_vaapi.h"
+#include "vtpv_virtq.h"
 
 /* ---- device constants ---------------------------------------------- */
 
@@ -70,11 +71,7 @@
  * only; the richer features come with the ring state machine. */
 #define VIRTIO_F_VERSION_1  (1ull << 32)
 
-typedef struct vt_queue {
-    uint16_t size;    /* negotiated, <= VT_QUEUE_MAX           */
-    uint8_t  enabled;
-    uint64_t desc, driver, device; /* guest ring addresses     */
-} vt_queue;
+#define VT_MAX_REGIONS 64
 
 typedef struct vt_dev {
     const qdp_host_ops *host;
@@ -85,18 +82,25 @@ typedef struct vt_dev {
 
     pthread_mutex_t m;
 
-    /* virtio common-config shadow */
+    /* virtio-modern common-config shadow */
     uint64_t device_features;
+    uint32_t device_feature_select, driver_feature_select;
     uint64_t driver_features;
     uint8_t  device_status;
+    uint8_t  config_generation;
+    uint16_t msix_config;
     uint16_t queue_select;
-    vt_queue queues[VT_QUEUES];
+    vtpv_virtq queues[VT_QUEUES];     /* 0 submission, 1 completion */
+    uint16_t queue_msix[VT_QUEUES];
     uint8_t  needs_reset;
 
-    /* guest memory regions, for the ring/buffer access the transport
-     * increment performs (tracked now so the seam is real). */
-    /* (kept minimal in increment 1) */
+    /* guest DMA regions (from the host's dma_register/unregister). */
+    qdp_dma_region regions[VT_MAX_REGIONS];
+    int n_regions;
 } vt_dev;
+
+/* the completion vq's MSI-X vector (set by the driver; config vector fallback) */
+#define VT_MSIX_NO_VECTOR 0xffffu
 
 /* libvfio-user region callbacks receive no private pointer (they get the
  * host's vfu_create_ctx private, not the plugin's), so the BAR0 callback
@@ -117,65 +121,158 @@ static void vt_log(vt_dev *d, int level, const char *fmt, ...)
         fprintf(stderr, "apple-videotoolbox: %s\n", buf);
 }
 
-/* ---- completion sink ------------------------------------------------ *
- * The protocol handler emits a completion here. In the full transport this
- * copies the bytes into the next guest-posted completion-queue buffer and
- * raises that queue's MSI-X vector. Increment 1 records it (the ring walk
- * that provides the destination buffer is the transport increment). */
+/* ---- guest memory via the DMA regions (called under d->m) ----------- */
+static void *vt_map(void *ctx, uint64_t iova, uint64_t len)
+{
+    vt_dev *d = ctx;
+    int i;
+    if (!len || iova + len < iova) return NULL;
+    for (i = 0; i < d->n_regions; i++) {
+        const qdp_dma_region *r = &d->regions[i];
+        if (r->vaddr && iova >= r->iova && iova + len <= r->iova + r->len)
+            return (uint8_t *)r->vaddr + (iova - r->iova);
+    }
+    return NULL;
+}
+
+static void vt_raise(vt_dev *d, unsigned queue)
+{
+    uint16_t vec = queue < VT_QUEUES ? d->queue_msix[queue] : d->msix_config;
+    if (d->host && d->host->irq_trigger && vec != VT_MSIX_NO_VECTOR)
+        (void)d->host->irq_trigger(d->host->host, vec);
+}
+
+/* ---- completion sink: place a completion on the completion vq -------- *
+ * Called by the protocol handler (under d->m, from vt_process_submission).
+ * Takes a pre-posted queue-1 writable buffer, copies `cmpl` into it, retires
+ * it on the used ring and raises the completion vector. A completion with no
+ * posted buffer is dropped (as a real device would, until the guest reposts). */
 static void vt_emit(void *ctx, const uint8_t *cmpl, size_t len)
 {
     vt_dev *d = ctx;
-    /* Transport increment: place `cmpl` on completion vq (queue 1) and
-     * d->host->irq_trigger(d->host->host, /vector of queue 1/). */
-    (void)cmpl; (void)len; (void)d;
+    vtpv_virtq *cq = &d->queues[1];
+    uint16_t head = 0; uint32_t written = 0;
+    int rc = vtpv_virtq_put_writable(cq, vt_map, d, cmpl, len, &head, &written);
+    if (rc == 1) {
+        vtpv_virtq_retire(cq, vt_map, d, head, written);
+        vt_raise(d, 1);
+        if (written < len)
+            vt_log(d, 1, "completion truncated %u/%zu (guest buffer too small)",
+                   written, len);
+    } else if (rc == 0) {
+        vt_log(d, 1, "completion dropped: no posted completion-queue buffer");
+    } else {
+        d->needs_reset = 1;
+    }
 }
 
-/*
- * Process the submission virtqueue after a notify: walk the avail ring, read
- * each descriptor chain's message bytes out of guest memory, and hand them to
- * vtpv_proto_submit (which validates + dispatches + emits a completion via
- * vt_emit). This is the integration point between the virtio transport and
- * the (complete, tested) message protocol handler. The ring walk itself is
- * the transport increment; the call it makes per message is final:
- *
- *     vtpv_proto_submit(d->proto, msg_bytes, msg_len);
- */
+/* ---- submission: drain the submission vq into the protocol handler --- */
 static void vt_process_submission(vt_dev *d)
 {
-    (void)d;
-    /* Transport increment: for each avail descriptor chain, gather the
-     * message bytes (bounded by VT_QUEUE_MAX descriptors / 1 MiB) and call
-     * vtpv_proto_submit(d->proto, msg, len). */
+    vtpv_virtq *sq = &d->queues[0];
+    unsigned budget = 2 * VT_QUEUE_MAX; /* bound the drain */
+    static uint8_t msg[VTPV_MAX_SAMPLE_BYTES + 4096];
+    while (budget-- && vtpv_virtq_has_avail(sq, vt_map, d) == 1) {
+        size_t len = 0; uint16_t head = 0;
+        int rc = vtpv_virtq_get_readable(sq, vt_map, d, msg, sizeof(msg), &len, &head);
+        if (rc != 1) { d->needs_reset = 1; break; } /* malformed ring */
+        (void)vtpv_proto_submit(d->proto, msg, len); /* emits completions via vt_emit */
+        vtpv_virtq_retire(sq, vt_map, d, head, 0);   /* submission buffers are read-only */
+    }
+    vt_raise(d, 0); /* the submission chains are now free on the used ring */
 }
 
-/* ---- BAR0: virtio-modern common config ------------------------------ */
+/* ---- BAR0: virtio-modern common config + notify --------------------- */
+
+static uint64_t ld(const void *p, size_t n) { uint64_t v = 0; memcpy(&v, p, n < 8 ? n : 8); return v; }
+static void st(void *p, size_t n, uint64_t v) { memcpy(p, &v, n < 8 ? n : 8); }
+
+/* set bytes [field_off, field_off+w) of a 64-bit field from val (for split
+ * lo/hi register writes of queue_desc/driver/device). */
+static void set64_part(uint64_t *field, unsigned byte, size_t w, uint64_t val)
+{
+    uint64_t f = *field;
+    unsigned bit = byte * 8, i;
+    for (i = 0; i < w && byte + i < 8; i++) {
+        f &= ~((uint64_t)0xff << (bit + i * 8));
+        f |= ((val >> (i * 8)) & 0xff) << (bit + i * 8);
+    }
+    *field = f;
+}
+
+/* Common-config register file (virtio_pci_common_cfg). off is within [0,0x40). */
+static void vt_common_cfg(vt_dev *d, uint64_t off, char *buf, size_t n, bool wr)
+{
+    const uint16_t q = d->queue_select;
+    vtpv_virtq *vq = q < VT_QUEUES ? &d->queues[q] : NULL;
+    const uint64_t v = wr ? ld(buf, n) : 0;
+
+#define RD(x) do { if (!wr) st(buf, n, (uint64_t)(x)); } while (0)
+    switch (off) {
+    case 0x00: if (wr) d->device_feature_select = (uint32_t)v; else RD(d->device_feature_select); break;
+    case 0x04: RD((d->device_features >> (d->device_feature_select ? 32 : 0)) & 0xffffffffu); break;
+    case 0x08: if (wr) d->driver_feature_select = (uint32_t)v; else RD(d->driver_feature_select); break;
+    case 0x0c:
+        if (wr) {
+            uint64_t shift = d->driver_feature_select ? 32 : 0;
+            d->driver_features &= ~((uint64_t)0xffffffffu << shift);
+            d->driver_features |= (v & 0xffffffffu) << shift;
+        } else RD((d->driver_features >> (d->driver_feature_select ? 32 : 0)) & 0xffffffffu);
+        break;
+    case 0x10: if (wr) d->msix_config = (uint16_t)v; else RD(d->msix_config); break;
+    case 0x12: RD(VT_QUEUES); break;                       /* num_queues (RO) */
+    case 0x14: if (wr) { d->device_status = (uint8_t)v; if (!v) d->needs_reset = 0; } else RD(d->device_status); break;
+    case 0x15: RD(d->config_generation); break;            /* config_generation (RO) */
+    case 0x16: if (wr) { if (v < VT_QUEUES) d->queue_select = (uint16_t)v; } else RD(d->queue_select); break;
+    case 0x18: if (wr && vq) { if (v && v <= VTPV_VQ_MAX_SIZE) vq->size = (uint16_t)v; } else RD(vq ? vq->size : 0); break;
+    case 0x1a: if (wr) { if (q < VT_QUEUES) d->queue_msix[q] = (uint16_t)v; } else RD(q < VT_QUEUES ? d->queue_msix[q] : VT_MSIX_NO_VECTOR); break;
+    case 0x1c:
+        if (wr && vq) {
+            vq->ready = v ? 1 : 0;
+            if (vq->ready) { vq->last_avail = 0; vq->used_idx = 0; }
+        } else RD(vq ? vq->ready : 0);
+        break;
+    case 0x1e: RD(q); break;                               /* queue_notify_off = queue index */
+    case 0x20: case 0x21: case 0x22: case 0x23:            /* queue_desc (8 bytes) */
+    case 0x24: case 0x25: case 0x26: case 0x27:
+        if (wr && vq) set64_part(&vq->desc, (unsigned)(off - 0x20), n, v);
+        else RD(vq ? (vq->desc >> ((off - 0x20) * 8)) : 0);
+        break;
+    case 0x28: case 0x29: case 0x2a: case 0x2b:            /* queue_driver = avail (8 bytes) */
+    case 0x2c: case 0x2d: case 0x2e: case 0x2f:
+        if (wr && vq) set64_part(&vq->avail, (unsigned)(off - 0x28), n, v);
+        else RD(vq ? (vq->avail >> ((off - 0x28) * 8)) : 0);
+        break;
+    case 0x30: case 0x31: case 0x32: case 0x33:            /* queue_device = used (8 bytes) */
+    case 0x34: case 0x35: case 0x36: case 0x37:
+        if (wr && vq) set64_part(&vq->used, (unsigned)(off - 0x30), n, v);
+        else RD(vq ? (vq->used >> ((off - 0x30) * 8)) : 0);
+        break;
+    default: if (!wr) memset(buf, 0, n); break;
+    }
+#undef RD
+}
 
 static ssize_t vt_bar0(vfu_ctx_t *ctx, char *buf, size_t count, loff_t off,
                        bool is_write)
 {
     vt_dev *d = g_dev;
-    if (!d) return is_write ? (ssize_t)count : -1;
+    (void)ctx;
+    if (!d || count > 8) return is_write ? (ssize_t)count : -1;
     pthread_mutex_lock(&d->m);
 
-    /* Notify window: a write of a queue index kicks that queue. */
-    if (off >= VT_CFG_NOTIFY && off < VT_CFG_NOTIFY + VT_QUEUES * 4) {
+    if (off >= VT_CFG_COMMON && off < VT_CFG_COMMON + 0x40) {
+        vt_common_cfg(d, off - VT_CFG_COMMON, buf, count, is_write);
+    } else if (off >= VT_CFG_ISR && off < VT_CFG_ISR + 0x100) {
+        if (!is_write) st(buf, count, 0); /* ISR status: read-to-clear, MSI-X in use */
+    } else if (off >= VT_CFG_NOTIFY && off < VT_CFG_NOTIFY + VT_QUEUES * 4) {
         if (is_write) {
-            uint16_t q = (uint16_t)((off - VT_CFG_NOTIFY) / 4);
-            if (q == 0) /* submission */
-                vt_process_submission(d);
+            uint16_t qn = (uint16_t)((off - VT_CFG_NOTIFY) / 4);
+            if (qn == 0) vt_process_submission(d); /* only the submission vq is kicked */
         }
-        pthread_mutex_unlock(&d->m);
-        return (ssize_t)count;
+    } else if (!is_write) {
+        memset(buf, 0, count);
     }
-
-    /*
-     * Common-config register file (virtio-modern). Increment 1 keeps the
-     * shadow registers that queue setup needs (feature negotiation gated on
-     * VERSION_1, queue select/size/enable, the DEVICE_NEEDS_RESET latch on a
-     * queue misuse); the full field decode lands with the ring machine.
-     */
-    if (!is_write)
-        memset(buf, 0, count); /* reads return the shadow / zero for now */
 
     pthread_mutex_unlock(&d->m);
     return (ssize_t)count;
@@ -240,6 +337,8 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
 
     d->queues[0].size = VT_QUEUE_MAX; /* submission */
     d->queues[1].size = VT_QUEUE_MAX; /* completion */
+    d->queue_msix[0] = d->queue_msix[1] = VT_MSIX_NO_VECTOR;
+    d->msix_config = VT_MSIX_NO_VECTOR;
 
     g_dev = d;
     *priv = d;
@@ -274,24 +373,55 @@ static int vt_reset(void *priv, vfu_reset_type_t type)
     if (!d) return 0;
     pthread_mutex_lock(&d->m);
     d->driver_features = 0;
+    d->device_feature_select = d->driver_feature_select = 0;
     d->device_status = 0;
     d->queue_select = 0;
     d->needs_reset = 0;
+    d->msix_config = VT_MSIX_NO_VECTOR;
     for (i = 0; i < VT_QUEUES; i++) {
-        d->queues[i].enabled = 0;
-        d->queues[i].desc = d->queues[i].driver = d->queues[i].device = 0;
+        vtpv_virtq *vq = &d->queues[i];
+        vq->ready = 0; vq->desc = vq->avail = vq->used = 0;
+        vq->last_avail = vq->used_idx = 0; vq->size = VT_QUEUE_MAX;
+        d->queue_msix[i] = VT_MSIX_NO_VECTOR;
     }
     pthread_mutex_unlock(&d->m);
     return 0;
 }
 
+/* Guest memory map changes (host main loop, quiesced around unmaps). */
+static void vt_dma_register(void *priv, const qdp_dma_region *region)
+{
+    vt_dev *d = priv;
+    pthread_mutex_lock(&d->m);
+    if (d->n_regions < VT_MAX_REGIONS)
+        d->regions[d->n_regions++] = *region;
+    else
+        vt_log(d, 1, "DMA region table full; region %#llx dropped",
+               (unsigned long long)region->iova);
+    pthread_mutex_unlock(&d->m);
+}
+static void vt_dma_unregister(void *priv, const qdp_dma_region *region)
+{
+    vt_dev *d = priv;
+    int i;
+    pthread_mutex_lock(&d->m);
+    for (i = 0; i < d->n_regions; i++)
+        if (d->regions[i].iova == region->iova && d->regions[i].len == region->len) {
+            d->regions[i] = d->regions[--d->n_regions];
+            break;
+        }
+    pthread_mutex_unlock(&d->m);
+}
+
 static const qdp_device_ops ops = {
     .abi_version = QDP_ABI_VERSION,
     .name = "apple-videotoolbox",
-    .version = "0.1-inc1",
+    .version = "0.2-inc2",
     .setup = vt_setup,
     .teardown = vt_teardown,
     .reset = vt_reset,
+    .dma_register = vt_dma_register,
+    .dma_unregister = vt_dma_unregister,
 };
 
 const qdp_device_ops *qdp_plugin_v1(void) { return &ops; }

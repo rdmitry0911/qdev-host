@@ -31,7 +31,10 @@ $(BUILD):
 $(BUILD)/test-proto: vtpv_proto.c vtpv_proto.h test_proto.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ vtpv_proto.c test_proto.c
 
-BACKEND := vtpv_proto.c vtpv_vaapi.c vtpv_h264.c
+$(BUILD)/test-virtq: vtpv_virtq.c vtpv_proto.c test_virtq.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ vtpv_virtq.c vtpv_proto.c test_virtq.c
+
+BACKEND := vtpv_proto.c vtpv_vaapi.c vtpv_h264.c vtpv_virtq.c
 
 $(BUILD)/test-vaapi: $(BACKEND) test_vaapi.c | $(BUILD)
 	$(CC) $(CFLAGS) $(VA_CFLAGS) -o $@ $(BACKEND) test_vaapi.c $(VA_LIBS)
@@ -48,8 +51,9 @@ $(BUILD)/test-plugin: test_plugin.c $(BUILD)/apple-videotoolbox.so | $(BUILD)
 
 plugin: $(BUILD)/apple-videotoolbox.so
 
-test: $(BUILD)/test-proto
+test: $(BUILD)/test-proto $(BUILD)/test-virtq
 	@echo "== protocol handler =="; $(BUILD)/test-proto
+	@echo "== virtio virtqueue =="; $(BUILD)/test-virtq
 ifeq ($(HAVE_VA),1)
 	@$(MAKE) --no-print-directory $(BUILD)/test-vaapi $(BUILD)/test-h264 $(BUILD)/test-plugin
 	@echo "== VA-API backend (live render node) =="; \
