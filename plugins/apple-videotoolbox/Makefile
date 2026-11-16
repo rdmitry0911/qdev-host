@@ -53,6 +53,11 @@ $(BUILD)/test-vaapi: $(BACKEND) test_vaapi.c | $(BUILD)
 $(BUILD)/test-h264: $(BACKEND) h264_gen.c test_h264.c | $(BUILD)
 	$(CC) $(CFLAGS) $(VA_CFLAGS) -o $@ $(BACKEND) h264_gen.c test_h264.c $(VA_LIBS)
 
+# THE HOST MILESTONE: real Apple contract-B wire bytes -> aw_session engine ->
+# live VA-API H.264 -> NV12 out, pixel-verified.
+$(BUILD)/test-aw-decode: $(AW_CORE) $(BACKEND) h264_gen.c test_aw_decode.c | $(BUILD)
+	$(CC) $(CFLAGS) $(VA_CFLAGS) -o $@ $(AW_CORE) $(BACKEND) h264_gen.c test_aw_decode.c $(VA_LIBS)
+
 $(BUILD)/apple-videotoolbox.so: apple-videotoolbox.c $(BACKEND) | $(BUILD)
 	$(CC) $(CFLAGS) -Wno-unused-parameter -fPIC -shared $(QDP_INC) $(VFU_INC) $(VA_CFLAGS) \
 	    -o $@ apple-videotoolbox.c $(BACKEND) $(VA_LIBS)
@@ -76,6 +81,11 @@ ifeq ($(HAVE_VA),1)
 	@echo "== H.264 I_PCM decode (live, pixel-verified) =="; \
 	 $(BUILD)/test-h264; rc=$$?; \
 	 if [ $$rc = 77 ]; then echo "(h264 test skipped: no usable render node)"; \
+	 elif [ $$rc != 0 ]; then exit $$rc; fi
+	@$(MAKE) --no-print-directory $(BUILD)/test-aw-decode
+	@echo "== MILESTONE: Apple-wire bytes in -> NV12 out (live) =="; \
+	 $(BUILD)/test-aw-decode; rc=$$?; \
+	 if [ $$rc = 77 ]; then echo "(milestone test skipped: no usable render node)"; \
 	 elif [ $$rc != 0 ]; then exit $$rc; fi
 	@echo "== plugin ABI smoke =="; $(BUILD)/test-plugin $(BUILD)/apple-videotoolbox.so
 else
