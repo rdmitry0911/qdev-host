@@ -8,6 +8,7 @@
 #include "aw_session.h"
 #include "aw_sbuf.h"
 #include "aw_wire.h"
+#include "aw_bplist.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,7 +19,7 @@ static int g_fail;
 
 /* ---- captured queue-1 emissions ------------------------------------- */
 #define MAXE 32
-static uint8_t g_e[MAXE][256];
+static uint8_t g_e[MAXE][1024];
 static size_t  g_el[MAXE];
 static int     g_ne;
 static void cap_emit(void *ctx, const uint8_t *m, size_t n) {
@@ -193,6 +194,12 @@ static void test_decode_exchange(void) {
     CHECK(g_open_calls == 1, "dsta opened backend decoder");
     CHECK(g_ne == 2, "dsta emits Dpba + reply (got %d)", g_ne);
     CHECK(e_type(0, &v) == AW_PARSE_OK && v.type == AW_MSG_DPBA && v.flags == AW_FLAG_HOST_REQ, "1st emission = Dpba (0x2)");
+    /* the Dpba ,val is a real bplist the framework would parse (H4) */
+    {
+        const uint8_t *pls; size_t pl;
+        CHECK(aw_get_bytes(&v, AW_KEY_VAL, AW_VT_PLS, &pls, &pl) == AW_PARSE_OK, "Dpba carries ,val =pls");
+        CHECK(pl > 8 && aw_bplist_check(pls, pl) == 0, "Dpba ,val is a valid bplist00");
+    }
     CHECK(e_type(1, &v) == AW_PARSE_OK && v.type == AW_MSG_DSTA && v.flags == AW_FLAG_HOST_REPLY, "2nd emission = dsta reply (0x4)");
 
     /* async dfrm (event-driven): deliver(dfrm) emits only Dbuf and returns */

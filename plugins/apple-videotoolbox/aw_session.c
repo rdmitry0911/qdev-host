@@ -4,6 +4,7 @@
  */
 #include "aw_session.h"
 #include "aw_sbuf.h"
+#include "aw_bplist.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -46,6 +47,73 @@ struct aw_engine {
     aw_dsession    sess[AW_MAX_SESSIONS];
     uint64_t       next_reply_id; /* host reply clerk: numbers from 100          */
 };
+
+/* ---- binary-plist payloads (H4) ------------------------------------------ *
+ * The guest's VideoToolbox parses these as bplist00 (contract-B §3). */
+
+/* Dpba: {PixelFormatType [420v], Width, Height, IOSurfaceProperties {},
+ * BytesPerRowAlignment 64, PlaneAlignment 256,
+ * PreferRealTimeCacheModeIfEveryoneDoes true}. PixelFormatType is an array of
+ * one OSType number ('420v'); if a guest shows it wants a string, swap
+ * aw_bpl_int -> aw_bpl_string (a guest-confirm point, FIX-CANDIDATE §4.4). */
+static size_t build_dpba_plist(uint8_t *out, size_t cap, uint32_t w, uint32_t h)
+{
+    aw_bplist *b = aw_bplist_new();
+    if (!b) return 0;
+    int fourcc = aw_bpl_int(b, (int64_t)AW_PIXFMT_420V);
+    int v_pft  = aw_bpl_array(b, &fourcc, 1);
+    int v_io   = aw_bpl_dict(b, NULL, NULL, 0);          /* IOSurfaceProperties {} */
+    int keys[7] = {
+        aw_bpl_string(b, "PixelFormatType"),
+        aw_bpl_string(b, "Width"),
+        aw_bpl_string(b, "Height"),
+        aw_bpl_string(b, "IOSurfaceProperties"),
+        aw_bpl_string(b, "BytesPerRowAlignment"),
+        aw_bpl_string(b, "PlaneAlignment"),
+        aw_bpl_string(b, "PreferRealTimeCacheModeIfEveryoneDoes"),
+    };
+    int vals[7] = {
+        v_pft,
+        aw_bpl_int(b, (int)w),
+        aw_bpl_int(b, (int)h),
+        v_io,
+        aw_bpl_int(b, 64),
+        aw_bpl_int(b, 256),
+        aw_bpl_bool(b, 1),
+    };
+    int root = aw_bpl_dict(b, keys, vals, 7);
+    size_t n = (root >= 0) ? aw_bplist_finalize(b, root, out, cap) : 0;
+    aw_bplist_free(b);
+    return n;
+}
+
+/* ,hin: {VTHostBuildVersion: "<our host id>"}. */
+static size_t build_hin_plist(uint8_t *out, size_t cap)
+{
+    aw_bplist *b = aw_bplist_new();
+    if (!b) return 0;
+    int k = aw_bpl_string(b, "VTHostBuildVersion");
+    int v = aw_bpl_string(b, "applegva-video 0.1");
+    int root = aw_bpl_dict(b, &k, &v, 1);
+    size_t n = (root >= 0) ? aw_bplist_finalize(b, root, out, cap) : 0;
+    aw_bplist_free(b);
+    return n;
+}
+
+/* A codec-list reply body (,dec / ,dca / ,enc). The decoder dictionaries built
+ * from the live VA-API caps (CMClassImplementationID/Name, VTCodecType,
+ * VTRating 400, VTPerProfileDetails) are a content follow-on; this emits a
+ * well-formed (currently empty) bplist dict so the reply carries real plist
+ * bytes the framework parses. */
+static size_t build_codeclist_plist(uint8_t *out, size_t cap)
+{
+    aw_bplist *b = aw_bplist_new();
+    if (!b) return 0;
+    int root = aw_bpl_dict(b, NULL, NULL, 0);
+    size_t n = (root >= 0) ? aw_bplist_finalize(b, root, out, cap) : 0;
+    aw_bplist_free(b);
+    return n;
+}
 
 /* ---- ImageDescription (=fds) --------------------------------------------- */
 
@@ -184,11 +252,13 @@ static uint64_t next_req_id(aw_engine *e) { return e->next_reply_id++; }
  * live VA-API caps. The routing + reply framing are what this slice proves. */
 static int32_t handle_listlike(aw_engine *e, const aw_msg_view *v, uint32_t list_key)
 {
+    uint8_t pls[128];
+    size_t pls_len = build_codeclist_plist(pls, sizeof pls);
     uint8_t buf[256];
     aw_builder b;
     aw_builder_init(&b, buf, sizeof buf);
     aw_build_header(&b, v->type, AW_FLAG_HOST_REPLY, v->uuid, v->reply_id);
-    aw_put_bytes(&b, list_key, AW_VT_PLS, NULL, 0); /* =pls NULL (H4 fills dict) */
+    aw_put_bytes(&b, list_key, AW_VT_PLS, pls, pls_len); /* bplist dict (H4)      */
     aw_put_u32(&b, AW_KEY_VER, 6);
     size_t n = aw_build_finalize(&b);
     if (n) emit(e, buf, n);
@@ -215,10 +285,12 @@ static int32_t handle_opendec(aw_engine *e, const aw_msg_view *v)
     uint8_t buf[256];
     aw_builder b;
     aw_builder_init(&b, buf, sizeof buf);
+    uint8_t hin[128];
+    size_t hin_len = build_hin_plist(hin, sizeof hin);
     aw_build_header(&b, v->type, AW_FLAG_HOST_REPLY, v->uuid, v->reply_id);
     aw_put_s32(&b, AW_KEY_ERR, AW_NOERR);  /* codec creation status (deferred to dsta) */
     aw_put_u32(&b, AW_KEY_VER, 6);
-    aw_put_bytes(&b, AW_KEY_HIN, AW_VT_PLS, NULL, 0); /* {VTHostBuildVersion}: H4 */
+    aw_put_bytes(&b, AW_KEY_HIN, AW_VT_PLS, hin, hin_len); /* {VTHostBuildVersion} */
     size_t n = aw_build_finalize(&b);
     if (n) emit(e, buf, n);
     return AW_NOERR;
@@ -240,11 +312,13 @@ static int32_t handle_closedec(aw_engine *e, const aw_msg_view *v)
  * its flags/UUID/ordering correct and a placeholder =pls body. */
 static void emit_dpba(aw_engine *e, aw_dsession *s)
 {
-    uint8_t buf[256];
+    uint8_t pls[256];
+    size_t pls_len = build_dpba_plist(pls, sizeof pls, s->width, s->height);
+    uint8_t buf[512];
     aw_builder b;
     aw_builder_init(&b, buf, sizeof buf);
     aw_build_header(&b, AW_MSG_DPBA, AW_FLAG_HOST_REQ, s->uuid, next_req_id(e));
-    aw_put_bytes(&b, AW_KEY_VAL, AW_VT_PLS, NULL, 0); /* H4: the attributes dict */
+    aw_put_bytes(&b, AW_KEY_VAL, AW_VT_PLS, pls, pls_len); /* real bplist (H4)    */
     size_t n = aw_build_finalize(&b);
     if (n) emit(e, buf, n);
 }
