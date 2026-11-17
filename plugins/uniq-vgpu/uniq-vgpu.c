@@ -47,6 +47,7 @@
  */
 #include "pvg.h"
 #include <dlfcn.h>
+#include <elf.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <sys/mman.h>
@@ -3177,12 +3178,142 @@ static int pvg_restart_workers(PvgState *s)
     return 0;
 }
 
+/* Driver-agnostic co-residency: stamp a UNIQUE DT_SONAME into a sibling copy of
+ * an ELF .so so a plain base-namespace dlopen of the copy yields an INDEPENDENT
+ * second instance.
+ *
+ * Why not dlmopen(LM_ID_NEWLM): a secondary link-map namespace is unsafe for ANY
+ * Vulkan ICD that performs an internal dlopen(..., RTLD_GLOBAL) during
+ * vkCreateDevice.  glibc's add_to_global_resize() (elf/dl-open.c) grows the
+ * namespace's global scope (GL(dl_ns)[nsid]._ns_main_searchlist); a secondary
+ * namespace has no base-equivalent main-searchlist backing, so the RTLD_GLOBAL
+ * dlopen SIGSEGVs.  The proprietary NVIDIA driver trips this via
+ * dlopen("libpthread.so.0", RTLD_GLOBAL) inside vkCreateDevice; Mesa RADV/ANV
+ * happen not to, which is the only reason they survived.  Loading the fresh
+ * instance in the BASE namespace (where BOOT's vkCreateDevice already works on
+ * every driver) is correct for all ICDs and never enters the faulting path.
+ *
+ * glibc aliases shared objects by SONAME, so a plain dlopen of a copy of
+ * libmlapi (SONAME "libmlapi.so") returns the already-mapped BOOT instance.  A
+ * distinct SONAME defeats that aliasing without a secondary namespace.  We edit
+ * a few bytes of .dynstr in a private copy (dependency-free, in-process) rather
+ * than requiring an external patchelf.  The new name must be no longer than the
+ * original so it fits the existing string slot.  Returns 0 or -errno; on success
+ * `out` holds the copy's path. */
+static int pvg_stamp_unique_soname_copy(PvgState *s, const char *src,
+                                        char *out, size_t outsz)
+{
+    static uint64_t ctr;   /* process-local monotonic; unique per reload */
+    uint64_t id = __atomic_add_fetch(&ctr, 1, __ATOMIC_RELAXED);
+    unsigned char *buf = NULL;
+    int fd = -1, ofd = -1, rc = -EIO;
+    struct stat st;
+
+    /* The copy lives beside `src` so libmlapi's $ORIGIN RUNPATH still resolves
+     * its sibling deps (they are already resident at reload time, but keep the
+     * invariant). */
+    if (g_snprintf(out, outsz, "%s.pvgns%06" PRIx64, src, id & 0xffffff) >= (int)outsz) {
+        return -ENAMETOOLONG;
+    }
+
+    fd = open(src, O_RDONLY | O_CLOEXEC);
+    if (fd < 0 || fstat(fd, &st) != 0 || st.st_size < (off_t)sizeof(Elf64_Ehdr)) {
+        goto out;
+    }
+    buf = g_malloc((size_t)st.st_size);
+    for (size_t got = 0; got < (size_t)st.st_size; ) {
+        ssize_t n = read(fd, buf + got, (size_t)st.st_size - got);
+        if (n < 0) { if (errno == EINTR) continue; goto out; }
+        if (n == 0) { goto out; }   /* truncated */
+        got += (size_t)n;
+    }
+
+    if (memcmp(buf, ELFMAG, SELFMAG) != 0 || buf[EI_CLASS] != ELFCLASS64) {
+        rc = -ENOEXEC;
+        goto out;
+    }
+    Elf64_Ehdr *eh = (Elf64_Ehdr *)buf;
+    if (eh->e_phoff == 0 ||
+        eh->e_phoff + (uint64_t)eh->e_phnum * eh->e_phentsize > (uint64_t)st.st_size) {
+        rc = -ENOEXEC;
+        goto out;
+    }
+    Elf64_Phdr *ph = (Elf64_Phdr *)(buf + eh->e_phoff);
+
+    Elf64_Dyn *dyn = NULL;
+    size_t dync = 0;
+    for (int i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type == PT_DYNAMIC) {
+            if (ph[i].p_offset + ph[i].p_filesz > (uint64_t)st.st_size) { rc = -ENOEXEC; goto out; }
+            dyn = (Elf64_Dyn *)(buf + ph[i].p_offset);
+            dync = ph[i].p_filesz / sizeof(Elf64_Dyn);
+            break;
+        }
+    }
+    if (!dyn) { rc = -ENOEXEC; goto out; }
+
+    Elf64_Addr strtab_va = 0;
+    Elf64_Xword soname_off = 0;
+    int has_soname = 0;
+    for (size_t i = 0; i < dync && dyn[i].d_tag != DT_NULL; i++) {
+        if (dyn[i].d_tag == DT_STRTAB) strtab_va = dyn[i].d_un.d_ptr;
+        else if (dyn[i].d_tag == DT_SONAME) { soname_off = dyn[i].d_un.d_val; has_soname = 1; }
+    }
+    if (!has_soname || strtab_va == 0) { rc = -ENOEXEC; goto out; }
+
+    /* Map DT_STRTAB's virtual address to a file offset via its PT_LOAD segment. */
+    uint64_t strtab_fo = 0;
+    int found = 0;
+    for (int i = 0; i < eh->e_phnum; i++) {
+        if (ph[i].p_type == PT_LOAD &&
+            strtab_va >= ph[i].p_vaddr &&
+            strtab_va < ph[i].p_vaddr + ph[i].p_filesz) {
+            strtab_fo = ph[i].p_offset + (strtab_va - ph[i].p_vaddr);
+            found = 1;
+            break;
+        }
+    }
+    if (!found || strtab_fo + soname_off >= (uint64_t)st.st_size) { rc = -ENOEXEC; goto out; }
+
+    char *oldname = (char *)(buf + strtab_fo + soname_off);
+    size_t maxlen = (size_t)st.st_size - (strtab_fo + soname_off);
+    size_t oldlen = strnlen(oldname, maxlen);
+    if (oldlen == maxlen) { rc = -ENOEXEC; goto out; }   /* unterminated */
+
+    char newname[64];
+    /* "ml%06x.so" is <= 10 chars; fits any real libmlapi SONAME length (>= 11). */
+    int nl = g_snprintf(newname, sizeof(newname), "ml%06" PRIx64 ".so", id & 0xffffff);
+    if (nl < 0 || (size_t)nl > oldlen) { rc = -ENAMETOOLONG; goto out; }
+    memset(oldname, 0, oldlen + 1);
+    memcpy(oldname, newname, (size_t)nl);
+
+    ofd = open(out, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0700);
+    if (ofd < 0) { rc = -errno; goto out; }
+    for (size_t put = 0; put < (size_t)st.st_size; ) {
+        ssize_t n = write(ofd, buf + put, (size_t)st.st_size - put);
+        if (n < 0) { if (errno == EINTR) continue; rc = -errno; goto out; }
+        put += (size_t)n;
+    }
+    rc = 0;
+
+out:
+    if (buf) g_free(buf);
+    if (fd >= 0) close(fd);
+    if (ofd >= 0) close(ofd);
+    if (rc) {
+        pvg_log(s, "[apple-gfx-ml][reload][ERROR] stamp unique SONAME on %s: %s\n",
+                src, strerror(-rc));
+    }
+    return rc;
+}
+
 int pvg_backend_reload(PvgState *s, const char *new_path, int reset)
 {
     const char *miss = NULL;
     struct pvg_qmu_vt nvt;
     void *ns;
     long lmid = -1;
+    char uniq_path[PATH_MAX];
     int r;
 
     if (!s || !new_path || !*new_path) {
@@ -3206,18 +3337,39 @@ int pvg_backend_reload(PvgState *s, const char *new_path, int reset)
     }
     g_assert(!s->qmu_dev);
 
-    /* dlmopen the new co-resident libmlapi into a FRESH link-map namespace.
-     * SONAME aliasing means a plain dlopen would alias the base instance, so
-     * LM_ID_NEWLM is required for an independent second copy.  The old instance
-     * stays mapped for the life of the process (no dlclose -> no _dl_fini under
-     * the threads it already joined); RTLD_NODELETE pins it too. */
-    ns = dlmopen(LM_ID_NEWLM, new_path, RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE);
+    /* Load the new co-resident libmlapi as an INDEPENDENT instance in the BASE
+     * link-map namespace -- NOT a dlmopen(LM_ID_NEWLM) secondary namespace.  A
+     * secondary namespace SIGSEGVs in glibc add_to_global_resize() when the host
+     * Vulkan ICD performs an internal dlopen(..., RTLD_GLOBAL) during
+     * vkCreateDevice (the proprietary NVIDIA driver does this via
+     * dlopen("libpthread.so.0"); see pvg_stamp_unique_soname_copy).  The base
+     * namespace is where BOOT's vkCreateDevice already works on every driver.
+     *
+     * glibc aliases shared objects by SONAME, so to get an independent second
+     * copy we stamp a unique DT_SONAME into a sibling copy and dlopen that by
+     * path.  RTLD_DEEPBIND makes the fresh instance resolve its own symbols
+     * first, so the BOOT instance (loaded RTLD_GLOBAL) cannot preempt its 5000+
+     * exported symbols -- giving true independence -- while undefined symbols
+     * still bind to the shared, already-resident deps.  The old instance stays
+     * mapped for the life of the process (no dlclose -> no _dl_fini under the
+     * threads it already joined); RTLD_NODELETE pins it too. */
+    r = pvg_stamp_unique_soname_copy(s, new_path, uniq_path, sizeof(uniq_path));
+    if (r) {
+        pthread_mutex_unlock(&s->backing_lock);
+        return r;   /* old instance already destroyed: caller rolls back */
+    }
+    ns = dlopen(uniq_path, RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE | RTLD_DEEPBIND);
+    /* The mapping survives unlink on Linux; drop the on-disk copy so reloads do
+     * not accumulate files (RTLD_NODELETE keeps it resident). */
+    unlink(uniq_path);
     if (!ns) {
-        pvg_log(s, "[apple-gfx-ml][reload][ERROR] dlmopen %s: %s\n", new_path, dlerror());
+        pvg_log(s, "[apple-gfx-ml][reload][ERROR] dlopen %s (unique-soname copy of %s): %s\n",
+                uniq_path, new_path, dlerror());
         pthread_mutex_unlock(&s->backing_lock);
         return -ENOENT;
     }
-    dlinfo(ns, RTLD_DI_LMID, &lmid);
+    lmid = LM_ID_BASE;
+    dlinfo(ns, RTLD_DI_LMID, &lmid);   /* LM_ID_BASE: base-namespace co-residency */
     memset(&nvt, 0, sizeof(nvt));
     if (!pvg_qmu_vt_bind(&nvt, ns, lmid, &miss)) {
         pvg_log(s, "[apple-gfx-ml][reload][ERROR] %s missing %s (not a libmlapi?)\n",
@@ -3388,9 +3540,10 @@ static const char *pvg_backend_report(void *priv, char *buf, size_t len)
     pthread_mutex_lock(&s->backing_lock);
     g_snprintf(buf, len,
                "envelope=%s reloads=%" PRIu64 " handshake_gen=%" PRIu64
-               " qmu_errors=%" PRIu64 " gpu_restarts=%" PRIu64 " lmid=%ld path=%s banner='%s'",
+               " qmu_errors=%" PRIu64 " gpu_restarts=%" PRIu64 " lmid=%ld instance=%p"
+               " path=%s banner='%s'",
                PVG_ENVELOPE_VERSION, s->reload_count, s->handshake_generation,
-               s->qmu_error_count, s->qmu_gpu_restart_count, s->qmu_lmid,
+               s->qmu_error_count, s->qmu_gpu_restart_count, s->qmu_lmid, s->qmu_ns,
                s->qmu_path ? s->qmu_path : "?", s->backend_banner);
     pthread_mutex_unlock(&s->backing_lock);
     return buf;
