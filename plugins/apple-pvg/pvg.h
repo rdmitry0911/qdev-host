@@ -134,6 +134,14 @@ typedef struct PvgState {
     uint32_t vram_size_mb;
     uint32_t display_width, display_height;
     uint32_t pci_vendor_id, pci_device_id;
+    /* Firmware-phase PCI identity (fw-vendor-id/fw-device-id; both or neither).
+     * While armed, config space carries these ids; the first BAR0 access after
+     * a device reset switches it to pci_vendor_id/pci_device_id; a device or
+     * FLR reset re-arms.  Accessed on the vfu loop thread only. */
+    uint32_t fw_vendor_id, fw_device_id;
+    bool fw_identity;             /* configured */
+    bool fw_identity_armed;
+    uint64_t fw_identity_switches;
     bool vsync_enabled;
     uint32_t debug_level;
     bool direct_scanout;
