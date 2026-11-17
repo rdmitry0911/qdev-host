@@ -768,19 +768,21 @@ int main(int argc, char **argv)
     printf("INFO QMetal [ERROR] log lines: %d\n", get_int(&qmetal_errors));
 
     /* 10b. IN-PROCESS REAL-RENDERER RELOAD (L-WARMSWAP-INPROC-RELOAD)
-     * N real device-reload cycles in ONE process: each dlmopen()s a banner-
-     * distinct libmlapi build, qmu_destroy + re-create the Session on it, with
-     * the device RESET (handshake generation bumped) each time.  Assert: the
-     * NEW banner is live (marker differs per cycle), lmid advances (a fresh
-     * link-map namespace), device state re-adopted (FIFO re-arms + consumes),
-     * handshake_gen == cycle, 0 new QMU errors, 0 abort/leak/join-hang. */
+     * N real device-reload cycles in ONE process: each loads a banner-distinct
+     * libmlapi build as an INDEPENDENT base-namespace instance (unique DT_SONAME
+     * + RTLD_DEEPBIND; driver-agnostic -- no dlmopen secondary namespace),
+     * qmu_destroy + re-create the Session on it, with the device RESET (handshake
+     * generation bumped) each time.  Assert: the NEW banner is live (marker
+     * differs per cycle), a distinct independent instance handle each cycle,
+     * device state re-adopted (FIFO re-arms + consumes), handshake_gen == cycle,
+     * 0 new QMU errors, 0 abort/leak/join-hang. */
     if (reload_n > 0 && reload_golden) {
         CHECK(ops->abi_version >= 4 && ops->reload && ops->backend_report,
               "plugin exposes qdp v4 reload + backend_report (abi %u)", ops->abi_version);
         if (ops->reload && ops->backend_report) {
             char root[256], sib[512], rep[512];
             const char *slash = strrchr(reload_golden, '/');
-            long prev_lmid = -1;
+            unsigned long prev_instance = 0;
             int ok_cycles = 0;
             int errs_before_all = get_int(&qmetal_errors);
             snprintf(root, sizeof(root), "/tmp/apple-pvg-reload-%d", getpid());
@@ -826,11 +828,20 @@ int main(int argc, char **argv)
                       "cycle %d: 0 new QMU [ERROR] lines (%d)", cyc,
                       get_int(&qmetal_errors) - errs_before);
 
-                /* lmid advances: a fresh co-resident namespace each cycle */
-                long lmid = -1; { char *p = strstr(rep, "lmid="); if (p) lmid = atol(p + 5); }
-                CHECK(lmid > 0 && lmid != prev_lmid, "cycle %d: co-resident lmid=%ld (was %ld)",
-                      cyc, lmid, prev_lmid);
-                prev_lmid = lmid;
+                /* Driver-agnostic co-residency: the fresh libmlapi loads as an
+                 * INDEPENDENT instance in the BASE link-map namespace (lmid==0;
+                 * NOT a dlmopen secondary namespace, which SIGSEGVs on ICDs that
+                 * RTLD_GLOBAL-dlopen inside vkCreateDevice, e.g. NVIDIA).  Prove
+                 * independence by a distinct, non-NULL instance handle each cycle
+                 * -- in tandem with the NEW-banner-live check above, which is the
+                 * semantic contamination detector (a preempted/aliased instance
+                 * would still carry the OLD banner). */
+                unsigned long inst_h = 0;
+                { char *p = strstr(rep, "instance="); if (p) inst_h = strtoul(p + 9, NULL, 0); }
+                CHECK(inst_h != 0 && inst_h != prev_instance,
+                      "cycle %d: independent base-ns instance=0x%lx (was 0x%lx)",
+                      cyc, inst_h, prev_instance);
+                prev_instance = inst_h;
 
                 /* device state re-adopted: re-arm the FIFO on the new session and
                  * confirm it consumes a NOP (FIFO_READ advances) */
