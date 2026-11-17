@@ -244,6 +244,28 @@ typedef struct qdp_device_ops {
      * -EINVAL out of the plugin's bounds, -ENOTSUP the plugin's policy does
      * not follow UI sizes, -ENODEV the device is stopped. */
     int  (*ui_info)(void *priv, const qdp_ui_info *info);
+
+    /* ------------------------------------------------------------ v3 (warm-swap)
+     * Warm-swap of the plugin's VARIABLE backing under a live, un-rebooted
+     * guest (the "fixed resident kext / variable host backend" model). The
+     * guest-visible ENVELOPE -- message framing, virtqueue layout, the
+     * handshake and the capability-negotiation MECHANISM -- is frozen; only
+     * the backing behind it changes. Both optional; the host reads them only
+     * when abi_version >= 3. */
+
+    /* Report the FROZEN envelope/transport version string (NOT the feature
+     * command set). An updater compares this across a bundle swap: an equal
+     * envelope means a warm swap is safe even if the new backing ADDS
+     * commands/capabilities; a changed envelope means the guest must reboot. */
+    const char *(*abi_tag)(void *priv);
+
+    /* Swap the VARIABLE backing in process (dlopen a new backing .so/bundle,
+     * or a built-in tag). Runs quiesced if the plugin has a quiesce op. `arg`
+     * is plugin-specific (a path or a tag). Returns 0 or -errno. The device's
+     * envelope state (queues, PCI config) is left intact: the guest picks up
+     * the new backing on its next capability re-negotiation, which a device
+     * reset (FLR / virtio reset / hot-replug) triggers. */
+    int (*swap)(void *priv, const char *arg);
 } qdp_device_ops;
 
 /* The single exported symbol of a plugin shared object. */

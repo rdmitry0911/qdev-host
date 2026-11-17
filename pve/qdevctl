@@ -117,6 +117,44 @@ def cmd_tb(a):
     for m in TB.set_ports(a.vmid, conf, a.ports or TB.port_count(conf), a.acpi, a.hotplug, a.power_controller):
         print(m)
 
+def _target(pos, control, want_backing):
+    """Resolve a device target. Forms:
+        VMID ID [BACKING]            (PVE: resolve control.sock from the config)
+        --control PATH   [BACKING]   (raw qdev-host, e.g. a bring-up harness)
+    Returns (control_path, vmid, dev_id, backing)."""
+    backing = None
+    if control:
+        if want_backing:
+            if len(pos) != 1:
+                raise Q.QdevError("with --control, give exactly: BACKING")
+            backing = pos[0]
+        elif pos:
+            raise Q.QdevError("with --control, give no positional arguments")
+        return control, 0, "", backing
+    need = 3 if want_backing else 2
+    if len(pos) != need:
+        raise Q.QdevError(f"need VMID ID{' BACKING' if want_backing else ''} (or --control PATH)")
+    vmid = int(pos[0]); dev_id = pos[1]
+    if want_backing:
+        backing = pos[2]
+    return str(Q.device_control(vmid, dev_id)), vmid, dev_id, backing
+
+def cmd_device_abi(a):
+    # Report the FROZEN envelope/transport ABI version read from the live device.
+    # increment 3's updater compares this to a bundle's ABI tag: same envelope =>
+    # warm-swap OK (even if the bundle adds commands); change => reboot required.
+    cp, _, _, _ = _target(a.pos, a.control, want_backing=False)
+    print(Q.device_abi(cp))
+
+def cmd_device_swap(a):
+    # Warm-swap the device's VARIABLE backing under a live guest: quiesce ->
+    # dlopen-swap the new backing .so/bundle (or tag) -> resume, with the
+    # vfio-user process kept alive. --reset hotplug re-enumerates the guest so a
+    # live guest re-handshakes and sees the new backing without a guest reboot.
+    cp, vmid, dev_id, backing = _target(a.pos, a.control, want_backing=True)
+    for m in Q.device_swap(cp, backing, reset=a.reset, vmid=vmid, dev_id=dev_id):
+        print(m)
+
 def cmd_hook(a):
     conf = Q.load_conf(a.vmid)
     rc = 0
@@ -216,6 +254,20 @@ def main():
         s.add_argument(f"--{key}", help=f"window the firmware reserves per port (default {default}; '' = QEMU's default)")
     s.set_defaults(fn=cmd_tb)
     s = sub.add_parser("tb-boot", help=argparse.SUPPRESS); s.add_argument("vmid", type=int); s.set_defaults(fn=cmd_tb_boot)
+    # warm-swap primitives (increment 1): the product-grade command increment 3
+    # (`uniq-vgpu update`) wraps. Target a device by VMID+ID (PVE) or by an
+    # explicit --control PATH (raw qdev-host, e.g. a bring-up harness).
+    s = sub.add_parser("device-abi", help="report a device's FROZEN envelope/ABI version (warm-vs-reboot gate)")
+    s.add_argument("pos", nargs="*", metavar="VMID ID", help="VMID ID (or use --control)")
+    s.add_argument("--control", help="qdev-host --control socket path (instead of VMID ID)")
+    s.set_defaults(fn=cmd_device_abi)
+    s = sub.add_parser("device-swap", help="warm-swap a device's VARIABLE backing in process (quiesce->dlopen-swap->resume)")
+    s.add_argument("pos", nargs="*", metavar="VMID ID BACKING",
+                   help="VMID ID BACKING (or --control PATH BACKING); BACKING = tag A|B|builtin:X or a backing .so/bundle")
+    s.add_argument("--control", help="qdev-host --control socket path (instead of VMID ID)")
+    s.add_argument("--reset", choices=["hotplug"], default=None,
+                   help="trigger the guest re-handshake: hotplug = QMP device_del+device_add (process stays alive)")
+    s.set_defaults(fn=cmd_device_swap)
     a = p.parse_args()
     try:
         rc = a.fn(a)

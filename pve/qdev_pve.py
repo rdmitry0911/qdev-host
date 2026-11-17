@@ -354,6 +354,71 @@ def device_socket(vmid: int, dev_id: str) -> Path:
 def device_display(vmid: int, dev_id: str) -> Path:
     return unit_run_dir(vmid, dev_id) / "display.sock"
 
+def device_control(vmid: int, dev_id: str) -> Path:
+    return unit_run_dir(vmid, dev_id) / "control.sock"
+
+# ---------------------------------------------- qdev-host control socket client
+def control_cmd(control_path, line: str, timeout: float = 5.0) -> str:
+    """Send one command line to a qdev-host --control socket and return its one
+    reply line (without the trailing newline). Raises QdevError on failure."""
+    control_path = str(control_path)
+    if not os.path.exists(control_path):
+        raise QdevError(f"control socket not found: {control_path} "
+                        "(the device process must be started with --control)")
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(control_path)
+        s.sendall((line.rstrip("\n") + "\n").encode())
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        return buf.decode(errors="replace").split("\n", 1)[0].strip()
+    except OSError as e:
+        raise QdevError(f"control socket {control_path}: {e}")
+    finally:
+        s.close()
+
+def device_abi(control_path) -> str:
+    """Report the device's FROZEN envelope/transport ABI version (warm-vs-reboot
+    gate), plugin name and version. Reads it from the live device."""
+    reply = control_cmd(control_path, "abi")
+    if not reply.startswith("ok"):
+        raise QdevError(f"device-abi: {reply}")
+    return reply[len("ok"):].strip()
+
+def device_swap(control_path, backing: str,
+                reset=None, vmid: int = 0, dev_id: str = "") -> list[str]:
+    """Warm-swap the device's VARIABLE backing in process (quiesce -> dlopen-swap
+    -> resume) WITHOUT dropping the vfio-user process. `backing` is a backing
+    tag (A/B/builtin:X) or a path to a backing .so. `reset` triggers the guest
+    re-handshake that makes the swap visible to a live guest:
+      None       - stage only (caller resets, or a later reset picks it up);
+      "hotplug"  - QMP device_del + device_add of the vfio-user-pci (process
+                   stays alive, backing persists); the guest re-enumerates and
+                   re-handshakes. Needs vmid/dev_id.
+    Returns progress lines."""
+    out = []
+    reply = control_cmd(control_path, f"swap {backing}")
+    if not reply.startswith("ok"):
+        raise QdevError(f"device-swap: {reply}")
+    out.append(f"backing swapped in process: {reply[len('ok'):].strip()}")
+    if reset == "hotplug":
+        if not vmid or not dev_id:
+            raise QdevError("device-swap --reset hotplug needs VMID and ID")
+        dev = find_device(load_conf(vmid), dev_id)
+        if not dev:
+            raise QdevError(f"device {dev_id} not found in VM {vmid} config")
+        if not device_del(vmid, dev_id):
+            raise QdevError(f"device_del {dev_id} timed out")
+        out.append(f"hot-unplugged {dev_id} (qdev-host process kept alive)")
+        device_add(vmid, dev, device_socket(vmid, dev_id))
+        out.append(f"hot-replugged {dev_id}: guest re-enumerates + re-handshakes")
+    return out
+
 def gpu_socket(vmid: int, dev_id: str) -> Path:
     return unit_run_dir(vmid, dev_id) / "gpu.sock"
 
@@ -366,6 +431,7 @@ def build_args(vmid: int, dev: dict) -> list[str]:
     if not plugin.exists():
         raise QdevError(f"plugin not installed: {plugin}")
     args = ["--plugin", str(plugin), "--socket", str(device_socket(vmid, dev["id"])),
+            "--control", str(device_control(vmid, dev["id"])),
             "--dump-dir", str(STATE_DIR), "--vm-name", f"VM{vmid}-{dev['id']}"]
     if dev.get("args"):
         args += ["--plugin-args", dev["args"]]

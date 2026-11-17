@@ -82,6 +82,9 @@ static struct {
     void (*dma_register)(void *, const qdp_dma_region *);
     void (*dma_unregister)(void *, const qdp_dma_region *);
     bool (*get_cursor)(void *, qdp_cursor *);
+    /* v3: warm-swap of the VARIABLE backing (see qdp.h). */
+    const char *(*abi_tag)(void *);
+    int  (*swap)(void *, const char *);
 } v2;
 #define PLUGIN_DAMAGE (v2.flags & QDP_F_PLUGIN_DAMAGE)
 /* v3 fields, likewise zero for an older plugin */
@@ -275,6 +278,7 @@ static void load_plugin(void)
         v2.dma_register = ops->dma_register; v2.dma_unregister = ops->dma_unregister; v2.get_cursor = ops->get_cursor;
     }
     if (abi >= 3) v3.ui_info = ops->ui_info;
+    if (abi >= 3) { v2.abi_tag = ops->abi_tag; v2.swap = ops->swap; }
     LOG("plugin %s %s (ABI %u%s)", ops->name, ops->version, abi, PLUGIN_DAMAGE ? ", plugin damage" : "");
 }
 
@@ -696,8 +700,35 @@ static void ctl_command(ctl_t *c, char *line)
         else if (r == QDP_UI_INFO_UNCHANGED) ctl_reply(c, "ok unchanged %ux%u", v[0], v[1]);
         else if (r == -ENOTSUP && !v3.ui_info) ctl_reply(c, "err plugin has no ui_info (ABI %u)", abi);
         else ctl_reply(c, "err %ux%u refused: %s", v[0], v[1], strerror(r < 0 ? -r : EINVAL));
+    } else if (!strcmp(line, "abi")) {
+        /* Report the FROZEN envelope/transport version (qdp.h v3 abi_tag), NOT
+         * the feature command set. An updater compares this across a bundle
+         * swap to decide warm-swap vs reboot-required. */
+        if (abi >= 3 && v2.abi_tag)
+            ctl_reply(c, "ok envelope=%s plugin=%s version=%s qdp_abi=%u",
+                      v2.abi_tag(priv), ops->name ? ops->name : "?",
+                      ops->version ? ops->version : "?", abi);
+        else
+            ctl_reply(c, "ok envelope=(none) plugin=%s version=%s qdp_abi=%u",
+                      ops->name ? ops->name : "?", ops->version ? ops->version : "?", abi);
+    } else if (!strncmp(line, "swap", 4) && (line[4] == ' ' || line[4] == 0)) {
+        /* Warm-swap the plugin's VARIABLE backing in process (quiesce -> swap
+         * -> resume). The vfio-user connection and the device envelope stay
+         * up; the guest sees the new backing after its next re-handshake,
+         * which a device reset (FLR / virtio reset / hot-replug) triggers. */
+        char *arg = g_strstrip(line + 4);
+        if (!(abi >= 3 && v2.swap)) { ctl_reply(c, "err swap unsupported by plugin"); return; }
+        bool did_q = false;
+        if (v2.quiesce) {
+            if (quiesce_cb(vfu) != 0) { ctl_reply(c, "err quiesce refused"); return; }
+            did_q = true;
+        }
+        int r = v2.swap(priv, arg);
+        if (did_q) plugin_resume();
+        if (r == 0) ctl_reply(c, "ok swapped %s", *arg ? arg : "(default)");
+        else ctl_reply(c, "err swap: %s", strerror(r < 0 ? -r : r));
     } else {
-        ctl_reply(c, "err unknown command (screendump FILE | frame | stats | uiinfo W H [WMM HMM])");
+        ctl_reply(c, "err unknown command (screendump FILE | frame | stats | uiinfo W H [WMM HMM] | abi | swap ARG)");
     }
 }
 static void ctl_process(ctl_t *c)
@@ -1503,7 +1534,7 @@ static void usage(void)
         "  --qemu-qmp PATH          the VM's QMP socket: forward keyboard/mouse with input-send-event\n"
         "                           (for VMs without a graphic console; --qemu-display wins if both are given)\n"
         "  --control PATH           control socket for automation: screendump FILE | frame | stats |\n"
-        "                           uiinfo W H [WMM HMM]\n"
+        "                           uiinfo W H [WMM HMM] | abi | swap ARG\n"
         "  --kms-copy               force the copy path (no udmabuf zero-copy)\n"
         "  --stats-interval S       print stats every S seconds (SIGUSR2 prints them once)\n"
         "  -v                       verbose\n"
