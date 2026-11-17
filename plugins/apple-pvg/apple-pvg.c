@@ -2371,7 +2371,7 @@ static int pvg_create_session(PvgState *s)
         .struct_size = sizeof(qmu_extended_config),
         .ram_base = 0,
         .ram_size = 0,
-        .max_protocol_version = 6,
+        .max_protocol_version = 10,  /* PVG-V10-UPLIFT: advertise binary version 10 ceiling (reims mapper_io_surfaces era) */
         .iosfc_caps = 0x03,
         .display_port_count = 1,
         .vram_size = s->vram_size,
