@@ -2333,6 +2333,69 @@ static int pvg_pci_setup(PvgState *s, vfu_ctx_t *ctx)
     return 0;
 }
 
+/* increment 2: the apple-pvg<->apple-videotoolbox IOSurface-mapper bridge (writer side).
+ * The mapper ring (in qmu/libmlapi) publishes each mapped surface through callbacks.mapper_publish;
+ * here we create/open a shared-memory region (name agreed with the video process via the
+ * launcher-set PVG_MAPPER_BRIDGE_SHM env) and write the mapping_id -> {gpa pages + NV12 layout}
+ * registry that apple-videotoolbox's vt_resolve_buffer reads. One region per device/process. */
+#include "pvg_mapper_bridge.h"
+
+static pvg_mapper_bridge *g_pvg_bridge = NULL;
+
+static const char *pvg_bridge_shm_name(void)
+{
+    const char *n = getenv("PVG_MAPPER_BRIDGE_SHM");
+    return (n && *n) ? n : "/pvg-mapper-bridge"; /* launcher should set a VM-scoped name */
+}
+
+static pvg_mapper_bridge *pvg_bridge_get(void)
+{
+    if (g_pvg_bridge) return g_pvg_bridge;
+    const char *name = pvg_bridge_shm_name();
+    int fd = shm_open(name, O_CREAT | O_RDWR, 0600);
+    if (fd < 0) return NULL;
+    if (ftruncate(fd, (off_t)pvg_mapper_bridge_bytes()) != 0) { close(fd); return NULL; }
+    void *p = mmap(NULL, pvg_mapper_bridge_bytes(), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (p == MAP_FAILED) return NULL;
+    pvg_mapper_bridge *b = (pvg_mapper_bridge *)p;
+    if (!pvg_mapper_bridge_valid(b)) pvg_mapper_bridge_init(b, 4096);
+    g_pvg_bridge = b;
+    return b;
+}
+
+static void pvg_mapper_publish(void *ctx, const qmu_mapper_surface_pub *pub)
+{
+    (void)ctx;
+    pvg_mapper_bridge *b = pvg_bridge_get();
+    if (!b || !pub) return;
+    pvg_bridge_publish_info info;
+    memset(&info, 0, sizeof info);
+    info.pixel_format = pub->pixel_format;
+    info.width = pub->width;
+    info.height = pub->height;
+    info.plane_count = pub->plane_count;
+    info.alloc_size = pub->alloc_size;
+    info.base_offset = pub->base_offset;
+    for (uint32_t i = 0; i < pub->plane_count && i < PVG_BRIDGE_MAX_PLANES; i++) {
+        info.planes[i].offset = pub->planes[i].offset;
+        info.planes[i].size = pub->planes[i].size;
+        info.planes[i].bytes_per_row = pub->planes[i].bytes_per_row;
+        info.planes[i].width = pub->planes[i].width;
+        info.planes[i].height = pub->planes[i].height;
+    }
+    info.page_count = pub->page_count;
+    info.gpa_pages = pub->gpa_pages;
+    info.page_size = pub->page_size;
+    (void)pvg_mapper_bridge_publish(b, pub->mapping_id, &info);
+}
+
+static void pvg_mapper_retract(void *ctx, uint32_t mapping_id)
+{
+    (void)ctx;
+    if (g_pvg_bridge) pvg_mapper_bridge_retract(g_pvg_bridge, mapping_id);
+}
+
 static int pvg_create_session(PvgState *s)
 {
     qmu_extended_callbacks callbacks = {
@@ -2357,6 +2420,9 @@ static int pvg_create_session(PvgState *s)
         .iosfc_map_memory = pvg_iosfc_map_memory,
         .iosfc_unmap_memory = pvg_iosfc_unmap_memory,
         .iosfc_raise_irq = pvg_raise_irq,
+        /* increment 2: the IOSurface-mapper bridge writer (mapping_id -> gpa-ranges + layout) */
+        .mapper_publish = pvg_mapper_publish,
+        .mapper_retract = pvg_mapper_retract,
         .schedule_display_completion = pvg_schedule_display_completion,
         /* no BQL out of process: the "main loop" forms are the same leaves */
         .read_memory_mainloop = pvg_read_memory,

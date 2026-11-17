@@ -43,10 +43,15 @@
 
 #include <libvfio-user.h>
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
 #include "qdp.h"
 #include "vtpv_vaapi.h"
 #include "vtpv_virtq.h"
 #include "aw_session.h"   /* the Apple contract-B wire session engine (H5/H6/H7) */
+#include "../apple-pvg/pvg_mapper_bridge.h" /* increment 2: resolve mapping_id -> gpa-ranges */
 
 /* ---- device constants ---------------------------------------------- */
 
@@ -337,6 +342,30 @@ static void vt_emit(void *ctx, const uint8_t *msg, size_t len)
  * (not a GPA), the plugin needs a plugin-boundary resolver
  * `map_guest_surface(mapper_ctx, mapping_id) -> {dma-buf fd or host ptr + plane
  * layout}`. Until that lands, the GPA convention above is the bring-up path. */
+/* increment 2: open the apple-pvg<->apple-videotoolbox IOSurface-mapper bridge (shm), once,
+ * lazily. The vfio-user launcher sets PVG_MAPPER_BRIDGE_SHM to the VM-scoped shm name that
+ * apple-pvg creates. Returns NULL when no bridge is wired (then resolve falls back to the
+ * GPA-as-mapping-id bring-up path below). */
+static const pvg_mapper_bridge *vt_bridge(void)
+{
+    static const pvg_mapper_bridge *b = NULL;
+    static int tried = 0;
+    if (!tried) {
+        tried = 1;
+        const char *name = getenv("PVG_MAPPER_BRIDGE_SHM");
+        if (name && *name) {
+            int fd = shm_open(name, O_RDONLY, 0);
+            if (fd >= 0) {
+                void *p = mmap(NULL, pvg_mapper_bridge_bytes(), PROT_READ, MAP_SHARED, fd, 0);
+                close(fd);
+                if (p != MAP_FAILED && pvg_mapper_bridge_valid((const pvg_mapper_bridge *)p))
+                    b = (const pvg_mapper_bridge *)p;
+            }
+        }
+    }
+    return b;
+}
+
 static int vt_resolve_buffer(void *ctx, const uint8_t uuid[16], uint64_t mapping_id,
                              uint32_t w, uint32_t h, aw_out_buffer *out)
 {
@@ -380,6 +409,53 @@ static int vt_resolve_buffer(void *ctx, const uint8_t uuid[16], uint64_t mapping
                "mapper (using_iosurface_mapper); see L-GVA-SURFACE.");
         return -1;
     }
+
+    /* increment 2: the v10 IOSurface-mapper path. A nonzero mapping_id is an opaque mapper token;
+     * resolve it through the apple-pvg bridge -> {guest-physical pages + AUTHORITATIVE NV12 layout
+     * from the guest surface descriptor}. This supersedes the GPA-as-mapping-id bring-up shortcut
+     * below AND the align(w,16) stride guess (the L-GVA-STRIDE fix: the rowBytes now comes from the
+     * guest surface, not a guess). The honest drop stays for a genuinely-unmapped id (bridge miss
+     * with a bridge present), and the GPA shortcut below stays for runs with no bridge. */
+    {
+        const pvg_mapper_bridge *bridge = vt_bridge();
+        pvg_bridge_resolved r;
+        if (bridge && pvg_mapper_bridge_lookup(bridge, (uint32_t)mapping_id, &r) == 0 &&
+            r.page_count > 0) {
+            if (!r.contiguous) {
+                /* Scattered guest pages need a page-aware (scatter) copy; not wired in this slice.
+                 * Bring-up allocates the output surface physically contiguous (guest kext), so this
+                 * path is the exception, logged and dropped honestly rather than mis-landed. */
+                vt_log(d, 1, "mapper id %llu: %u scattered pages (scatter copy not wired); dropping",
+                       (unsigned long long)mapping_id, r.page_count);
+                return -1;
+            }
+            size_t y_stride = (r.plane_count >= 1 && r.planes[0].bytes_per_row)
+                                  ? (size_t)r.planes[0].bytes_per_row : (size_t)r.width;
+            size_t uv_off = (r.plane_count >= 2) ? (size_t)r.planes[1].offset
+                                                 : y_stride * (size_t)r.height;
+            size_t uv_stride = (r.plane_count >= 2 && r.planes[1].bytes_per_row)
+                                   ? (size_t)r.planes[1].bytes_per_row : y_stride;
+            size_t total = (size_t)(r.alloc_size ? r.alloc_size
+                                                 : uv_off + uv_stride * ((r.height + 1) / 2));
+            uint8_t *p = vt_map(d, r.gpa_base, total);
+            if (!p) {
+                vt_log(d, 1, "mapper id %llu gpa %#llx: no guest pages (%zu B) in the DMA regions",
+                       (unsigned long long)mapping_id, (unsigned long long)r.gpa_base, total);
+                return -1;
+            }
+            memset(out, 0, sizeof *out);
+            memcpy(out->uuid, uuid, 16);
+            out->mapping_id = mapping_id;
+            out->y = p + (size_t)r.base_offset;              out->y_stride = y_stride;
+            out->uv = p + (size_t)r.base_offset + uv_off;    out->uv_stride = uv_stride;
+            out->width = w; out->height = h;
+            vt_log(d, 2, "mapper id %llu resolved via bridge: gpa %#llx %ux%u y_stride %zu uv@%zu",
+                   (unsigned long long)mapping_id, (unsigned long long)r.gpa_base, w, h, y_stride,
+                   uv_off);
+            return 0;
+        }
+    }
+
     uint32_t ystride = (w + 15u) & ~15u;          /* guest CoreVideo rowBytes (16)  */
     size_t   ysize   = (size_t)ystride * h;
     size_t   csize   = (size_t)ystride * ((h + 1u) / 2u); /* NV12 interleaved UV   */
