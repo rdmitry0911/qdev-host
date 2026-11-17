@@ -357,6 +357,29 @@ static int vt_resolve_buffer(void *ctx, const uint8_t uuid[16], uint64_t mapping
      * 128 to every real column), so final pixel-exact closure also depends on that
      * guest-side copy honouring the same 352 stride - confirm live. The
      * authoritative rowBytes should arrive via the surface-mapper token. */
+    /* L-GVA-SURFACE: a surface-less Dbuf reply carries no `subs` box, so
+     * mapping_id arrives as 0 (the "no lent buffer" sentinel - reims' subs ids
+     * stop at the first zero). mapping_id 0 is NOT a valid landing: vt_map(0,..)
+     * resolves to the base of guest RAM (guest-physical 0), so the decode would
+     * be DMA'd nowhere useful while the guest delivers its own never-written
+     * output IOSurface (stale RAM that aliases the input bitstream - the
+     * "delivered == sample.bin[156:]" / misleading-0.5% illusion, proven in
+     * evidence/runs/applegva-stride-guest-20261117). Refuse it so the engine
+     * drops the frame honestly (no Demt success) instead of reporting a false
+     * delivery. A real NONZERO mapping_id is an opaque IOSurface-mapper token
+     * (IOSurfaceGetID), not a GPA, whose (possibly scattered udmabuf) pages only
+     * resolve through the paravirtual-GPU IOSurface mapper
+     * (apple-pvg/qmu retain_io_surface_with_mapping_id /
+     * address_ranges_for_virtual_page, gated by using_iosurface_mapper=0 today).
+     * The GPA-as-mapping-id path below is the bring-up shortcut and lands pixels
+     * in the guest only once that mapper is exposed to this plugin (the
+     * H2-QMETAL-SURFACE-MAPPER-ASK / L-GVA-SURFACE cross-component dependency). */
+    if (mapping_id == 0) {
+        vt_log(d, 1, "Dbuf reply lent no output surface (mapping_id 0): dropping the "
+               "frame. The decoded surface backing needs the apple-pvg IOSurface "
+               "mapper (using_iosurface_mapper); see L-GVA-SURFACE.");
+        return -1;
+    }
     uint32_t ystride = (w + 15u) & ~15u;          /* guest CoreVideo rowBytes (16)  */
     size_t   ysize   = (size_t)ystride * h;
     size_t   csize   = (size_t)ystride * ((h + 1u) / 2u); /* NV12 interleaved UV   */

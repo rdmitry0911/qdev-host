@@ -45,6 +45,10 @@ typedef struct { vtpv_vaapi *v; uint8_t *guest_ram; size_t ram_len;
 static int resolvebuf(void *c, const uint8_t uuid[16], uint64_t mapid,
                       uint32_t w, uint32_t h, aw_out_buffer *o) {
     bufctx *b = c; (void)uuid;
+    /* L-GVA-SURFACE: mapping_id 0 = a surface-less Dbuf reply (no subs box); it is
+     * NEVER a valid landing (it would resolve to guest-physical 0). Mirror the
+     * device's vt_resolve_buffer: refuse it so the engine drops the frame. */
+    if (mapid == 0) return -1;
     uint32_t ystride = (w + 63u) & ~63u;
     size_t ysize = (size_t)ystride * h;
     size_t csize = (size_t)ystride * ((h + 1u) / 2u);
@@ -243,6 +247,63 @@ int main(int argc, char **argv) {
                         (int)(first % W), (int)(first / W),
                         gy[(first / W) * ys + (first % W)], luma_ref[first]);
         CHECK(bad == 0, "decoded luma landed in the guest buffer, byte-exact");
+    }
+
+    /* ---- NEGATIVE GATE (L-GVA-SURFACE): a surface-less Dbuf reply (mapping_id 0)
+     * MUST be refused, never silently landed at guest-physical 0. This is the
+     * exact live failure: the host "resolved" gpa 0, DMA'd the decode nowhere,
+     * and the guest delivered its own never-written output IOSurface = stale RAM
+     * aliasing the input bitstream (the misleading "0.5% luma residual"). Gate it
+     * so that class of disconnected delivery can never again pass as success:
+     * resolve must fail, no frame is landed (copied==0), and NO Demt (decode-
+     * complete) is emitted - the engine drops the frame after only the early
+     * dfrm reply. */
+    {
+        uint8_t uuid0[16]; memset(uuid0, 0x3c, 16);
+
+        aw_builder_init(&b, msg, (1u << 20) + 512);
+        aw_build_header(&b, AW_MSG_PDEC, AW_FLAG_GUEST_REQ, uuid0, 30);
+        aw_put_s32(&b, AW_KEY_COD, (int32_t)AW_4CC('a','v','c','1'));
+        aw_put_u32(&b, AW_KEY_VER, 6);
+        n = aw_build_finalize(&b);
+        CHECK(aw_engine_deliver(e, msg, n) == AW_NOERR, "mapid0: +dec accepted");
+
+        aw_builder_init(&b, msg, (1u << 20) + 512);
+        aw_build_header(&b, AW_MSG_DSTA, AW_FLAG_GUEST_REQ, uuid0, 31);
+        aw_put_bytes(&b, AW_KEY_FDS, AW_VT_FDS, fds, fds_len);
+        n = aw_build_finalize(&b);
+        CHECK(aw_engine_deliver(e, msg, n) == AW_NOERR, "mapid0: dsta accepted");
+
+        aw_builder_init(&b, msg, (1u << 20) + 512);
+        aw_build_header(&b, AW_MSG_DFRM, AW_FLAG_GUEST_REQ, uuid0, 32);
+        aw_put_s64(&b, AW_KEY_FRM, 0);
+        aw_put_bytes(&b, AW_KEY_SBF, AW_VT_SBF, sbf, sbf_len);
+        aw_put_u32(&b, AW_KEY_DFL, 1);
+        n = aw_build_finalize(&b);
+        CHECK(aw_engine_deliver(e, msg, n) == AW_NOERR, "mapid0: dfrm accepted");
+
+        /* Dbuf reply that lends NO surface (mapping_id 0) */
+        bc.copied = 0;
+        g_ne = 0;
+        n = guest_dbuf_reply(msg, (1u << 20) + 512, uuid0, 0 /* no surface */);
+        st = aw_engine_deliver(e, msg, n);
+        CHECK(st == AW_NOERR, "mapid0: Dbuf(no-surface) reply accepted (status=%d)", st);
+        CHECK(bc.copied == 0, "mapid0: NO decode landed (gpa 0 refused, not delivered)");
+        {
+            int saw_demt = 0;
+            for (int i = 0; i < g_ne && i < MAXE; i++) {
+                aw_msg_view mv;
+                if (aw_parse(g_e[i], g_el[i], &mv) == AW_PARSE_OK && mv.type == AW_MSG_DEMT)
+                    saw_demt = 1;
+            }
+            CHECK(!saw_demt, "mapid0: NO Demt emitted (frame dropped honestly, not a false success)");
+        }
+
+        /* close the session */
+        aw_builder_init(&b, msg, (1u << 20) + 512);
+        aw_build_header(&b, AW_MSG_MDEC, AW_FLAG_GUEST_REQ, uuid0, 33);
+        n = aw_build_finalize(&b);
+        aw_engine_deliver(e, msg, n);
     }
 
     /* ---- LIVE-WIRE FRAMING: avcC param sets + length-prefixed slice-only AU.
