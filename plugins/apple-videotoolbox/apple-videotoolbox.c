@@ -341,7 +341,23 @@ static int vt_resolve_buffer(void *ctx, const uint8_t uuid[16], uint64_t mapping
                              uint32_t w, uint32_t h, aw_out_buffer *out)
 {
     vt_dev *d = ctx;
-    uint32_t ystride = (w + 63u) & ~63u;          /* Dpba BytesPerRowAlignment 64 */
+    /* L-GVA-STRIDE: land luma at the guest surface's rowBytes, not VA-API's
+     * 64-byte alignment. The host has NO knowledge of the guest surface layout
+     * (the Dbuf reply carries only a mapping id - the H2-QMETAL-SURFACE-MAPPER-ASK
+     * gap below), so bcb1d78 just imposed align(w,64) = 384. But the guest's
+     * VideoToolbox output CVPixelBuffer is L008 with CoreVideo's default 16-byte
+     * rowBytes = 352 (w=352). Writing luma at 384 leaves a 32-byte UNWRITTEN pad
+     * per row (cols 352..383 keep prior guest-RAM garbage); the downstream
+     * guest-side NV12->L008 delivery copy then reads that garbage, producing the
+     * live 526/101376 luma artifact (a [13,00] value every 386 guest-linear bytes,
+     * corrupting even row 0 - see evidence/runs/applegva-stride-20261117). Align
+     * to 16 so the luma plane is written GAPLESSLY at the guest rowBytes, leaving
+     * no pad for that copy to pick up. NB: the delivered buffer is provably a
+     * separate buffer from this lent one (delivered[237]=13 while the host writes
+     * 128 to every real column), so final pixel-exact closure also depends on that
+     * guest-side copy honouring the same 352 stride - confirm live. The
+     * authoritative rowBytes should arrive via the surface-mapper token. */
+    uint32_t ystride = (w + 15u) & ~15u;          /* guest CoreVideo rowBytes (16)  */
     size_t   ysize   = (size_t)ystride * h;
     size_t   csize   = (size_t)ystride * ((h + 1u) / 2u); /* NV12 interleaved UV   */
     uint8_t *p = vt_map(d, mapping_id, ysize + csize);

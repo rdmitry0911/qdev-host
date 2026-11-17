@@ -40,12 +40,17 @@ static void cap_emit(void *ctx, const uint8_t *m, size_t n) {
     g_ne++;
 }
 
+/* L-GVA-STRIDE: g_host_align is the host luma row alignment under test. 64 is the
+ * old (buggy) VA-API alignment that the host imposed on the landing stride; 16 is
+ * the fix (the guest CoreVideo rowBytes). Set from argv[7] (default 16). */
+static uint32_t g_host_align = 16;
 typedef struct { vtpv_vaapi *v; uint8_t *guest_ram; size_t ram_len;
                  uint32_t ystride; int copied; } bufctx;
 static int resolvebuf(void *c, const uint8_t uuid[16], uint64_t mapid,
                       uint32_t w, uint32_t h, aw_out_buffer *o) {
     bufctx *b = c; (void)uuid;
-    uint32_t ystride = (w + 63u) & ~63u;
+    uint32_t a = g_host_align;
+    uint32_t ystride = (w + (a - 1u)) & ~(a - 1u);
     size_t ysize = (size_t)ystride * h;
     size_t csize = (size_t)ystride * ((h + 1u) / 2u);
     if (mapid + ysize + csize > b->ram_len) return -1;
@@ -100,11 +105,16 @@ static uint8_t *slurp(const char *path, size_t *len) {
 
 int main(int argc, char **argv) {
     if (argc < 7) {
-        printf("usage: %s <render_node> <avcc.bin> <sample.bin> <luma_ref.bin> W H\n", argv[0]);
+        printf("usage: %s <render_node> <avcc.bin> <sample.bin> <luma_ref.bin> W H [host_align]\n", argv[0]);
         return 1;
     }
     const char *node = argv[1];
     const int W = atoi(argv[5]), H = atoi(argv[6]);
+    if (argc > 7) { int a = atoi(argv[7]); if (a == 16 || a == 32 || a == 64 || a == 1) g_host_align = (uint32_t)a; }
+    /* The guest's L008 CVPixelBuffer rowBytes: CoreVideo's 16-byte default. The
+     * guest callback reads the lent buffer at THIS stride regardless of what the
+     * host chose to land at. */
+    const uint32_t guest_rowbytes = ((uint32_t)W + 15u) & ~15u;
     vtpv_vaapi *v = NULL;
     const vtpv_decoder_backend *be = NULL;
     char err[256] = {0};
@@ -200,19 +210,37 @@ int main(int argc, char **argv) {
     if (bc.copied) {
         const uint8_t *gy = guest_ram + GUEST_OFF;
         uint32_t ys = bc.ystride;
-        size_t bad = 0, first = 0;
+
+        /* HOST VIEW: read the landed buffer back at the host's OWN landing stride.
+         * This is always self-consistent (it reads exactly what read_luma wrote),
+         * so it is 0 regardless of the stride artifact - informational only. */
+        size_t hbad = 0;
         for (int y = 0; y < H; y++)
             for (int x = 0; x < W; x++)
-                if (gy[(size_t)y * ys + x] != luma_ref[y * W + x]) {
-                    if (!bad) first = (size_t)y * W + x;
-                    bad++;
+                if (gy[(size_t)y * ys + x] != luma_ref[y * W + x]) hbad++;
+        printf("  host-view (@landing stride %u): %zu/%d mismatches [self-consistent]\n",
+               ys, hbad, W * H);
+
+        /* GUEST VIEW: read the SAME landed bytes at the guest's real L008 rowBytes
+         * (%u). This is what the in-guest VideoToolbox callback sees. When the host
+         * landed at a different stride (the 384 bug) this shears into the pad and
+         * reproduces the live 526/101376 artifact; when the host lands at the guest
+         * rowBytes (the fix) it is byte-exact. THIS is the acceptance gate. */
+        size_t gbad = 0, first = 0;
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++)
+                if (gy[(size_t)y * guest_rowbytes + x] != luma_ref[y * W + x]) {
+                    if (!gbad) first = (size_t)y * W + x;
+                    gbad++;
                 }
-        printf("  live-replay NV12 luma @stride %u: %zu/%d mismatches; pixel0 got=%u want=%u\n",
-               ys, bad, W * H, gy[0], luma_ref[0]);
-        if (bad) printf("  first mismatch at (%d,%d) got=%u want=%u\n",
-                        (int)(first % W), (int)(first / W),
-                        gy[(first / W) * ys + (first % W)], luma_ref[first]);
-        CHECK(bad == 0, "live-replay decoded luma byte-exact to reference");
+        printf("  GUEST-VIEW luma @guest rowBytes %u (host landed @%u): %zu/%d mismatches; "
+               "pixel0 got=%u want=%u\n",
+               guest_rowbytes, ys, gbad, W * H,
+               gy[0], luma_ref[0]);
+        if (gbad) printf("  first guest-view mismatch at (%d,%d) got=%u want=%u\n",
+                         (int)(first % W), (int)(first / W),
+                         gy[(first / W) * guest_rowbytes + (first % W)], luma_ref[first]);
+        CHECK(gbad == 0, "guest-view decoded luma byte-exact to reference (luma_exact=1)");
     }
 
     n = guest_demt_reply(msg, (1u << 20) + 512, uuid);
