@@ -57,6 +57,14 @@ $(BUILD)/dump-decs: aw_wire.c aw_sbuf.c aw_bplist.c aw_session.c dump_decs.c | $
 $(BUILD)/test-virtq: vtpv_virtq.c vtpv_proto.c test_virtq.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ vtpv_virtq.c vtpv_proto.c test_virtq.c
 
+# NVDEC backend: libnvcuvid + libcuda loaded at run time with dlopen (reims
+# dl.rs), so it links only -ldl and builds on a host with no NVIDIA driver; the
+# decode test skips (exit 77) where NVDEC is not present.
+NVDEC_BACKEND := vtpv_proto.c vtpv_nvdec.c vtpv_h264.c vtpv_virtq.c
+
+$(BUILD)/test-nvdec: $(NVDEC_BACKEND) h264_gen.c test_nvdec.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $(NVDEC_BACKEND) h264_gen.c test_nvdec.c -ldl
+
 BACKEND := vtpv_proto.c vtpv_vaapi.c vtpv_h264.c vtpv_virtq.c
 
 $(BUILD)/test-vaapi: $(BACKEND) test_vaapi.c | $(BUILD)
@@ -78,9 +86,12 @@ $(BUILD)/test-aw-decode: $(AW_CORE) $(BACKEND) h264_gen.c test_aw_decode.c | $(B
 $(BUILD)/test-aw-replay: $(AW_CORE) $(BACKEND) test_aw_replay.c | $(BUILD)
 	$(CC) $(CFLAGS) $(VA_CFLAGS) -o $@ $(AW_CORE) $(BACKEND) test_aw_replay.c $(VA_LIBS)
 
-$(BUILD)/apple-videotoolbox.so: apple-videotoolbox.c $(AW_CORE) $(BACKEND) | $(BUILD)
+# The device links the NVDEC backend too (vtpv_nvdec.c); it loads libnvcuvid +
+# libcuda at run time with dlopen, so the .so needs only -ldl and still loads on
+# a host with no NVIDIA driver (NVDEC open then fails cleanly, VA-API is used).
+$(BUILD)/apple-videotoolbox.so: apple-videotoolbox.c $(AW_CORE) $(BACKEND) vtpv_nvdec.c | $(BUILD)
 	$(CC) $(CFLAGS) -Wno-unused-parameter -fPIC -shared $(QDP_INC) $(VFU_INC) $(VA_CFLAGS) \
-	    -o $@ apple-videotoolbox.c $(AW_CORE) $(BACKEND) $(VA_LIBS)
+	    -o $@ apple-videotoolbox.c $(AW_CORE) $(BACKEND) vtpv_nvdec.c $(VA_LIBS) -ldl
 
 $(BUILD)/test-plugin: test_plugin.c $(BUILD)/apple-videotoolbox.so | $(BUILD)
 	$(CC) $(CFLAGS) $(QDP_INC) $(VFU_INC) -o $@ test_plugin.c -ldl
@@ -93,6 +104,11 @@ test: $(BUILD)/test-proto $(BUILD)/test-virtq $(BUILD)/test-aw-wire $(BUILD)/tes
 	@echo "== Apple-wire session engine (H3/H5/H6, mock backend) =="; $(BUILD)/test-aw-session
 	@echo "== protocol handler =="; $(BUILD)/test-proto
 	@echo "== virtio virtqueue =="; $(BUILD)/test-virtq
+	@$(MAKE) --no-print-directory $(BUILD)/test-nvdec
+	@echo "== NVDEC H.264 I_PCM decode (live NVDEC, pixel-verified) =="; \
+	 $(BUILD)/test-nvdec; rc=$$?; \
+	 if [ $$rc = 77 ]; then echo "(nvdec test skipped: no NVIDIA GPU / NVDEC)"; \
+	 elif [ $$rc != 0 ]; then exit $$rc; fi
 ifeq ($(HAVE_VA),1)
 	@$(MAKE) --no-print-directory $(BUILD)/test-vaapi $(BUILD)/test-h264 $(BUILD)/test-plugin
 	@echo "== VA-API backend (live render node) =="; \

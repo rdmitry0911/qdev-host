@@ -45,6 +45,7 @@
 
 #include "qdp.h"
 #include "vtpv_vaapi.h"
+#include "vtpv_nvdec.h"
 #include "vtpv_virtq.h"
 #include "aw_session.h"   /* the Apple contract-B wire session engine (H5/H6/H7) */
 
@@ -139,6 +140,7 @@ typedef struct vt_dev {
     const qdp_host_ops *host;
 
     vtpv_vaapi              *va;
+    vtpv_nvdec              *nvdec;
     const vtpv_decoder_backend *be;
     aw_engine               *engine;   /* contract-B wire session engine          */
 
@@ -403,9 +405,18 @@ static int vt_resolve_buffer(void *ctx, const uint8_t uuid[16], uint64_t mapping
 static int vt_copy_frame(void *ctx, const vtpv_decoded_frame *f, const aw_out_buffer *b)
 {
     vt_dev *d = ctx;
-    if (!d->va || !b->y) return -1;
-    /* land the full NV12 frame: Y plane, then the interleaved UV plane. */
-    int rc = vtpv_vaapi_read_luma(d->va, f->surface_id, b->y, b->y_stride, f->width, f->height);
+    int rc;
+    if (!b->y) return -1;
+    /* land the full NV12 frame: Y plane, then the interleaved UV plane. Route to
+     * whichever backend is active (NVDEC on an NVIDIA host, else VA-API). */
+    if (d->nvdec) {
+        rc = vtpv_nvdec_read_luma(d->nvdec, f->surface_id, b->y, b->y_stride, f->width, f->height);
+        if (rc == 0 && b->uv)
+            rc = vtpv_nvdec_read_chroma(d->nvdec, f->surface_id, b->uv, b->uv_stride, f->width, f->height);
+        return rc;
+    }
+    if (!d->va) return -1;
+    rc = vtpv_vaapi_read_luma(d->va, f->surface_id, b->y, b->y_stride, f->width, f->height);
     if (rc == 0 && b->uv)
         rc = vtpv_vaapi_read_chroma(d->va, f->surface_id, b->uv, b->uv_stride, f->width, f->height);
     return rc;
@@ -659,12 +670,33 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
     pthread_mutex_init(&d->m, NULL);
     d->device_features = VT_DEVICE_FEATURES;
 
-    /* bring up the VA-API decode backend + the protocol handler */
-    rc = vtpv_vaapi_open(node, &d->va, &d->be, NULL, err, sizeof(err));
-    if (rc != 0) {
-        vt_log(d, 1, "VA-API backend unavailable on %s: %s; the device will "
-                     "advertise no codecs", node, err);
-        d->va = NULL; d->be = NULL;
+    /* Pick a decode backend, mirroring reims video/backend_choice.rs: NVDEC on
+     * an NVIDIA GPU (CUDA opens it), else VA-API on the DRM render node, else the
+     * selection-only stub. `backend=nvdec|vaapi|auto` overrides (default auto =
+     * NVDEC first); `gpu=<cuda ordinal>` selects the NVIDIA GPU. */
+    {
+        const char *want = "auto", *gpu = NULL, *q;
+        int try_nvdec, try_vaapi;
+        if (args && (q = strstr(args, "backend="))) want = q + 8;
+        if (args && (q = strstr(args, "gpu=")))     gpu = q + 4;
+        try_nvdec = strncmp(want, "vaapi", 5) != 0; /* auto or nvdec */
+        try_vaapi = strncmp(want, "nvdec", 5) != 0; /* auto or vaapi */
+
+        if (try_nvdec) {
+            rc = vtpv_nvdec_open(gpu, &d->nvdec, &d->be, NULL, err, sizeof(err));
+            if (rc != 0) {
+                vt_log(d, 2, "NVDEC backend unavailable: %s", err);
+                d->nvdec = NULL; d->be = NULL;
+            }
+        }
+        if (!d->be && try_vaapi) {
+            rc = vtpv_vaapi_open(node, &d->va, &d->be, NULL, err, sizeof(err));
+            if (rc != 0) {
+                vt_log(d, 1, "VA-API backend unavailable on %s: %s; the device "
+                             "will advertise no codecs", node, err);
+                d->va = NULL; d->be = NULL;
+            }
+        }
     }
     if (!d->be && args && strstr(args, "force_h264=1")) {
         vt_log(d, 1, "force_h264=1: advertising a fallback H.264 decoder "
@@ -675,7 +707,8 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
         aw_session_cfg cfg;
         memset(&cfg, 0, sizeof cfg);
         cfg.be = d->be;
-        cfg.be_ctx = d->va ? vtpv_vaapi_ctx(d->va) : NULL;
+        cfg.be_ctx = d->nvdec ? vtpv_nvdec_ctx(d->nvdec)
+                   : (d->va ? vtpv_vaapi_ctx(d->va) : NULL);
         cfg.emit = vt_emit; cfg.emit_ctx = d;
         cfg.resolve_buffer = vt_resolve_buffer;
         cfg.copy_frame = vt_copy_frame;
@@ -684,6 +717,7 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
         d->engine = aw_engine_create(&cfg);
     }
     if (!d->engine) {
+        if (d->nvdec) vtpv_nvdec_close(d->nvdec);
         if (d->va) vtpv_vaapi_close(d->va);
         free(d);
         return -ENOMEM;
@@ -725,11 +759,13 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
     *priv = d;
     vt_log(d, 2, "apple-videotoolbox %04x:%04x up (%u virtqueues, %s)",
            VT_PCI_VENDOR, VT_PCI_DEVICE, VT_QUEUES,
-           d->be ? "VA-API decode" : "no backend");
+           d->nvdec ? "NVDEC decode" : d->va ? "VA-API decode"
+                    : d->be ? "stub decode" : "no backend");
     return 0;
 
 fail:
     aw_engine_destroy(d->engine);
+    if (d->nvdec) vtpv_nvdec_close(d->nvdec);
     if (d->va) vtpv_vaapi_close(d->va);
     free(d);
     return -errno ? -errno : -EINVAL;
@@ -741,6 +777,7 @@ static void vt_teardown(void *priv)
     if (!d) return;
     if (g_dev == d) g_dev = NULL;
     aw_engine_destroy(d->engine);
+    if (d->nvdec) vtpv_nvdec_close(d->nvdec);
     if (d->va) vtpv_vaapi_close(d->va);
     pthread_mutex_destroy(&d->m);
     free(d);
