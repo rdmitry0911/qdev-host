@@ -238,6 +238,14 @@ typedef struct PvgState {
     bool stop_phase_done;
     bool retired;                 /* after the stop phase: no more MMIO */
     bool realized;
+
+    /* warm-swap VARIABLE backing (qdp.h v3 / pvg_backing.h, L-WARMSWAP-2).
+     * The FROZEN envelope is the PVG MMIO/FIFO register contract; only the
+     * advertised backend identity behind it is swapped under quiesce. */
+    pthread_mutex_t backing_lock;
+    void  *backing_h;             /* dlopen handle of the active backing .so (NULL = builtin A) */
+    char   backing_tag[32];       /* current backing tag, for logging + device-abi               */
+    char   backend_version[64];   /* advertised backend identity (the guest ioreg-triplet value) */
 } PvgState;
 
 /* ------------------------------------------------------------ logging */

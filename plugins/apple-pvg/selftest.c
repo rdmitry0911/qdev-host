@@ -232,7 +232,7 @@ int main(int argc, char **argv)
     }
     fn = (qdp_plugin_v1_fn)dlsym(h, QDP_PLUGIN_SYMBOL);
     ops = fn ? fn() : NULL;
-    CHECK(ops && ops->abi_version == 2 && !strcmp(ops->name, "apple-pvg"),
+    CHECK(ops && ops->abi_version >= 2 && !strcmp(ops->name, "apple-pvg"),
           "qdp_plugin_v1: abi %u name %s", ops ? ops->abi_version : 0, ops ? ops->name : "-");
     if (!ops) {
         return 1;

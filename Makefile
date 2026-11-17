@@ -35,6 +35,7 @@ QMETAL_LIBDIR ?=
 QMETAL_RPATH ?= $(QMETAL_LIBDIR)
 APPLE_PVG_SRC := $(addprefix plugins/apple-pvg/,apple-pvg.c pvg-memory.c pvg-process-vm.c pvg-dmabuf.c)
 APPLE_PVG_HDR := plugins/apple-pvg/pvg.h plugins/apple-pvg/pvg-process-vm.h \
+                 plugins/apple-pvg/pvg_backing.h \
                  $(wildcard plugins/apple-pvg/qmu-private/*.h)
 GLIB_ONLY_CFLAGS = $(shell pkg-config --cflags glib-2.0)
 GLIB_ONLY_LIBS   = $(shell pkg-config --libs glib-2.0)
@@ -91,6 +92,16 @@ plugins/apple-pvg/apple-pvg.so: $(APPLE_PVG_SRC) $(APPLE_PVG_HDR) qdp.h $(VFU_DE
 	    -I$(QMETAL_INCLUDE) $(VFU_CFLAGS) $(GLIB_ONLY_CFLAGS) -o $@ $(APPLE_PVG_SRC) \
 	    $(VFU_LIBS) -L$(QMETAL_LIBDIR) -lmlapi $(if $(QMETAL_RPATH),-Wl$(comma)-rpath$(comma)$(QMETAL_RPATH)) \
 	    $(GLIB_ONLY_LIBS) -ldl
+
+# Warm-swap VARIABLE backings (increment 2): tiny backend-identity .so's the
+# plugin dlopen-swaps under a live guest (quiesce -> swap -> resume). The frozen
+# envelope (PVG MMIO/FIFO contract) is untouched. See pvg_backing.h.
+plugins/apple-pvg/backing_A.so: plugins/apple-pvg/backing_A.c plugins/apple-pvg/pvg_backing.h
+	$(CC) $(CFLAGS) -fPIC -shared -Iplugins/apple-pvg -o $@ $<
+plugins/apple-pvg/backing_B.so: plugins/apple-pvg/backing_B.c plugins/apple-pvg/pvg_backing.h
+	$(CC) $(CFLAGS) -fPIC -shared -Iplugins/apple-pvg -o $@ $<
+.PHONY: pvg-backings
+pvg-backings: plugins/apple-pvg/backing_A.so plugins/apple-pvg/backing_B.so
 
 # Self-test of the apple-pvg plugin on a vfu context without a VM (see
 # plugins/apple-pvg/README.md). Runs the real libmlapi; select the Vulkan
