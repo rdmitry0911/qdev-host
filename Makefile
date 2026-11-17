@@ -35,6 +35,7 @@ QMETAL_LIBDIR ?=
 QMETAL_RPATH ?= $(QMETAL_LIBDIR)
 UNIQ_VGPU_SRC := $(addprefix plugins/uniq-vgpu/,uniq-vgpu.c pvg-memory.c pvg-process-vm.c pvg-dmabuf.c)
 UNIQ_VGPU_HDR := plugins/uniq-vgpu/pvg.h plugins/uniq-vgpu/pvg-process-vm.h \
+                 plugins/uniq-vgpu/pvg_backing.h \
                  $(wildcard plugins/uniq-vgpu/qmu-private/*.h)
 GLIB_ONLY_CFLAGS = $(shell pkg-config --cflags glib-2.0)
 GLIB_ONLY_LIBS   = $(shell pkg-config --libs glib-2.0)
@@ -84,6 +85,16 @@ plugins/uniq-vgpu/uniq-vgpu.so: $(UNIQ_VGPU_SRC) $(UNIQ_VGPU_HDR) qdp.h $(VFU_DE
 # and scripts that load apple-pvg.so keep working: a symlink to uniq-vgpu.so.
 plugins/uniq-vgpu/apple-pvg.so: plugins/uniq-vgpu/uniq-vgpu.so
 	ln -sfn uniq-vgpu.so $@
+
+# Warm-swap VARIABLE backings (increment 2): tiny backend-identity .so's the
+# plugin dlopen-swaps under a live guest (quiesce -> swap -> resume). The frozen
+# envelope (PVG MMIO/FIFO contract) is untouched. See pvg_backing.h.
+plugins/uniq-vgpu/backing_A.so: plugins/uniq-vgpu/backing_A.c plugins/uniq-vgpu/pvg_backing.h
+	$(CC) $(CFLAGS) -fPIC -shared -Iplugins/uniq-vgpu -o $@ $<
+plugins/uniq-vgpu/backing_B.so: plugins/uniq-vgpu/backing_B.c plugins/uniq-vgpu/pvg_backing.h
+	$(CC) $(CFLAGS) -fPIC -shared -Iplugins/uniq-vgpu -o $@ $<
+.PHONY: pvg-backings
+pvg-backings: plugins/uniq-vgpu/backing_A.so plugins/uniq-vgpu/backing_B.so
 
 # Self-test of the uniq-vgpu plugin on a vfu context without a VM (see
 # plugins/uniq-vgpu/README.md). Runs the real libmlapi; select the Vulkan

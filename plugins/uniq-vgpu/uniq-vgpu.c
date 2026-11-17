@@ -54,6 +54,7 @@
 #include <time.h>
 #include <unistd.h>
 #include "qmu/pvg_regs.h"
+#include "pvg_backing.h"
 #include "pci_caps/msi.h"
 
 /* Declared in QMetal's C++ qmu_vulkan.h, which C cannot include. */
@@ -2525,6 +2526,10 @@ static int pvg_start_thread(pthread_t *t, void *(*fn)(void *), void *arg, const 
     return -r;
 }
 
+/* warm-swap backing helpers (defined with the v3 ops below). */
+static const pvg_backing_v1 pvg_builtin_A;
+static void pvg_apply_backing(PvgState *s, const pvg_backing_v1 *b);
+
 static int pvg_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env, void **priv)
 {
     PvgState *s;
@@ -2594,6 +2599,8 @@ static int pvg_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env, 
     }
 
     pvg_memory_init(&s->mem);
+    pthread_mutex_init(&s->backing_lock, NULL);
+    pvg_apply_backing(s, &pvg_builtin_A);   /* boot backend A */
     pthread_mutex_init(&s->irq_lock, NULL);
     s->irq_gate = PVG_IRQ_DROP;   /* opened when setup returns */
     pthread_mutex_init(&s->cursor.lock, NULL);
@@ -2923,10 +2930,101 @@ static int pvg_ui_info(void *priv, const qdp_ui_info *info)
     return 0;
 }
 
+/* =========================================================== warm swap (v3)
+ *
+ * The FROZEN envelope for the DISPLAY GPU is the PVG MMIO/FIFO register
+ * contract (pvg_regs.h), the ch5/virtqueue framing and the DeviceInfo
+ * capability-negotiation MECHANISM -- NOT the backend behind it. abi_tag
+ * reports that envelope version; swap repoints the VARIABLE backend identity
+ * under the host's quiesce (which stalls all guest-RAM access + IRQ delivery,
+ * so the accelerated backend freezes while the host's memfd scanout keeps
+ * presenting the LAST frame -> the screen is held, not blacked). The guest's
+ * FIXED resident picks up the new backend on its next in-place reset
+ * re-handshake. Mirrors the apple-videotoolbox inc1 primitive. */
+#define PVG_ENVELOPE_VERSION "pvg-envelope-1"   /* PVG MMIO/FIFO contract, protocol v6 */
+
+static const pvg_backing_v1 pvg_builtin_A = {
+    PVG_BACKING_ABI, "A", "qmetal-backend-A", 0
+};
+
+/* Apply a backing descriptor to the live state. Caller holds s->backing_lock. */
+static void pvg_apply_backing(PvgState *s, const pvg_backing_v1 *b)
+{
+    g_strlcpy(s->backing_tag, b->tag ? b->tag : "?", sizeof(s->backing_tag));
+    g_strlcpy(s->backend_version,
+              b->backend_version ? b->backend_version : "", sizeof(s->backend_version));
+}
+
+/* qdp v3 swap op: resolve `arg` to a backing and apply it, quiesced.
+ *   ""/"default"/"A"/"builtin:A" -> built-in A (boot backend)
+ *   any other string             -> dlopen it as a backing .so (pvg_backing_v1)
+ * On a successful .so swap the previous dlopen handle is closed. Returns 0 or
+ * -errno. qdev-host has already quiesced the device before calling this (the
+ * memory table write-lock is held, the backend cannot touch guest RAM); it
+ * resumes after. A backing's hold_ms widens that quiesce window so the live
+ * crux probe can characterise how long the resident holds basic scanout. */
+static int pvg_swap(void *priv, const char *arg)
+{
+    PvgState *s = priv;
+    if (!s) return -EINVAL;
+    const char *a = arg ? arg : "";
+    const pvg_backing_v1 *b = NULL;
+    void *newh = NULL;
+
+    if (*a == '\0' || !strcmp(a, "default") || !strcmp(a, "A") || !strcmp(a, "builtin:A")) {
+        b = &pvg_builtin_A;
+    } else {
+        newh = dlopen(a, RTLD_NOW | RTLD_LOCAL);
+        if (!newh) {
+            pvg_log(s, "[apple-gfx-ml][warmswap][ERROR] swap: dlopen %s: %s\n", a, dlerror());
+            return -ENOENT;
+        }
+        pvg_backing_fn fn = (pvg_backing_fn)dlsym(newh, PVG_BACKING_SYMBOL);
+        if (!fn) {
+            pvg_log(s, "[apple-gfx-ml][warmswap][ERROR] swap: %s: no %s symbol\n",
+                    a, PVG_BACKING_SYMBOL);
+            dlclose(newh);
+            return -ENOEXEC;
+        }
+        b = fn();
+        if (!b || b->abi != PVG_BACKING_ABI) {
+            pvg_log(s, "[apple-gfx-ml][warmswap][ERROR] swap: %s: bad backing ABI\n", a);
+            dlclose(newh);
+            return -ENOEXEC;
+        }
+    }
+
+    pthread_mutex_lock(&s->backing_lock);
+    pvg_apply_backing(s, b);
+    void *oldh = s->backing_h;
+    s->backing_h = newh;          /* NULL for the builtin */
+    uint32_t hold_ms = b->hold_ms;
+    pthread_mutex_unlock(&s->backing_lock);
+    if (oldh) dlclose(oldh);
+
+    pvg_log(s, "[apple-gfx-ml][warmswap] WARM-SWAP backend -> tag '%s' version '%s' "
+            "hold_ms=%u %s%s (envelope %s frozen)\n",
+            b->tag ? b->tag : "?", b->backend_version ? b->backend_version : "",
+            hold_ms, newh ? "from " : "(builtin)", newh ? a : "", PVG_ENVELOPE_VERSION);
+
+    /* Widen the quiesce window (crux probe): the accelerated backend stays
+     * frozen this long while the host memfd holds the last frame. Bounded. */
+    if (hold_ms) {
+        if (hold_ms > 5000) hold_ms = 5000;
+        struct timespec ts = { hold_ms / 1000, (long)(hold_ms % 1000) * 1000000L };
+        nanosleep(&ts, NULL);
+    }
+    return 0;
+}
+
+/* qdp v3 abi_tag op: the FROZEN envelope/transport version (NOT the backend
+ * command/capability set). An updater compares this across a bundle swap. */
+static const char *pvg_abi_tag(void *priv) { (void)priv; return PVG_ENVELOPE_VERSION; }
+
 static const qdp_device_ops ops = {
     .abi_version = QDP_ABI_VERSION,
     .name = "uniq-vgpu",
-    .version = "0.1",
+    .version = "0.2-warmswap",
     .setup = pvg_setup,
     .teardown = pvg_teardown,
     .reset = pvg_reset,
@@ -2938,6 +3036,8 @@ static const qdp_device_ops ops = {
     .dma_unregister = pvg_dma_unregister,
     .get_cursor = pvg_get_cursor,
     .ui_info = pvg_ui_info,
+    .abi_tag = pvg_abi_tag,
+    .swap = pvg_swap,
 };
 
 __attribute__((visibility("default")))
