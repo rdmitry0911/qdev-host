@@ -155,6 +155,19 @@ def cmd_device_swap(a):
     for m in Q.device_swap(cp, backing, reset=a.reset, vmid=vmid, dev_id=dev_id):
         print(m)
 
+def cmd_device_reload(a):
+    # In-process REAL-backend reload under a live, un-rebooted guest on STOCK
+    # QEMU (no device_del/add, vfio-user stays BOUND): quiesce -> destroy the
+    # live backend Session + dlmopen a new co-resident backend build + re-create
+    # the Session re-adopting device state -> device reset re-handshake -> resume.
+    # Same ABI gate (frozen envelope) + health gate (0 new QMU errors, gpuRestart
+    # within budget, HandshakeGeneration bumps) + auto-rollback as device-swap.
+    cp, vmid, dev_id, backing = _target(a.pos, a.control, want_backing=True)
+    for m in Q.device_reload(cp, backing, reset=not a.no_reset,
+                             expect_gpurestart=a.expect_gpurestart,
+                             rollback=not a.no_rollback):
+        print(m)
+
 def cmd_hook(a):
     conf = Q.load_conf(a.vmid)
     rc = 0
@@ -268,6 +281,18 @@ def main():
     s.add_argument("--reset", choices=["hotplug"], default=None,
                    help="trigger the guest re-handshake: hotplug = QMP device_del+device_add (process stays alive)")
     s.set_defaults(fn=cmd_device_swap)
+    s = sub.add_parser("device-reload",
+                       help="in-process REAL-backend reload in process (quiesce->destroy+dlmopen+re-create->reset->resume), stock QEMU")
+    s.add_argument("pos", nargs="*", metavar="VMID ID BACKING",
+                   help="VMID ID BACKING (or --control PATH BACKING); BACKING = path to the new backend .so")
+    s.add_argument("--control", help="qdev-host --control socket path (instead of VMID ID)")
+    s.add_argument("--no-reset", action="store_true",
+                   help="do NOT arm the in-place device-reset re-handshake (stage only)")
+    s.add_argument("--expect-gpurestart", type=int, default=0,
+                   help="tolerated gpuRestart delta across the reload (health gate; default 0)")
+    s.add_argument("--no-rollback", action="store_true",
+                   help="do NOT auto-rollback to the previous backend on a health-gate failure")
+    s.set_defaults(fn=cmd_device_reload)
     a = p.parse_args()
     try:
         rc = a.fn(a)

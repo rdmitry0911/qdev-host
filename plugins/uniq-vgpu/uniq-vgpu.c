@@ -57,18 +57,13 @@
 #include "pvg_backing.h"
 #include "pci_caps/msi.h"
 
-/* Declared in QMetal's C++ qmu_vulkan.h, which C cannot include. */
-struct qmu_vulkan_ctx;
-void qmu_vk_consume_current_frame_signal(struct qmu_vulkan_ctx *ctx);
-
-/* QMetal private peers; absence is checked like the fork's weak imports. */
-#pragma weak qmu_get_private_ordinary_physical_capture_v2
-#pragma weak qmu_get_private_ordinary_physical_comparison_v1
-#pragma weak qmu_get_private_ordinary_task_memory_v1
-#pragma weak qmu_get_private_mapped_transport_v1
-/* Newer than the QMetal of the first qdev package: without it a UI size
- * request is refused and everything else works. */
-#pragma weak qmu_display_set_mode_list
+/* qmu_vk_consume_current_frame_signal is forward-declared in pvg.h (QMetal's
+ * qmu_vulkan.h is C++).  The private peers (qmu_get_private_*) and the optional
+ * qmu_display_set_mode_list (newer than the first qdev package's QMetal; absent
+ * -> a UI size request is refused and everything else works) used to be
+ * `#pragma weak` imports; they are now resolved by dlsym in pvg_qmu_vt_bind and
+ * stored NULL when the instance does not export them, so the NULL-tests at the
+ * call sites route through the vtable instead (and follow a reload). */
 
 #define APPLE_GFX_ML_VENDOR_ID          0x106b
 #define APPLE_GFX_ML_DEVICE_ID          0xeeee
@@ -91,6 +86,68 @@ static PvgState *g;
 
 static bool pvg_diag_mmio_roundtrip;
 static bool pvg_diag_mmio_all;
+
+/* ============================================================ backend vtable
+ * The active qmu_* vtable the call-site macros (pvg.h) read.  One device per
+ * process, so a single global pointer; it is bound to the base libmlapi at
+ * setup and re-bound to the dlmopen target by pvg_backend_reload(). */
+const struct pvg_qmu_vt *pvg_qvt;
+
+bool pvg_qmu_vt_bind(struct pvg_qmu_vt *vt, void *handle, long lmid, const char **err)
+{
+    /* Mandatory symbols: a miss means a wrong/incompatible libmlapi -> fail. */
+    struct { const char *name; void **slot; } m[] = {
+        { "qmu_create_extended",                                   (void **)&vt->create_extended },
+        { "qmu_destroy",                                           (void **)&vt->destroy },
+        { "qmu_set_debug_level",                                   (void **)&vt->set_debug_level },
+        { "qmu_log_set_callback",                                  (void **)&vt->log_set_callback },
+        { "qmu_log_category_name",                                 (void **)&vt->log_category_name },
+        { "qmu_log_level_name",                                    (void **)&vt->log_level_name },
+        { "qmu_mmio_read",                                         (void **)&vt->mmio_read },
+        { "qmu_mmio_write",                                        (void **)&vt->mmio_write },
+        { "qmu_session_quiesce_host_callback_producers_deferred",  (void **)&vt->session_quiesce_host_callback_producers_deferred },
+        { "qmu_session_rethrow_quiesce",                           (void **)&vt->session_rethrow_quiesce },
+        { "qmu_session_finish_retirement_for_exit",               (void **)&vt->session_finish_retirement_for_exit },
+        { "qmu_session_get_vulkan",                               (void **)&vt->session_get_vulkan },
+        { "qmu_session_acquire_host_work",                        (void **)&vt->session_acquire_host_work },
+        { "qmu_session_current_host_work",                        (void **)&vt->session_current_host_work },
+        { "qmu_session_invoke_host_work",                         (void **)&vt->session_invoke_host_work },
+        { "qmu_session_release_host_work",                        (void **)&vt->session_release_host_work },
+        { "qmu_session_retain_host_work",                         (void **)&vt->session_retain_host_work },
+        { "qmu_iosfc_present_tick",                              (void **)&vt->iosfc_present_tick },
+        { "qmu_display_copy_selected_current_target",           (void **)&vt->display_copy_selected_current_target },
+        { "qmu_display_publish_mode_target",                    (void **)&vt->display_publish_mode_target },
+        { "qmu_display_target_release",                         (void **)&vt->display_target_release },
+        { "qmu_get_display_cursor_position",                    (void **)&vt->get_display_cursor_position },
+        { "qmu_owned_display_frame_release",                    (void **)&vt->owned_display_frame_release },
+        { "qmu_vk_consume_current_frame_signal",                (void **)&vt->vk_consume_current_frame_signal },
+        { "qmu_vk_encode_submit_owned_display_frame",           (void **)&vt->vk_encode_submit_owned_display_frame },
+        { "qmu_vk_prepare_owned_display_frame",                 (void **)&vt->vk_prepare_owned_display_frame },
+    };
+    /* Optional private peers: absent on older builds -> stored NULL. */
+    struct { const char *name; void **slot; } o[] = {
+        { "qmu_get_private_mapped_transport_v1",              (void **)&vt->get_private_mapped_transport_v1 },
+        { "qmu_get_private_ordinary_physical_capture_v2",     (void **)&vt->get_private_ordinary_physical_capture_v2 },
+        { "qmu_get_private_ordinary_physical_comparison_v1",  (void **)&vt->get_private_ordinary_physical_comparison_v1 },
+        { "qmu_get_private_ordinary_task_memory_v1",          (void **)&vt->get_private_ordinary_task_memory_v1 },
+        { "qmu_display_set_mode_list",                        (void **)&vt->display_set_mode_list },
+    };
+
+    (void)dlerror();
+    for (size_t i = 0; i < G_N_ELEMENTS(m); i++) {
+        *m[i].slot = dlsym(handle, m[i].name);
+        if (!*m[i].slot) {
+            if (err) { *err = m[i].name; }
+            return false;
+        }
+    }
+    for (size_t i = 0; i < G_N_ELEMENTS(o); i++) {
+        *o[i].slot = dlsym(handle, o[i].name);   /* NULL ok */
+    }
+    vt->handle = handle;
+    vt->lmid = lmid;
+    return true;
+}
 
 static int64_t pvg_now_us(void)
 {
@@ -283,6 +340,22 @@ static void pvg_qmu_log_callback(void *ctx, qmu_log_level level,
         }
     }
     body = g_strdup_vprintf(fmt, args);
+    /* Health + identity taps for the reload gate: record the per-instance build
+     * banner the renderer prints on create, and count errors / GPU restarts. */
+    if (body) {
+        const char *banner = strstr(body, "libmlapi built");
+        if (banner) {
+            g_strlcpy(s->backend_banner, banner, sizeof(s->backend_banner));
+            char *nl = strchr(s->backend_banner, '\n');
+            if (nl) { *nl = '\0'; }
+        }
+        if (level == QMU_LOG_ERROR) {
+            s->qmu_error_count++;
+        }
+        if (strstr(body, "gpuRestart") || strstr(body, "GPU_HANG") || strstr(body, "gpu_hang")) {
+            s->qmu_gpu_restart_count++;
+        }
+    }
     full = g_strdup_printf("[apple-gfx-ml][qmetal][%s][%s] %s:%d %s: %s\n",
                            qmu_log_level_name(level),
                            qmu_log_category_name(category),
@@ -2626,6 +2699,31 @@ static int pvg_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env, 
     }
     s->loop_started = true;
 
+    /* Bind the backend vtable to the BASE libmlapi before the first qmu_* call.
+     * dlopen by SONAME (RUNPATH-resolved) returns the already-mapped base copy
+     * (apple-pvg.so links it) or loads it into the base namespace; every
+     * routed qmu_* call then goes through this instance until a reload. */
+    {
+        void *base = dlopen("libmlapi.so", RTLD_NOW | RTLD_GLOBAL);
+        const char *miss = NULL;
+        if (!base) {
+            pvg_log(s, "[apple-gfx-ml] [ERROR] realize: cannot dlopen base libmlapi.so: %s\n",
+                    dlerror());
+            r = -ELIBACC;
+            goto fail;
+        }
+        if (!pvg_qmu_vt_bind(&s->qvt_storage, base, LM_ID_BASE, &miss)) {
+            pvg_log(s, "[apple-gfx-ml] [ERROR] realize: base libmlapi missing %s\n",
+                    miss ? miss : "(unknown)");
+            r = -ENOSYS;
+            goto fail;
+        }
+        pvg_qvt = &s->qvt_storage;
+        s->qmu_ns = NULL;            /* base instance */
+        s->qmu_lmid = LM_ID_BASE;
+        s->qmu_path = g_strdup("libmlapi.so");
+    }
+
     r = pvg_create_session(s);
     if (r) {
         goto fail;
@@ -2930,6 +3028,254 @@ static int pvg_ui_info(void *priv, const qdp_ui_info *info)
     return 0;
 }
 
+/* =================================================== in-process renderer reload
+ * (L-WARMSWAP-INPROC-RELOAD) Reload the REAL renderer (libmlapi/QMetal) under a
+ * live, un-rebooted guest on STOCK QEMU -- no QEMU patch, no device_del/add,
+ * vfio-user BOUND throughout.  The device stays realized; the Session is torn
+ * down in-process, a new co-resident libmlapi build is dlmopen()-ed, and the
+ * Session is re-created from the PARKED PvgState (memory tables, FIFO GPA,
+ * display mode, fw identity -- all apple-pvg-side, reached by QMetal only via
+ * our callbacks, so re-create re-adopts them).  Runs under the host's quiesce
+ * (memory write-lock + IRQ hold), so there is no concurrent guest MMIO. */
+
+/* Reload teardown.  The FOUNDATION's crash-safe full in-process teardown is
+ * qmu_destroy() itself: it runs qmu_quiesce_renderer_before_destroy (joins the
+ * four renderer workers), qmu_vk_wait_all_retired, then qmu_vk_destroy -- proven
+ * across 35 create/destroy cycles in one process (RESULT-L-WARMSWAP-INPROC-
+ * RELOAD).  The ordinary-physical / task-memory "returned" peer disposals
+ * (destroy_returned/dispose_returned) are the NORMAL-EXIT protocol and
+ * legitimately RETAIN (return false -> endless owned hold) when driven outside
+ * it; for a reload we instead qmu_destroy the Session directly and LEAK-RESET
+ * the apple-pvg-side owner bookkeeping.  The leak is within the accepted trade
+ * (the old instance and its host owners stay mapped for the life of the
+ * process); pvg_create_session rebuilds fresh owners on the new instance. */
+static void pvg_reload_teardown(PvgState *s)
+{
+    /* stop host-side capture producers so no callback races the destroy */
+    agfx_eeee_native_context_stop_acquiring(s->ordinary_task_memory_context);
+    agfx_ordinary_physical_context_stop(s->ordinary_physical_context);
+
+    /* Release the owned output lease (the display mode target) on the OLD
+     * instance BEFORE qmu_destroy -- qmu_destroy throws "owned output leases
+     * remain after actual Session drainage" otherwise.  pvg_qvt still points at
+     * the old instance here (the switch happens after teardown). */
+    if (s->display_target) {
+        qmu_display_target_release(s->display_target);
+        s->display_target = NULL;
+    }
+
+    /* foundation step 5: the clean full teardown (workers joined, VkDevice gone) */
+    qmu_destroy(s->qmu_dev);
+    s->qmu_dev = NULL;
+
+    /* leak-reset the host-side owners + session-scoped handles (the old instance
+     * stays mapped forever; its qmu_* struct layouts belong to the old build) */
+    s->ordinary_physical_context = NULL;
+    s->ordinary_physical_receipt = NULL;
+    s->ordinary_physical_peer = NULL;
+    s->ordinary_task_memory_context = NULL;
+    s->ordinary_task_memory_receipt = NULL;
+    s->ordinary_task_memory_peer = NULL;
+    s->ordinary_task_memory_install_result = 0;
+    s->eeee_native_context = NULL;
+    s->eeee_provider_state = NULL;
+    s->mapped_transport_peer = NULL;
+    s->mapped_transport_installed = false;
+    /* display target already released above; force a fresh one on re-publish */
+    s->display_published = false;
+    pvg_atomic_set(&s->pending_frames, 0);
+    memset(&s->deferred_frame_owner, 0, sizeof(s->deferred_frame_owner));
+}
+
+/* Reversible mirror of pvg_stop_phase: stop apple-pvg's present/render workers
+ * and quiesce the Session's host-callback producers, but DO NOT set the
+ * terminal retired/exiting/stop_phase_done flags -- the device is coming back
+ * on a new instance.  Returns 0 or -errno. */
+static int pvg_stop_phase_reversible(PvgState *s)
+{
+    qmu_status status;
+
+    if (!s->qmu_dev) {
+        return 0;
+    }
+    /* close autonomous present roots (keep the accepted-control executor) */
+    pthread_mutex_lock(&s->present_lock);
+    s->present_roots_stopped = true;
+    pthread_cond_signal(&s->present_cond);
+    pthread_mutex_unlock(&s->present_lock);
+
+    status = qmu_session_quiesce_host_callback_producers_deferred(s->qmu_dev);
+    qmu_session_rethrow_quiesce(s->qmu_dev);
+    if (status != QMU_OK) {
+        pvg_log(s, "[apple-gfx-ml][reload][ERROR] quiesce producers status=%d\n", (int)status);
+        return -EIO;
+    }
+
+    pthread_mutex_lock(&s->present_lock);
+    s->present_worker_stop = true;
+    pthread_cond_signal(&s->present_cond);
+    pthread_mutex_unlock(&s->present_lock);
+    if (s->present_started) {
+        pthread_join(s->present_thread, NULL);
+        s->present_started = false;
+    }
+    pthread_mutex_lock(&s->present_lock);
+    pvg_present_cancel_locked(s);
+    pthread_mutex_unlock(&s->present_lock);
+
+    if (s->render_started) {
+        pthread_mutex_lock(&s->render_lock);
+        s->render_stop = true;
+        pthread_cond_broadcast(&s->render_cond);
+        pthread_mutex_unlock(&s->render_lock);
+        for (int i = 0; i < PVG_RENDER_THREADS; i++) {
+            pthread_join(s->render_threads[i], NULL);
+        }
+        s->render_started = false;
+    }
+    return 0;
+}
+
+/* Reset the worker state parked by the reversible stop and start fresh present
+ * + render workers on the re-created Session. */
+static int pvg_restart_workers(PvgState *s)
+{
+    PvgModeCall mode = { .state = s };
+    int r;
+
+    pthread_mutex_lock(&s->present_lock);
+    s->present_worker_stop = false;
+    s->present_roots_stopped = false;
+    s->present_timer_active = false;
+    s->present_next_fire_us = 0;
+    s->present_source_pending = false;
+    memset(&s->present_source_owner, 0, sizeof(s->present_source_owner));
+    s->present_cmd_head = s->present_cmd_tail = NULL;
+    pvg_atomic_set(&s->iosfc_bootstrap_active, 0);
+    pthread_mutex_unlock(&s->present_lock);
+
+    pthread_mutex_lock(&s->render_lock);
+    s->render_stop = false;
+    s->render_head = s->render_tail = NULL;
+    pthread_mutex_unlock(&s->render_lock);
+
+    for (int i = 0; i < PVG_RENDER_THREADS; i++) {
+        r = pvg_start_thread(&s->render_threads[i], pvg_render_thread, s, "agfx-render");
+        if (r) {
+            return r;
+        }
+    }
+    s->render_started = true;
+    r = pvg_start_thread(&s->present_thread, pvg_present_thread, s, "agfx-present");
+    if (r) {
+        return r;
+    }
+    s->present_started = true;
+
+    /* re-publish the parked display mode on the device loop */
+    pvg_loop_run_sync(s, pvg_initial_mode_call, &mode);
+    return 0;
+}
+
+int pvg_backend_reload(PvgState *s, const char *new_path, int reset)
+{
+    const char *miss = NULL;
+    struct pvg_qmu_vt nvt;
+    void *ns;
+    long lmid = -1;
+    int r;
+
+    if (!s || !new_path || !*new_path) {
+        return -EINVAL;
+    }
+    pthread_mutex_lock(&s->backing_lock);
+
+    /* On a re-entry after a FAILED reload the Session is already NULL (dead
+     * device): skip the stop + teardown and go straight to loading a (rollback)
+     * instance.  Otherwise do the reversible quiesce + symmetric teardown. */
+    if (s->qmu_dev) {
+        r = pvg_stop_phase_reversible(s);
+        if (r) {
+            pthread_mutex_unlock(&s->backing_lock);
+            return r;
+        }
+        /* crash-safe full in-process teardown: qmu_destroy joins the four QMetal
+         * workers and releases the VkDevice, then the host owners are leak-reset.
+         * Leaves s->qmu_dev == NULL, device state parked in PvgState. */
+        pvg_reload_teardown(s);
+    }
+    g_assert(!s->qmu_dev);
+
+    /* dlmopen the new co-resident libmlapi into a FRESH link-map namespace.
+     * SONAME aliasing means a plain dlopen would alias the base instance, so
+     * LM_ID_NEWLM is required for an independent second copy.  The old instance
+     * stays mapped for the life of the process (no dlclose -> no _dl_fini under
+     * the threads it already joined); RTLD_NODELETE pins it too. */
+    ns = dlmopen(LM_ID_NEWLM, new_path, RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE);
+    if (!ns) {
+        pvg_log(s, "[apple-gfx-ml][reload][ERROR] dlmopen %s: %s\n", new_path, dlerror());
+        pthread_mutex_unlock(&s->backing_lock);
+        return -ENOENT;
+    }
+    dlinfo(ns, RTLD_DI_LMID, &lmid);
+    memset(&nvt, 0, sizeof(nvt));
+    if (!pvg_qmu_vt_bind(&nvt, ns, lmid, &miss)) {
+        pvg_log(s, "[apple-gfx-ml][reload][ERROR] %s missing %s (not a libmlapi?)\n",
+                new_path, miss ? miss : "(unknown)");
+        /* old instance already destroyed: caller must roll back to a good one */
+        pthread_mutex_unlock(&s->backing_lock);
+        return -ENOSYS;
+    }
+    /* Switch the active vtable: every qmu_* call now targets the NEW instance. */
+    s->qvt_storage = nvt;
+    pvg_qvt = &s->qvt_storage;
+    s->qmu_ns = ns;
+    s->qmu_lmid = lmid;
+
+    pvg_log(s, "[apple-gfx-ml][reload] loaded %s lmid=%ld; re-creating Session...\n",
+            new_path, lmid);
+
+    /* Register the host log callback on the NEW instance BEFORE qmu_create_extended
+     * (qmu_log_set_callback is per-instance/global; a fresh namespace starts with
+     * none) so the new build's create-time banner flows through our callback and
+     * is captured in s->backend_banner for the health/identity report. */
+    qmu_log_set_callback(pvg_qmu_log_callback, s);
+
+    /* Re-resolve the private peers + re-create the Session on the new instance,
+     * re-adopting the parked PvgState (same config built from s). */
+    r = pvg_create_session(s);
+    if (r) {
+        pvg_log(s, "[apple-gfx-ml][reload][ERROR] re-create Session on %s failed: %s\n",
+                new_path, strerror(-r));
+        pthread_mutex_unlock(&s->backing_lock);
+        return r;   /* device dead; caller rolls back */
+    }
+    r = pvg_restart_workers(s);
+    if (r) {
+        pvg_log(s, "[apple-gfx-ml][reload][ERROR] restart workers failed: %s\n", strerror(-r));
+        pthread_mutex_unlock(&s->backing_lock);
+        return r;
+    }
+
+    /* In-place device reset re-handshake: re-arm the firmware identity and bump
+     * the handshake generation (host-side stand-in for the guest kext's
+     * HandshakeGeneration bump; the live gate measures the real guest bump). */
+    if (reset) {
+        pvg_fw_identity_rearm(s, "backend reload");
+        s->handshake_generation++;
+    }
+    s->reload_count++;
+    g_free(s->qmu_path);
+    s->qmu_path = g_strdup(new_path);
+
+    pvg_log(s, "[apple-gfx-ml][reload] RELOAD #%" PRIu64 " OK -> %s lmid=%ld "
+            "handshake_gen=%" PRIu64 " qmu_errors=%" PRIu64 " banner='%s'\n",
+            s->reload_count, new_path, lmid, s->handshake_generation,
+            s->qmu_error_count, s->backend_banner);
+    pthread_mutex_unlock(&s->backing_lock);
+    return 0;
+}
+
 /* =========================================================== warm swap (v3)
  *
  * The FROZEN envelope for the DISPLAY GPU is the PVG MMIO/FIFO register
@@ -3021,10 +3367,39 @@ static int pvg_swap(void *priv, const char *arg)
  * command/capability set). An updater compares this across a bundle swap. */
 static const char *pvg_abi_tag(void *priv) { (void)priv; return PVG_ENVELOPE_VERSION; }
 
+/* qdp v4 reload op: full in-process REAL-renderer (libmlapi/QMetal) reload.
+ * The host has already quiesced the device (memory write-lock + IRQ hold); it
+ * resumes after.  `path` is the new libmlapi .so; QDP_RELOAD_RESET arms the
+ * in-place device-reset re-handshake. */
+static int pvg_reload_op(void *priv, const char *path, uint32_t flags)
+{
+    PvgState *s = priv;
+    if (!s) return -EINVAL;
+    return pvg_backend_reload(s, path, (flags & QDP_RELOAD_RESET) ? 1 : 0);
+}
+
+/* qdp v4 backend_report op: the reload health-gate reads this before and after
+ * a reload (envelope frozen? handshake bumped? 0 new QMU errors? gpuRestart
+ * within budget?). */
+static const char *pvg_backend_report(void *priv, char *buf, size_t len)
+{
+    PvgState *s = priv;
+    if (!s || !buf || !len) return NULL;
+    pthread_mutex_lock(&s->backing_lock);
+    g_snprintf(buf, len,
+               "envelope=%s reloads=%" PRIu64 " handshake_gen=%" PRIu64
+               " qmu_errors=%" PRIu64 " gpu_restarts=%" PRIu64 " lmid=%ld path=%s banner='%s'",
+               PVG_ENVELOPE_VERSION, s->reload_count, s->handshake_generation,
+               s->qmu_error_count, s->qmu_gpu_restart_count, s->qmu_lmid,
+               s->qmu_path ? s->qmu_path : "?", s->backend_banner);
+    pthread_mutex_unlock(&s->backing_lock);
+    return buf;
+}
+
 static const qdp_device_ops ops = {
     .abi_version = QDP_ABI_VERSION,
     .name = "uniq-vgpu",
-    .version = "0.2-warmswap",
+    .version = "0.3-reload",
     .setup = pvg_setup,
     .teardown = pvg_teardown,
     .reset = pvg_reset,
@@ -3038,6 +3413,8 @@ static const qdp_device_ops ops = {
     .ui_info = pvg_ui_info,
     .abi_tag = pvg_abi_tag,
     .swap = pvg_swap,
+    .reload = pvg_reload_op,
+    .backend_report = pvg_backend_report,
 };
 
 __attribute__((visibility("default")))

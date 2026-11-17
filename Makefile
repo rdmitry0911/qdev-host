@@ -78,7 +78,8 @@ plugins/uniq-vgpu/uniq-vgpu.so: $(UNIQ_VGPU_SRC) $(UNIQ_VGPU_HDR) qdp.h $(VFU_DE
 	    { echo "uniq-vgpu needs QMETAL_INCLUDE and QMETAL_LIBDIR" >&2; exit 1; }
 	$(CC) $(CFLAGS) -fPIC -shared -pthread -fvisibility=hidden -I. -Iplugins/uniq-vgpu \
 	    -I$(QMETAL_INCLUDE) $(VFU_CFLAGS) $(GLIB_ONLY_CFLAGS) -o $@ $(UNIQ_VGPU_SRC) \
-	    $(VFU_LIBS) -L$(QMETAL_LIBDIR) -lmlapi $(if $(QMETAL_RPATH),-Wl$(comma)-rpath$(comma)$(QMETAL_RPATH)) \
+	    $(VFU_LIBS) -L$(QMETAL_LIBDIR) -Wl,--no-as-needed -lmlapi -Wl,--as-needed \
+	    $(if $(QMETAL_RPATH),-Wl$(comma)-rpath$(comma)$(QMETAL_RPATH)) \
 	    $(GLIB_ONLY_LIBS) -ldl
 
 # The plugin's former name, kept for one release so that device definitions

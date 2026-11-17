@@ -419,6 +419,97 @@ def device_swap(control_path, backing: str,
         out.append(f"hot-replugged {dev_id}: guest re-enumerates + re-handshakes")
     return out
 
+def _parse_backend_report(reply: str) -> dict:
+    """Parse the qdev-host 'backend' reply ("ok key=value ... banner='...'")."""
+    out = {}
+    s = reply[len("ok"):].strip() if reply.startswith("ok") else reply
+    # banner is quoted and may contain spaces/=, so pull it out first
+    if "banner='" in s:
+        head, _, tail = s.partition("banner='")
+        out["banner"] = tail[:-1] if tail.endswith("'") else tail
+        s = head
+    for tok in s.split():
+        if "=" in tok:
+            k, _, v = tok.partition("=")
+            out[k] = v
+    return out
+
+def device_backend(control_path) -> dict:
+    """Read the device's backend health/identity report (reload health-gate)."""
+    reply = control_cmd(control_path, "backend")
+    if not reply.startswith("ok"):
+        raise QdevError(f"device-backend: {reply}")
+    return _parse_backend_report(reply)
+
+def device_reload(control_path, path: str, reset: bool = True,
+                  expect_gpurestart: int = 0, rollback: bool = True) -> list[str]:
+    """In-process REAL-backend reload (v4): destroy the live backend Session and
+    re-create it on the freshly loaded backend at `path`, re-adopting device
+    state, with the vfio-user process kept alive (stock QEMU, device BOUND).
+
+    SAME gates as device-swap plus the reload-specific ones:
+      - ABI gate: the FROZEN envelope (abi_tag) must be unchanged across the
+        reload (equal envelope => WARM; a change would require a guest reboot);
+      - health gate: 0 new QMU [ERROR] lines; gpuRestart delta within
+        `expect_gpurestart`; HandshakeGeneration must bump;
+      - auto-rollback: on a failed reload or a failed health gate, reload the
+        PREVIOUS backend (read from the pre-reload report) to restore the device.
+    Returns progress lines; raises QdevError if the (post-rollback) device is
+    not healthy."""
+    out = []
+    envelope_before = device_abi(control_path)
+    rep0 = device_backend(control_path)
+    prev_path = rep0.get("path")
+    reloads0 = int(rep0.get("reloads", 0))
+    gen0 = int(rep0.get("handshake_gen", 0))
+    errs0 = int(rep0.get("qmu_errors", 0))
+    gpur0 = int(rep0.get("gpu_restarts", 0))
+    out.append(f"pre-reload: envelope={envelope_before.split()[0] if envelope_before else '?'} "
+               f"reloads={reloads0} handshake_gen={gen0} qmu_errors={errs0} prev={prev_path}")
+
+    arg = f"reload {path}" + (" --reset" if reset else "")
+    reply = control_cmd(control_path, arg, timeout=60.0)
+    reload_ok = reply.startswith("ok")
+    if reload_ok:
+        out.append(f"backend reloaded in process: {reply[len('ok'):].strip()}")
+
+    def _rollback(reason: str):
+        if not (rollback and prev_path):
+            raise QdevError(f"device-reload failed ({reason}); no rollback target")
+        out.append(f"HEALTH-GATE FAIL ({reason}); auto-rollback -> {prev_path}")
+        rb = control_cmd(control_path, f"reload {prev_path}" + (" --reset" if reset else ""),
+                         timeout=60.0)
+        if not rb.startswith("ok"):
+            raise QdevError(f"device-reload: rollback to {prev_path} FAILED: {rb}")
+        out.append(f"rolled back to {prev_path}: {rb[len('ok'):].strip()}")
+
+    if not reload_ok:
+        _rollback(reply)
+        return out
+
+    # health + ABI gates
+    envelope_after = device_abi(control_path)
+    rep1 = device_backend(control_path)
+    errs1 = int(rep1.get("qmu_errors", 0))
+    gen1 = int(rep1.get("handshake_gen", 0))
+    gpur1 = int(rep1.get("gpu_restarts", 0))
+    problems = []
+    if envelope_after != envelope_before:
+        problems.append(f"envelope changed {envelope_before!r}->{envelope_after!r} (reboot required)")
+    if reset and gen1 <= gen0:
+        problems.append(f"HandshakeGeneration did not bump ({gen0}->{gen1})")
+    if errs1 > errs0:
+        problems.append(f"{errs1 - errs0} new QMU [ERROR] line(s)")
+    if gpur1 - gpur0 > expect_gpurestart:
+        problems.append(f"gpuRestart delta {gpur1 - gpur0} > expected {expect_gpurestart}")
+    if problems:
+        _rollback("; ".join(problems))
+        return out
+    out.append(f"HEALTH-GATE PASS: envelope frozen, handshake_gen {gen0}->{gen1}, "
+               f"0 new QMU errors, gpuRestart delta {gpur1 - gpur0} (<= {expect_gpurestart})")
+    out.append(f"backend now: {rep1.get('banner', '?')}")
+    return out
+
 def gpu_socket(vmid: int, dev_id: str) -> Path:
     return unit_run_dir(vmid, dev_id) / "gpu.sock"
 

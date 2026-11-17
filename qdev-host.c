@@ -85,6 +85,9 @@ static struct {
     /* v3: warm-swap of the VARIABLE backing (see qdp.h). */
     const char *(*abi_tag)(void *);
     int  (*swap)(void *, const char *);
+    /* v4: in-process REAL-backend reload (see qdp.h). */
+    int  (*reload)(void *, const char *, uint32_t);
+    const char *(*backend_report)(void *, char *, size_t);
 } v2;
 #define PLUGIN_DAMAGE (v2.flags & QDP_F_PLUGIN_DAMAGE)
 /* v3 fields, likewise zero for an older plugin */
@@ -279,6 +282,7 @@ static void load_plugin(void)
     }
     if (abi >= 3) v3.ui_info = ops->ui_info;
     if (abi >= 3) { v2.abi_tag = ops->abi_tag; v2.swap = ops->swap; }
+    if (abi >= 4) { v2.reload = ops->reload; v2.backend_report = ops->backend_report; }
     LOG("plugin %s %s (ABI %u%s)", ops->name, ops->version, abi, PLUGIN_DAMAGE ? ", plugin damage" : "");
 }
 
@@ -727,8 +731,39 @@ static void ctl_command(ctl_t *c, char *line)
         if (did_q) plugin_resume();
         if (r == 0) ctl_reply(c, "ok swapped %s", *arg ? arg : "(default)");
         else ctl_reply(c, "err swap: %s", strerror(r < 0 ? -r : r));
+    } else if (!strncmp(line, "reload", 6) && (line[6] == ' ' || line[6] == 0)) {
+        /* In-process REAL-backend reload (v4): quiesce -> destroy the live
+         * backend Session and re-create it on a freshly loaded, co-resident
+         * backend build, re-adopting device state -> resume.  The vfio-user
+         * connection and the device envelope stay up (stock QEMU, device
+         * BOUND).  "reload PATH [--reset]"; --reset arms the in-place device-
+         * reset re-handshake.  On failure the device may be left down: the
+         * caller (qdevctl) rolls back by reloading the previous backend. */
+        char *arg = g_strstrip(line + 6);
+        uint32_t flags = 0;
+        char *sp = strstr(arg, "--reset");
+        if (sp) { flags |= QDP_RELOAD_RESET; *sp = 0; arg = g_strstrip(arg); }
+        if (!(abi >= 4 && v2.reload)) { ctl_reply(c, "err reload unsupported by plugin"); return; }
+        if (!*arg) { ctl_reply(c, "err usage: reload PATH [--reset]"); return; }
+        bool did_q = false;
+        if (v2.quiesce) {
+            if (quiesce_cb(vfu) != 0) { ctl_reply(c, "err quiesce refused"); return; }
+            did_q = true;
+        }
+        int r = v2.reload(priv, arg, flags);
+        if (did_q) plugin_resume();
+        if (r == 0) ctl_reply(c, "ok reloaded %s%s", arg, (flags & QDP_RELOAD_RESET) ? " (reset)" : "");
+        else ctl_reply(c, "err reload: %s", strerror(r < 0 ? -r : r));
+    } else if (!strcmp(line, "backend")) {
+        /* Backend health/identity report for the reload health-gate (v4). */
+        char buf[512];
+        if (abi >= 4 && v2.backend_report && v2.backend_report(priv, buf, sizeof(buf)))
+            ctl_reply(c, "ok %s", buf);
+        else
+            ctl_reply(c, "err backend report unsupported by plugin");
     } else {
-        ctl_reply(c, "err unknown command (screendump FILE | frame | stats | uiinfo W H [WMM HMM] | abi | swap ARG)");
+        ctl_reply(c, "err unknown command (screendump FILE | frame | stats | uiinfo W H [WMM HMM] | "
+                  "abi | swap ARG | reload PATH [--reset] | backend)");
     }
 }
 static void ctl_process(ctl_t *c)
@@ -1534,7 +1569,7 @@ static void usage(void)
         "  --qemu-qmp PATH          the VM's QMP socket: forward keyboard/mouse with input-send-event\n"
         "                           (for VMs without a graphic console; --qemu-display wins if both are given)\n"
         "  --control PATH           control socket for automation: screendump FILE | frame | stats |\n"
-        "                           uiinfo W H [WMM HMM] | abi | swap ARG\n"
+        "                           uiinfo W H [WMM HMM] | abi | swap ARG | reload PATH [--reset] | backend\n"
         "  --kms-copy               force the copy path (no udmabuf zero-copy)\n"
         "  --stats-interval S       print stats every S seconds (SIGUSR2 prints them once)\n"
         "  -v                       verbose\n"

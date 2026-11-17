@@ -34,8 +34,11 @@
 #include <stdint.h>
 #include "libvfio-user.h"
 
-#define QDP_ABI_VERSION 3
+#define QDP_ABI_VERSION 4
 #define QDP_ABI_VERSION_MIN 1
+
+/* v4 reload() flags */
+#define QDP_RELOAD_RESET 1u    /* trigger the in-place device-reset re-handshake */
 
 /* Current scanout of a display plugin. fd is a memfd/shm fd the host may dup
  * and pass to display listeners (ScanoutMap); the plugin keeps it open. */
@@ -266,6 +269,29 @@ typedef struct qdp_device_ops {
      * the new backing on its next capability re-negotiation, which a device
      * reset (FLR / virtio reset / hot-replug) triggers. */
     int (*swap)(void *priv, const char *arg);
+
+    /* ------------------------------------------------------------ v4
+     * In-process REAL-backend reload (the host reads these only when
+     * abi_version >= 4).  Unlike v3 swap -- which only repoints a descriptor
+     * the guest picks up on its next re-handshake -- reload() tears the live
+     * backend down IN PROCESS and re-creates it on a freshly loaded,
+     * co-resident backend build, re-adopting the device state.  The guest-
+     * visible ENVELOPE (abi_tag) is still frozen; the reload is survivable
+     * because the device stays bound and only a device-reset re-handshake is
+     * used (no PCIe surprise-removal).  Both optional. */
+
+    /* Reload the backend in process from `path` (a new backend .so/bundle).
+     * Runs quiesced if the plugin has a quiesce op.  flags: QDP_RELOAD_RESET
+     * triggers the in-place device-reset re-handshake.  Returns 0 or -errno; on
+     * failure the device may be left down and the caller should reload the
+     * previous backend (auto-rollback). */
+    int (*reload)(void *priv, const char *path, uint32_t flags);
+
+    /* Backend health/identity for the reload health-gate, written into `buf`
+     * (NUL-terminated) as a "key=value ..." line and returned.  Keys include
+     * the build banner, reload count, handshake generation, and error / GPU-
+     * restart counters.  Returns buf, or NULL if unsupported. */
+    const char *(*backend_report)(void *priv, char *buf, size_t len);
 } qdp_device_ops;
 
 /* The single exported symbol of a plugin shared object. */

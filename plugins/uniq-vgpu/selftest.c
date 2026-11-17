@@ -138,6 +138,49 @@ static void host_log(void *host, int level, const char *fmt, ...)
     fprintf(stderr, "host-log[%d] %s\n", level, line);
 }
 
+/* ------ live banner capture: libmlapi prints "[qmetal] libmlapi built ..."
+ * straight to stderr (its default sink, bypassing the log callback), so to
+ * prove the NEW build's banner is live after a reload we tee the process's own
+ * stderr through a pipe and scan it for the banner line. */
+static char live_banner[256];
+static int banner_real_err = -1;
+static void *banner_reader(void *arg)
+{
+    int rfd = (int)(intptr_t)arg;
+    char buf[8192];
+    ssize_t n;
+    while ((n = read(rfd, buf, sizeof(buf))) > 0) {
+        if (banner_real_err >= 0) { (void)!write(banner_real_err, buf, n); }
+        char *b = strstr(buf, "libmlapi built");
+        if (b) {
+            char *e = strchr(b, '\n');
+            pthread_mutex_lock(&host_lock);
+            snprintf(live_banner, sizeof(live_banner), "%.*s", e ? (int)(e - b) : 200, b);
+            pthread_mutex_unlock(&host_lock);
+        }
+    }
+    return NULL;
+}
+static void banner_capture_start(void)
+{
+    int pfd[2];
+    pthread_t t;
+    fflush(stderr);
+    banner_real_err = dup(2);
+    if (pipe(pfd) != 0) { return; }
+    dup2(pfd[1], 2);
+    close(pfd[1]);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    pthread_create(&t, NULL, banner_reader, (void *)(intptr_t)pfd[0]);
+    pthread_detach(t);
+}
+static void get_live_banner(char *out, size_t len)
+{
+    pthread_mutex_lock(&host_lock);
+    snprintf(out, len, "%s", live_banner);
+    pthread_mutex_unlock(&host_lock);
+}
+
 static int get_int(int *v)
 {
     int r;
@@ -193,6 +236,65 @@ static bool wait_reg(uint32_t off, uint32_t want, double timeout_s)
     return rd(off) == want;
 }
 
+/* ------------------------------------------------- reload proof (L-WARMSWAP-INPROC-RELOAD)
+ * Mint a BANNER-DISTINGUISHABLE, ABI-identical libmlapi copy for reload cycle
+ * `cycle` from a golden build: copy it into a private per-instance directory
+ * (so its $ORIGIN RUNPATH resolves its own fresh libair2spirv/libMetal), then
+ * overwrite the compiled-in build banner (marker + git, both fixed-length) with
+ * cycle-distinct values.  Each dlmopen(LM_ID_NEWLM) of the result is an
+ * independent co-resident instance whose live banner differs from every other.
+ * Returns a malloc'd path to the minted libmlapi.so, or NULL. */
+static int mint_replace(uint8_t *buf, size_t n, const char *from, const char *to)
+{
+    size_t fl = strlen(from), tl = strlen(to);
+    if (fl != tl) { return -2; }           /* must be in-place (same length) */
+    for (size_t i = 0; i + fl <= n; i++) {
+        if (!memcmp(buf + i, from, fl)) { memcpy(buf + i, to, tl); return 0; }
+    }
+    return -1;                             /* not found */
+}
+
+static char *mint_instance(const char *golden, const char *sibdir, int cycle,
+                           const char *root, char *marker_out, size_t marker_len)
+{
+    char dir[512], out[640], link[640], tgt[640];
+    const char *sibs[] = { "libair2spirv.so.1", "libair2spirv.so", "libMetal.so" };
+    char git[9], marker[31];
+    uint8_t *buf;
+    long n;
+    FILE *f;
+
+    snprintf(dir, sizeof(dir), "%s/inst-%02d", root, cycle);
+    if (mkdir(dir, 0700) != 0 && errno != EEXIST) { return NULL; }
+    for (size_t i = 0; i < sizeof(sibs) / sizeof(sibs[0]); i++) {
+        snprintf(tgt, sizeof(tgt), "%s/%s", sibdir, sibs[i]);
+        snprintf(link, sizeof(link), "%s/%s", dir, sibs[i]);
+        if (access(tgt, F_OK) == 0) { unlink(link); (void)symlink(tgt, link); }
+    }
+    f = fopen(golden, "rb");
+    if (!f) { return NULL; }
+    fseek(f, 0, SEEK_END); n = ftell(f); fseek(f, 0, SEEK_SET);
+    buf = malloc(n);
+    if (!buf || fread(buf, 1, n, f) != (size_t)n) { free(buf); fclose(f); return NULL; }
+    fclose(f);
+
+    /* cycle-distinct, fixed-length banner fields (base: ae78d0ef build) */
+    snprintf(git, sizeof(git), "rl%06d", cycle);                      /* 8 chars */
+    snprintf(marker, sizeof(marker), "RELOADCYCLE_%02d_INPROC_WARMSWAP", cycle); /* 30 chars */
+    if (strlen(git) != 8 || strlen(marker) != 30) { free(buf); return NULL; }
+    if (mint_replace(buf, n, "2994552d", git) ||
+        mint_replace(buf, n, "20260402_1308_FORCE_REBUILD_V3", marker)) {
+        free(buf); return NULL;   /* golden must be the known base build */
+    }
+    snprintf(out, sizeof(out), "%s/libmlapi.so", dir);
+    f = fopen(out, "wb");
+    if (!f || fwrite(buf, 1, n, f) != (size_t)n) { if (f) fclose(f); free(buf); return NULL; }
+    fclose(f);
+    free(buf);
+    if (marker_out) { snprintf(marker_out, marker_len, "%s", marker); }
+    return strdup(out);
+}
+
 #define MiB (1024ull * 1024)
 #define GUEST_FILE_SIZE (64 * MiB)
 #define A_IOVA 0ull                   /* [0, 48 MiB) at file offset 0 */
@@ -230,6 +332,15 @@ int main(int argc, char **argv)
     if (argc > 2 && !strcmp(argv[2], "--fw-identity")) {
         fw_identity = true;
         personality = 0xeee1;
+    }
+    /* --reload N GOLDEN : after the boot sequence, run N in-process real-renderer
+     * reload cycles against banner-distinct copies of GOLDEN (the base libmlapi). */
+    int reload_n = 0; const char *reload_golden = NULL;
+    for (int i = 2; i + 2 < argc + 1 && i < argc; i++) {
+        if (!strcmp(argv[i], "--reload") && i + 2 < argc) {
+            reload_n = atoi(argv[i + 1]);
+            reload_golden = argv[i + 2];
+        }
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
 
@@ -655,6 +766,139 @@ int main(int argc, char **argv)
     CHECK(get_int(&plugin_errors) == 0, "no plugin [ERROR] lines (%d host-log lines seen)",
           get_int(&log_lines));
     printf("INFO QMetal [ERROR] log lines: %d\n", get_int(&qmetal_errors));
+
+    /* 10b. IN-PROCESS REAL-RENDERER RELOAD (L-WARMSWAP-INPROC-RELOAD)
+     * N real device-reload cycles in ONE process: each dlmopen()s a banner-
+     * distinct libmlapi build, qmu_destroy + re-create the Session on it, with
+     * the device RESET (handshake generation bumped) each time.  Assert: the
+     * NEW banner is live (marker differs per cycle), lmid advances (a fresh
+     * link-map namespace), device state re-adopted (FIFO re-arms + consumes),
+     * handshake_gen == cycle, 0 new QMU errors, 0 abort/leak/join-hang. */
+    if (reload_n > 0 && reload_golden) {
+        CHECK(ops->abi_version >= 4 && ops->reload && ops->backend_report,
+              "plugin exposes qdp v4 reload + backend_report (abi %u)", ops->abi_version);
+        if (ops->reload && ops->backend_report) {
+            char root[256], sib[512], rep[512];
+            const char *slash = strrchr(reload_golden, '/');
+            long prev_lmid = -1;
+            int ok_cycles = 0;
+            int errs_before_all = get_int(&qmetal_errors);
+            snprintf(root, sizeof(root), "/tmp/apple-pvg-reload-%d", getpid());
+            mkdir(root, 0700);
+            snprintf(sib, sizeof(sib), "%.*s", slash ? (int)(slash - reload_golden) : 1,
+                     slash ? reload_golden : ".");
+
+            printf("INFO reload: %d cycles, golden=%s sibdir=%s\n", reload_n, reload_golden, sib);
+            banner_capture_start();   /* tee stderr to catch each build's live banner */
+            for (int cyc = 1; cyc <= reload_n; cyc++) {
+                char marker[64]; char *inst;
+                int errs_before = get_int(&qmetal_errors);
+                double tc0 = now_s();
+
+                inst = mint_instance(reload_golden, sib, cyc, root, marker, sizeof(marker));
+                CHECK(inst != NULL, "cycle %d: mint banner-distinct instance (marker=%s)",
+                      cyc, inst ? marker : "FAILED");
+                if (!inst) { break; }
+
+                /* quiesce -> in-process reload (destroy + dlmopen + re-create,
+                 * device reset) -> resume : exactly the qdev-host control path */
+                r = ops->quiesce(priv);
+                int rr = ops->reload(priv, inst, QDP_RELOAD_RESET);
+                ops->resume(priv);
+                double reload_ms = (now_s() - tc0) * 1000.0;
+                CHECK(r == 0 && rr == 0, "cycle %d: quiesce+reload+resume rc=%d/%d in %.0f ms",
+                      cyc, r, rr, reload_ms);
+                if (rr) { free(inst); break; }
+
+                ops->backend_report(priv, rep, sizeof(rep));
+                /* NEW banner live (marker for THIS cycle), handshake bumped, 0 new errors.
+                 * The banner is captured from the library's own stderr output. */
+                usleep(50 * 1000);   /* let the reader thread drain the pipe */
+                char banner[256]; get_live_banner(banner, sizeof(banner));
+                CHECK(strstr(banner, marker) != NULL,
+                      "cycle %d: NEW banner live (git/marker differ): %s", cyc, banner);
+                char want_hs[64]; snprintf(want_hs, sizeof(want_hs), "handshake_gen=%d", cyc);
+                CHECK(strstr(rep, want_hs) != NULL, "cycle %d: HandshakeGeneration bumped (%s)",
+                      cyc, want_hs);
+                char want_rl[64]; snprintf(want_rl, sizeof(want_rl), "reloads=%d", cyc);
+                CHECK(strstr(rep, want_rl) != NULL, "cycle %d: reload count == %d", cyc, cyc);
+                CHECK(get_int(&qmetal_errors) == errs_before,
+                      "cycle %d: 0 new QMU [ERROR] lines (%d)", cyc,
+                      get_int(&qmetal_errors) - errs_before);
+
+                /* lmid advances: a fresh co-resident namespace each cycle */
+                long lmid = -1; { char *p = strstr(rep, "lmid="); if (p) lmid = atol(p + 5); }
+                CHECK(lmid > 0 && lmid != prev_lmid, "cycle %d: co-resident lmid=%ld (was %ld)",
+                      cyc, lmid, prev_lmid);
+                prev_lmid = lmid;
+
+                /* device state re-adopted: re-arm the FIFO on the new session and
+                 * confirm it consumes a NOP (FIFO_READ advances) */
+                {
+                    const uint64_t fifo_gpa = B_IOVA + 0x100000;
+                    uint8_t *fifo = guest + B_FILE_OFF + 0x100000;
+                    uint32_t nop[3] = { 0x03, 12, 0x4200 + cyc };
+                    /* B was unregistered in step 8; re-register for the probe */
+                    qdp_dma_region b = { B_IOVA, B_LEN, guest + B_FILE_OFF, memfd, B_FILE_OFF,
+                                         PROT_READ | PROT_WRITE };
+                    r = ops->quiesce(priv); ops->dma_register(priv, &b); ops->resume(priv);
+                    /* replay the minimal boot handshake the guest does on its
+                     * post-reset re-handshake, so the re-created session reaches
+                     * GFX_READY (not UNINITIALIZED): negotiate protocol v6 + the
+                     * shared-state page, re-adopting the parked memory tables */
+                    wr(PVG_REG_PROTOCOL_VERSION, 6);
+                    wr(PVG_REG_SHARED_STATE_PFN, (uint32_t)((B_IOVA + 0x100000) >> 12));
+                    wr(PVG_REG_FIFO_PFN, (uint32_t)(fifo_gpa >> 12));
+                    wr(PVG_REG_FIFO_OFFSET, 0x1000);
+                    wr(PVG_REG_FIFO_SIZE, 0x10000);
+                    wr(PVG_REG_FIFO_ENABLE, 1);
+                    memcpy(fifo + 0x1000, nop, sizeof(nop));
+                    memset(fifo, 0, 4);
+                    wr(PVG_REG_FIFO_WRITE, 12);
+                    CHECK(wait_reg(PVG_REG_FIFO_READ, 12, 5.0),
+                          "cycle %d: re-adopted session consumes FIFO NOP (FIFO_READ %u)",
+                          cyc, rd(PVG_REG_FIFO_READ));
+                    wr(PVG_REG_FIFO_ENABLE, 0);
+                    r = ops->quiesce(priv); ops->dma_unregister(priv, &b); ops->resume(priv);
+                }
+                free(inst);
+                ok_cycles++;
+            }
+            printf("INFO reload: %d/%d cycles OK, 0 new QMU errors=%s\n", ok_cycles, reload_n,
+                   get_int(&qmetal_errors) == errs_before_all ? "yes" : "NO");
+
+            /* 10c. HEALTH-GATE ROLLBACK: inject a BAD reload (a valid .so that is
+             * NOT a libmlapi -> the vtable bind fails after the old Session is
+             * already destroyed, device down), then auto-rollback by reloading a
+             * known-good instance.  Proves the vtable gate + rollback recovery. */
+            {
+                char marker[64]; char badrep[512];
+                char *good = mint_instance(reload_golden, sib, 99, root, marker, sizeof(marker));
+                /* a non-libmlapi .so: the shipped backing_A.so has no qmu_* */
+                const char *bad = "plugins/uniq-vgpu/backing_A.so";
+                long reloads_before = 0;
+                ops->backend_report(priv, rep, sizeof(rep));
+                { char *p = strstr(rep, "reloads="); if (p) reloads_before = atol(p + 8); }
+
+                r = ops->quiesce(priv);
+                int rr = ops->reload(priv, bad, QDP_RELOAD_RESET);
+                CHECK(rr != 0, "rollback: BAD reload (non-libmlapi) rejected by the vtable gate (rc=%d)", rr);
+                /* device is down (Session destroyed, new bind failed): roll back */
+                int rb = good ? ops->reload(priv, good, QDP_RELOAD_RESET) : -1;
+                ops->resume(priv);
+                ops->backend_report(priv, badrep, sizeof(badrep));
+                long reloads_after = 0;
+                { char *p = strstr(badrep, "reloads="); if (p) reloads_after = atol(p + 8); }
+                CHECK(rb == 0 && reloads_after == reloads_before + 1,
+                      "rollback: auto-rollback to good instance restored the device (rc=%d, reloads %ld->%ld)",
+                      rb, reloads_before, reloads_after);
+                usleep(50 * 1000);
+                char banner[256]; get_live_banner(banner, sizeof(banner));
+                CHECK(strstr(banner, marker) != NULL, "rollback: good banner live after recovery: %s", banner);
+                free(good);
+            }
+        }
+    }
 
     /* 11. quit stop phase */
     t0 = now_s();

@@ -36,6 +36,115 @@
 #include "qmu-private/qmu_ordinary_physical_comparison_v1.h"
 #include "qmu-private/qmu_ordinary_task_memory_v1.h"
 
+/* Declared in QMetal's C++ qmu_vulkan.h, which C cannot include. Forward it
+ * here so the backend vtable below can take its exact type. */
+struct qmu_vulkan_ctx;
+void qmu_vk_consume_current_frame_signal(struct qmu_vulkan_ctx *ctx);
+
+/* ============================================================ backend vtable
+ * (L-WARMSWAP-INPROC-RELOAD) The REAL renderer (libmlapi / QMetal) is reloaded
+ * in-process on stock QEMU by destroying the live Session, dlmopen()-ing a new,
+ * co-resident libmlapi build into a fresh link-map namespace, and re-creating
+ * the Session on it from the PARKED PvgState.  struct layouts can differ
+ * between builds, so EVERY qmu_* call on a Session must go to the instance that
+ * CREATED it: the whole qmu_* surface this plugin imports (29 functions + the
+ * added qmu_destroy, 35 call sites) is routed through this per-process
+ * function-pointer vtable, bound from the active instance's dlopen handle.
+ *
+ * The field types are taken with __typeof__ from the real prototypes above, so
+ * the vtable is exact and tracks the headers automatically; the call sites are
+ * then rewritten to the vtable by the object-like macros at the end of this
+ * block.  Because the only remaining references to the qmu_* names are these
+ * compile-time __typeof__ uses, apple-pvg.so carries no direct link-time
+ * dependency on any routed symbol: the base instance is bound explicitly by
+ * dlopen("libmlapi.so") at setup, and every reload target by dlmopen(NEWLM). */
+struct pvg_qmu_vt {
+    __typeof__(qmu_create_extended)                                   *create_extended;
+    __typeof__(qmu_destroy)                                           *destroy;
+    __typeof__(qmu_set_debug_level)                                   *set_debug_level;
+    __typeof__(qmu_log_set_callback)                                  *log_set_callback;
+    __typeof__(qmu_log_category_name)                                 *log_category_name;
+    __typeof__(qmu_log_level_name)                                    *log_level_name;
+    __typeof__(qmu_mmio_read)                                         *mmio_read;
+    __typeof__(qmu_mmio_write)                                        *mmio_write;
+    __typeof__(qmu_session_quiesce_host_callback_producers_deferred)  *session_quiesce_host_callback_producers_deferred;
+    __typeof__(qmu_session_rethrow_quiesce)                           *session_rethrow_quiesce;
+    __typeof__(qmu_session_finish_retirement_for_exit)                *session_finish_retirement_for_exit;
+    __typeof__(qmu_session_get_vulkan)                                *session_get_vulkan;
+    __typeof__(qmu_session_acquire_host_work)                         *session_acquire_host_work;
+    __typeof__(qmu_session_current_host_work)                         *session_current_host_work;
+    __typeof__(qmu_session_invoke_host_work)                          *session_invoke_host_work;
+    __typeof__(qmu_session_release_host_work)                         *session_release_host_work;
+    __typeof__(qmu_session_retain_host_work)                          *session_retain_host_work;
+    __typeof__(qmu_get_private_mapped_transport_v1)                   *get_private_mapped_transport_v1;
+    __typeof__(qmu_get_private_ordinary_physical_capture_v2)          *get_private_ordinary_physical_capture_v2;
+    __typeof__(qmu_get_private_ordinary_physical_comparison_v1)       *get_private_ordinary_physical_comparison_v1;
+    __typeof__(qmu_get_private_ordinary_task_memory_v1)               *get_private_ordinary_task_memory_v1;
+    __typeof__(qmu_iosfc_present_tick)                                *iosfc_present_tick;
+    __typeof__(qmu_display_copy_selected_current_target)              *display_copy_selected_current_target;
+    __typeof__(qmu_display_publish_mode_target)                       *display_publish_mode_target;
+    __typeof__(qmu_display_target_release)                            *display_target_release;
+    __typeof__(qmu_get_display_cursor_position)                       *get_display_cursor_position;
+    __typeof__(qmu_owned_display_frame_release)                       *owned_display_frame_release;
+    __typeof__(qmu_vk_consume_current_frame_signal)                   *vk_consume_current_frame_signal;
+    __typeof__(qmu_vk_encode_submit_owned_display_frame)              *vk_encode_submit_owned_display_frame;
+    __typeof__(qmu_vk_prepare_owned_display_frame)                    *vk_prepare_owned_display_frame;
+    /* Optional (newer than the first qdev package's QMetal): NULL when the
+     * instance does not export it, exactly like the private getters. */
+    __typeof__(qmu_display_set_mode_list)                             *display_set_mode_list;
+    /* identity of the instance this vtable was bound from */
+    void       *handle;        /* dlopen/dlmopen handle (base = the LM_ID_BASE copy) */
+    long        lmid;          /* link-map namespace id (LM_ID_BASE for the base)    */
+};
+
+/* The active backend vtable (one device per process; the call-site macros read
+ * it).  Bound to the base instance at setup, re-bound to the dlmopen target by
+ * pvg_backend_reload(). */
+extern const struct pvg_qmu_vt *pvg_qvt;
+
+/* Resolve all routed symbols from `handle` into `vt`.  The four optional
+ * private getters may be absent (stored NULL, as the old weak imports were);
+ * every other symbol is mandatory and a miss fails the bind.  On failure,
+ * `*err` (if non-NULL) names the first missing mandatory symbol. */
+bool pvg_qmu_vt_bind(struct pvg_qmu_vt *vt, void *handle, long lmid, const char **err);
+
+/* Route every qmu_* call site through the active vtable.  Object-like macros,
+ * so both a call `qmu_foo(a)` -> `(pvg_qvt->foo)(a)` and the NULL-test of an
+ * optional getter `qmu_get_private_x ? qmu_get_private_x() : NULL` rewrite
+ * correctly.  Defined AFTER the struct so the __typeof__ uses above see the
+ * real prototypes. */
+#define qmu_create_extended                                  (pvg_qvt->create_extended)
+#define qmu_destroy                                          (pvg_qvt->destroy)
+#define qmu_set_debug_level                                  (pvg_qvt->set_debug_level)
+#define qmu_log_set_callback                                 (pvg_qvt->log_set_callback)
+#define qmu_log_category_name                                (pvg_qvt->log_category_name)
+#define qmu_log_level_name                                   (pvg_qvt->log_level_name)
+#define qmu_mmio_read                                        (pvg_qvt->mmio_read)
+#define qmu_mmio_write                                       (pvg_qvt->mmio_write)
+#define qmu_session_quiesce_host_callback_producers_deferred (pvg_qvt->session_quiesce_host_callback_producers_deferred)
+#define qmu_session_rethrow_quiesce                          (pvg_qvt->session_rethrow_quiesce)
+#define qmu_session_finish_retirement_for_exit               (pvg_qvt->session_finish_retirement_for_exit)
+#define qmu_session_get_vulkan                               (pvg_qvt->session_get_vulkan)
+#define qmu_session_acquire_host_work                        (pvg_qvt->session_acquire_host_work)
+#define qmu_session_current_host_work                        (pvg_qvt->session_current_host_work)
+#define qmu_session_invoke_host_work                         (pvg_qvt->session_invoke_host_work)
+#define qmu_session_release_host_work                        (pvg_qvt->session_release_host_work)
+#define qmu_session_retain_host_work                         (pvg_qvt->session_retain_host_work)
+#define qmu_get_private_mapped_transport_v1                  (pvg_qvt->get_private_mapped_transport_v1)
+#define qmu_get_private_ordinary_physical_capture_v2         (pvg_qvt->get_private_ordinary_physical_capture_v2)
+#define qmu_get_private_ordinary_physical_comparison_v1      (pvg_qvt->get_private_ordinary_physical_comparison_v1)
+#define qmu_get_private_ordinary_task_memory_v1              (pvg_qvt->get_private_ordinary_task_memory_v1)
+#define qmu_iosfc_present_tick                               (pvg_qvt->iosfc_present_tick)
+#define qmu_display_copy_selected_current_target             (pvg_qvt->display_copy_selected_current_target)
+#define qmu_display_publish_mode_target                      (pvg_qvt->display_publish_mode_target)
+#define qmu_display_target_release                           (pvg_qvt->display_target_release)
+#define qmu_get_display_cursor_position                      (pvg_qvt->get_display_cursor_position)
+#define qmu_owned_display_frame_release                      (pvg_qvt->owned_display_frame_release)
+#define qmu_vk_consume_current_frame_signal                  (pvg_qvt->vk_consume_current_frame_signal)
+#define qmu_vk_encode_submit_owned_display_frame             (pvg_qvt->vk_encode_submit_owned_display_frame)
+#define qmu_vk_prepare_owned_display_frame                   (pvg_qvt->vk_prepare_owned_display_frame)
+#define qmu_display_set_mode_list                            (pvg_qvt->display_set_mode_list)
+
 /* ------------------------------------------------------------ atomics */
 #define pvg_atomic_read(p)        __atomic_load_n((p), __ATOMIC_SEQ_CST)
 #define pvg_atomic_set(p, v)      __atomic_store_n((p), (v), __ATOMIC_SEQ_CST)
@@ -261,11 +370,38 @@ typedef struct PvgState {
     void  *backing_h;             /* dlopen handle of the active backing .so (NULL = builtin A) */
     char   backing_tag[32];       /* current backing tag, for logging + device-abi               */
     char   backend_version[64];   /* advertised backend identity (the guest ioreg-triplet value) */
+
+    /* in-process REAL-renderer reload (L-WARMSWAP-INPROC-RELOAD): destroy the
+     * live Session, dlmopen a new co-resident libmlapi build, re-create the
+     * Session from the parked state.  All under backing_lock. */
+    struct pvg_qmu_vt qvt_storage; /* storage the global pvg_qvt points at          */
+    void  *qmu_ns;                 /* current reload instance handle (NULL = base)   */
+    long    qmu_lmid;              /* its link-map namespace id                      */
+    char   *qmu_path;             /* path the active instance was loaded from (g_strdup) */
+    uint64_t reload_count;         /* successful in-process reloads so far           */
+    uint64_t handshake_generation; /* bumped on every reload device-reset: the host- *
+                                    * side stand-in for the guest kext's Handshake-  *
+                                    * Generation re-handshake (live gate d measures  *
+                                    * the real guest bump).                          */
+    char   backend_banner[192];    /* last "[qmetal] libmlapi built ... git=.. marker=.." seen */
+    uint64_t qmu_error_count;      /* QMU [ERROR] log lines (health gate)            */
+    uint64_t qmu_gpu_restart_count;/* QMetal gpuRestart/GPU-hang log lines (health)  */
 } PvgState;
 
 /* ------------------------------------------------------------ logging */
 void pvg_log(PvgState *s, const char *fmt, ...) G_GNUC_PRINTF(2, 3);
 void pvg_log_direct(PvgState *s, const char *text);
+
+/* ------------------------------------------- in-process real-renderer reload */
+/* Destroy the live Session, load `new_path` as a co-resident libmlapi via
+ * dlmopen(LM_ID_NEWLM), re-bind the backend vtable to it and re-create the
+ * Session from the parked PvgState.  reset != 0 arms the firmware identity and
+ * bumps handshake_generation (the in-place device-reset re-handshake).  The
+ * caller (qdev-host) has already quiesced the device (memory write-lock held,
+ * IRQ held) and resumes after.  Returns 0 or -errno; on any failure the prior
+ * instance is left torn down and the Session NULL (the caller rolls back by
+ * reloading the previous path).  Not thread-safe against MMIO: quiesced only. */
+int pvg_backend_reload(PvgState *s, const char *new_path, int reset);
 
 /* ------------------------------------------------------------ pvg-memory.c */
 void pvg_memory_init(PvgMemory *m);
