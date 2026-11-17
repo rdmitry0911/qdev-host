@@ -1685,8 +1685,53 @@ static void setup_cpu_affinity(void)
     LOG("cpu affinity %s (%s)", have, why);
 }
 
+/* In-process REAL-renderer reload (apple-pvg: `reload <libmlapi.so> --reset`)
+ * dlmopen(LM_ID_NEWLM)s a new libmlapi into a fresh link-map namespace.  When a
+ * drop-in malloc (mimalloc/jemalloc/tcmalloc) is LD_PRELOADed -- as the shipped
+ * bundles do -- it interposes malloc ONLY in the base namespace.  The dlmopen
+ * also grows the process TLS module count; glibc's pthread stack cache then holds
+ * exited threads whose dtv was allocated by the preloaded malloc, and on the next
+ * pthread_create (the new libmlapi's vkCreateDevice spawning RADV threads) glibc
+ * reuses such a cached stack and frees that stale dtv through its own INTERNAL
+ * free (__GI___libc_free, not routed through the preload) -> the preloaded
+ * allocator's chunk reaches glibc's free() -> "free(): invalid pointer" SIGABRT.
+ * (This is the live-only gate-(d) crash: reproduced off-VM only with the bundle's
+ * mimalloc preload, never under plain glibc.)  Disabling the glibc thread-stack
+ * cache (glibc.pthread.stack_cache_size=0) removes the reuse, so each exited
+ * thread's stack+dtv is released by the allocator that made it and nothing
+ * crosses the dlmopen boundary.  The tunable is parsed once at libc init, before
+ * main(), so set it and re-exec BEFORE any thread or allocation that matters.
+ * Scoped to a preloaded foreign allocator so an ordinary launch is untouched. */
+static void ensure_reload_safe_allocator_env(char **argv)
+{
+    static const char KEY[] = "glibc.pthread.stack_cache_size";
+    const char *preload = getenv("LD_PRELOAD");
+    const char *tun = getenv("GLIBC_TUNABLES");
+    char buf[4096];
+
+    if (!preload || !(strstr(preload, "mimalloc") || strstr(preload, "jemalloc") ||
+                      strstr(preload, "tcmalloc"))) {
+        return;   /* no foreign allocator interposed: glibc stack cache is safe */
+    }
+    if (tun && strstr(tun, KEY)) {
+        return;   /* already set (incl. our own re-exec): do not loop */
+    }
+    if (tun && *tun) {
+        snprintf(buf, sizeof(buf), "%s:%s=0", tun, KEY);
+    } else {
+        snprintf(buf, sizeof(buf), "%s=0", KEY);
+    }
+    setenv("GLIBC_TUNABLES", buf, 1);
+    execv("/proc/self/exe", argv);
+    /* execv returns only on failure: run on without it (reload may then abort). */
+    fprintf(stderr, "[qdev-host][WARN] re-exec to set %s=0 failed: %s; the "
+            "in-process renderer reload can abort under the preloaded allocator\n",
+            KEY, strerror(errno));
+}
+
 int main(int argc, char **argv)
 {
+    ensure_reload_safe_allocator_env(argv);
     static const struct option lopts[] = {
         { "plugin", 1, 0, 'p' }, { "socket", 1, 0, 's' }, { "plugin-args", 1, 0, 'a' },
         { "display-p2p", 1, 0, 'P' }, { "display-bus", 1, 0, 'B' }, { "display-name", 1, 0, 'N' },
