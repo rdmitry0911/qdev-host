@@ -38,7 +38,7 @@ $(BUILD)/test-aw-wire: aw_wire.c aw_wire.h test_aw_wire.c | $(BUILD)
 
 # Apple-wire sbuf reader (aw_sbuf, H3) + session engine (aw_session, H5+H6):
 # routing/status + decode-exchange wire ordering with a mock backend. No libva.
-AW_CORE := aw_wire.c aw_sbuf.c aw_bplist.c aw_session.c
+AW_CORE := aw_wire.c aw_sbuf.c aw_bplist.c aw_session.c vt_scatter.c
 $(BUILD)/test-aw-session: $(AW_CORE) test_aw_session.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $(AW_CORE) test_aw_session.c
 
@@ -53,6 +53,10 @@ $(BUILD)/test-aw-bplist: aw_bplist.c aw_bplist.h test_aw_bplist.c | $(BUILD)
 dump-decs: $(BUILD)/dump-decs
 $(BUILD)/dump-decs: aw_wire.c aw_sbuf.c aw_bplist.c aw_session.c dump_decs.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ aw_wire.c aw_sbuf.c aw_bplist.c aw_session.c dump_decs.c
+
+# Scattered-page landing of a decoded frame into a non-contiguous guest surface.
+$(BUILD)/test-vt-scatter: vt_scatter.c vt_scatter.h test_vt_scatter.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ vt_scatter.c test_vt_scatter.c
 
 $(BUILD)/test-virtq: vtpv_virtq.c vtpv_proto.c test_virtq.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ vtpv_virtq.c vtpv_proto.c test_virtq.c
@@ -87,10 +91,11 @@ $(BUILD)/test-plugin: test_plugin.c $(BUILD)/apple-videotoolbox.so | $(BUILD)
 
 plugin: $(BUILD)/apple-videotoolbox.so
 
-test: $(BUILD)/test-proto $(BUILD)/test-virtq $(BUILD)/test-aw-wire $(BUILD)/test-aw-bplist $(BUILD)/test-aw-session
+test: $(BUILD)/test-proto $(BUILD)/test-virtq $(BUILD)/test-aw-wire $(BUILD)/test-aw-bplist $(BUILD)/test-aw-session $(BUILD)/test-vt-scatter
 	@echo "== Apple real-wire codec =="; $(BUILD)/test-aw-wire
 	@echo "== binary-plist encoder (H4) =="; $(BUILD)/test-aw-bplist
 	@echo "== Apple-wire session engine (H3/H5/H6, mock backend) =="; $(BUILD)/test-aw-session
+	@echo "== scattered-page landing =="; $(BUILD)/test-vt-scatter
 	@echo "== protocol handler =="; $(BUILD)/test-proto
 	@echo "== virtio virtqueue =="; $(BUILD)/test-virtq
 ifeq ($(HAVE_VA),1)

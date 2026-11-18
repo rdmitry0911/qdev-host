@@ -98,6 +98,10 @@ extern "C" {
 #define AW_KEY_SUP    AW_4CC(',','s','u','p')
 #define AW_KEY_KEY    AW_4CC(',','k','e','y')
 #define AW_KEY_VAL    AW_4CC(',','v','a','l')
+/* ,pba: pixel buffer attributes, =pls. Reference: guest VideoToolbox (KDK 25C56 x86_64h) Dpba handler
+ * FUN_7ff814b54cb3 -> VTParavirtualizationMessageCopyCFDictionary(msg, 0x2c706261) then
+ * VTDecoderSessionSetPixelBufferAttributes; independently reims names.rs PIXEL_BUFFER_ATTRIBUTES. */
+#define AW_KEY_PBA    AW_4CC(',','p','b','a')
 #define AW_KEY_FDS    AW_4CC(',','f','d','s')
 #define AW_KEY_FRM    AW_4CC(',','f','r','m')
 #define AW_KEY_SBF    AW_4CC(',','s','b','f')

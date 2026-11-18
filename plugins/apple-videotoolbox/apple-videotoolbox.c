@@ -51,6 +51,7 @@
 #include "vtpv_vaapi.h"
 #include "vtpv_virtq.h"
 #include "aw_session.h"   /* the Apple contract-B wire session engine (H5/H6/H7) */
+#include "vt_scatter.h"   /* page-aware landing into a non-contiguous guest surface */
 #include "../apple-pvg/pvg_mapper_bridge.h" /* increment 2: resolve mapping_id -> gpa-ranges */
 
 /* ---- device constants ---------------------------------------------- */
@@ -221,6 +222,19 @@ static void *vt_map(void *ctx, uint64_t iova, uint64_t len)
     }
     return NULL;
 }
+
+/* Scattered-page landing (non-contiguous guest surface): the frame is composed in a
+ * host shadow of the surface allocation and moved to the guest pages by vt_copy_frame. */
+typedef struct vt_landing {
+    vt_dev   *d;
+    uint8_t  *shadow;
+    size_t    total;
+    uint32_t  npages;
+    uint64_t  page_size;
+    uint64_t  gpa_pages[PVG_BRIDGE_MAX_PAGES];
+} vt_landing;
+
+static void *vt_scatter_map(void *ctx, uint64_t gpa, uint64_t len) { return vt_map(ctx, gpa, len); }
 
 static void vt_raise(vt_dev *d, unsigned queue)
 {
@@ -421,14 +435,7 @@ static int vt_resolve_buffer(void *ctx, const uint8_t uuid[16], uint64_t mapping
         pvg_bridge_resolved r;
         if (bridge && pvg_mapper_bridge_lookup(bridge, (uint32_t)mapping_id, &r) == 0 &&
             r.page_count > 0) {
-            if (!r.contiguous) {
-                /* Scattered guest pages need a page-aware (scatter) copy; not wired in this slice.
-                 * Bring-up allocates the output surface physically contiguous (guest kext), so this
-                 * path is the exception, logged and dropped honestly rather than mis-landed. */
-                vt_log(d, 1, "mapper id %llu: %u scattered pages (scatter copy not wired); dropping",
-                       (unsigned long long)mapping_id, r.page_count);
-                return -1;
-            }
+            const size_t ps = bridge->page_size ? (size_t)bridge->page_size : 4096u;
             size_t y_stride = (r.plane_count >= 1 && r.planes[0].bytes_per_row)
                                   ? (size_t)r.planes[0].bytes_per_row : (size_t)r.width;
             size_t uv_off = (r.plane_count >= 2) ? (size_t)r.planes[1].offset
@@ -437,7 +444,36 @@ static int vt_resolve_buffer(void *ctx, const uint8_t uuid[16], uint64_t mapping
                                    ? (size_t)r.planes[1].bytes_per_row : y_stride;
             size_t total = (size_t)(r.alloc_size ? r.alloc_size
                                                  : uv_off + uv_stride * ((r.height + 1) / 2));
-            uint8_t *p = vt_map(d, r.gpa_base, total);
+            uint8_t *p = NULL;
+            vt_landing *land = NULL;
+            if (!r.contiguous) {
+                /* Scattered guest pages (the IOSurface's own memory is not physically
+                 * contiguous): compose the frame in a host shadow of the allocation
+                 * (seeded from the guest pages so untouched bytes are preserved) and
+                 * scatter it back in vt_copy_frame. Contract: vt_scatter.h. */
+                size_t need = (size_t)r.base_offset + uv_off + uv_stride * (((size_t)r.height + 1) / 2);
+                if (total < need) total = need;
+                if (r.page_count > PVG_BRIDGE_MAX_PAGES || total > (size_t)r.page_count * ps) {
+                    vt_log(d, 1, "mapper id %llu: %u scattered pages cover less than the %zu B surface; dropping",
+                           (unsigned long long)mapping_id, r.page_count, total);
+                    return -1;
+                }
+                land = calloc(1, sizeof *land);
+                if (land) land->shadow = malloc(total);
+                if (!land || !land->shadow) { if (land) free(land->shadow); free(land); return -1; }
+                land->d = d; land->total = total; land->npages = r.page_count; land->page_size = ps;
+                memcpy(land->gpa_pages, r.gpa_pages, (size_t)r.page_count * sizeof(uint64_t));
+                if (vt_scatter_gather(land->shadow, total, land->gpa_pages, land->npages, ps,
+                                      vt_scatter_map, d) != VT_SCATTER_OK) {
+                    vt_log(d, 1, "mapper id %llu: scattered pages not all in the guest DMA regions (%zu B); dropping",
+                           (unsigned long long)mapping_id, total);
+                    free(land->shadow); free(land);
+                    return -1;
+                }
+                p = land->shadow;
+            } else {
+                p = vt_map(d, r.gpa_base, total);
+            }
             if (!p) {
                 vt_log(d, 1, "mapper id %llu gpa %#llx: no guest pages (%zu B) in the DMA regions",
                        (unsigned long long)mapping_id, (unsigned long long)r.gpa_base, total);
@@ -446,12 +482,13 @@ static int vt_resolve_buffer(void *ctx, const uint8_t uuid[16], uint64_t mapping
             memset(out, 0, sizeof *out);
             memcpy(out->uuid, uuid, 16);
             out->mapping_id = mapping_id;
+            out->landing = land;
             out->y = p + (size_t)r.base_offset;              out->y_stride = y_stride;
             out->uv = p + (size_t)r.base_offset + uv_off;    out->uv_stride = uv_stride;
             out->width = w; out->height = h;
-            vt_log(d, 2, "mapper id %llu resolved via bridge: gpa %#llx %ux%u y_stride %zu uv@%zu",
-                   (unsigned long long)mapping_id, (unsigned long long)r.gpa_base, w, h, y_stride,
-                   uv_off);
+            vt_log(d, 2, "mapper id %llu resolved via bridge (%s): gpa %#llx %ux%u y_stride %zu uv@%zu",
+                   (unsigned long long)mapping_id, land ? "scatter" : "contiguous",
+                   (unsigned long long)r.gpa_base, w, h, y_stride, uv_off);
             return 0;
         }
     }
@@ -484,9 +521,26 @@ static int vt_copy_frame(void *ctx, const vtpv_decoded_frame *f, const aw_out_bu
     int rc = vtpv_vaapi_read_luma(d->va, f->surface_id, b->y, b->y_stride, f->width, f->height);
     if (rc == 0 && b->uv)
         rc = vtpv_vaapi_read_chroma(d->va, f->surface_id, b->uv, b->uv_stride, f->width, f->height);
+    if (rc == 0 && b->landing) {
+        /* scattered guest surface: move the composed frame to its pages (all-or-nothing). */
+        vt_landing *l = b->landing;
+        if (vt_scatter_write(l->shadow, l->total, l->gpa_pages, l->npages, l->page_size,
+                             vt_scatter_map, d) != VT_SCATTER_OK) {
+            vt_log(d, 1, "scatter write to guest pages failed (%zu B); frame not delivered", l->total);
+            rc = -1;
+        }
+    }
     return rc;
 }
-static void vt_put_buffer(void *ctx, const aw_out_buffer *b) { (void)ctx; (void)b; }
+static void vt_put_buffer(void *ctx, const aw_out_buffer *b)
+{
+    (void)ctx;
+    if (b && b->landing) {
+        vt_landing *l = b->landing;
+        free(l->shadow);
+        free(l);
+    }
+}
 
 /* ---- queue 0 (guest->host): drain into the session engine ----------- *
  * Apple's queue 0 is asymmetric: each chain is one message plus a 4-byte i32

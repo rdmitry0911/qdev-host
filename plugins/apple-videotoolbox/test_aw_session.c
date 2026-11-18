@@ -219,11 +219,14 @@ static void test_decode_exchange(void) {
     CHECK(g_open_calls == 1, "dsta opened backend decoder");
     CHECK(g_ne == 2, "dsta emits Dpba + reply (got %d)", g_ne);
     CHECK(e_type(0, &v) == AW_PARSE_OK && v.type == AW_MSG_DPBA && v.flags == AW_FLAG_HOST_REQ, "1st emission = Dpba (0x2)");
-    /* the Dpba ,val is a real bplist the framework would parse (H4) */
+    /* Reference contract (guest VideoToolbox Dpba handler, KDK 25C56 x86_64h: CopyCFDictionary(msg,",pba")
+     * -> SetPixelBufferAttributes; reims names.rs PIXEL_BUFFER_ATTRIBUTES ",pba" =pls): the attributes
+     * dict travels under ,pba as a bplist00; the guest reads NOTHING under ,val for Dpba. */
     {
-        const uint8_t *pls; size_t pl;
-        CHECK(aw_get_bytes(&v, AW_KEY_VAL, AW_VT_PLS, &pls, &pl) == AW_PARSE_OK, "Dpba carries ,val =pls");
-        CHECK(pl > 8 && aw_bplist_check(pls, pl) == 0, "Dpba ,val is a valid bplist00");
+        const uint8_t *pls = NULL; size_t pl = 0;
+        CHECK(aw_get_bytes(&v, AW_KEY_PBA, AW_VT_PLS, &pls, &pl) == AW_PARSE_OK, "Dpba carries ,pba =pls");
+        CHECK(pl > 8 && aw_bplist_check(pls, pl) == 0, "Dpba ,pba is a valid bplist00");
+        CHECK(aw_get_bytes(&v, AW_KEY_VAL, AW_VT_PLS, &pls, &pl) != AW_PARSE_OK, "Dpba does not use ,val");
     }
     CHECK(e_type(1, &v) == AW_PARSE_OK && v.type == AW_MSG_DSTA && v.flags == AW_FLAG_HOST_REPLY, "2nd emission = dsta reply (0x4)");
 
