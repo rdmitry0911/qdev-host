@@ -2862,6 +2862,71 @@ typedef struct PvgResetCall {
     qmu_status status;
 } PvgResetCall;
 
+static int pvg_restart_workers(PvgState *s);
+
+/* -[PGDevice reset] -> teardownRoot -> teardownDisplays (host decompile
+ * ParavirtualizedGraphics-host-lc.c :50724, :47818, :47793): a device reset ends
+ * every display of the old boot.  This plugin's part of it: its present/render
+ * workers stop and the display mode target and frame state it holds on the
+ * QMetal renderer are returned BEFORE qmu_session_reset_for_device_reset, so the
+ * reset drains no owned output lease of the old boot (after a VkDevice loss
+ * QMetal replaces its Vulkan context there, H-DEVLOST-B, and qmu_vk_destroy
+ * refuses a remaining lease); the mode is then published again on the
+ * Session's current renderer.  The same steps as the reload path
+ * (pvg_reload_teardown, pvg_restart_workers) without its Session quiesce: the
+ * Session lives on.  The target and frame state belong to the device loop. */
+static void pvg_display_release_call(void *opaque)
+{
+    PvgState *s = opaque;
+
+    if (s->display_target) {
+        qmu_display_target_release(s->display_target);
+        s->display_target = NULL;
+    }
+    s->display_published = false;
+    pvg_atomic_set(&s->pending_frames, 0);
+    if (s->deferred_frame_owner.state) {
+        PvgHostWork owner = s->deferred_frame_owner;
+
+        memset(&s->deferred_frame_owner, 0, sizeof(s->deferred_frame_owner));
+        pvg_host_work_unref(&owner);
+    }
+}
+
+/* Returns whether the display workers were running (and are to be restarted). */
+static bool pvg_display_reset_stop(PvgState *s)
+{
+    const bool running = s->present_started || s->render_started;
+
+    if (!running) {
+        return false;
+    }
+    pthread_mutex_lock(&s->present_lock);
+    s->present_roots_stopped = true;
+    s->present_worker_stop = true;
+    pthread_cond_signal(&s->present_cond);
+    pthread_mutex_unlock(&s->present_lock);
+    if (s->present_started) {
+        pthread_join(s->present_thread, NULL);   /* drains queued commands first */
+        s->present_started = false;
+    }
+    pthread_mutex_lock(&s->present_lock);
+    pvg_present_cancel_locked(s);
+    pthread_mutex_unlock(&s->present_lock);
+    if (s->render_started) {
+        pthread_mutex_lock(&s->render_lock);
+        s->render_stop = true;
+        pthread_cond_broadcast(&s->render_cond);
+        pthread_mutex_unlock(&s->render_lock);
+        for (int i = 0; i < PVG_RENDER_THREADS; i++) {
+            pthread_join(s->render_threads[i], NULL);   /* drains queued jobs first */
+        }
+        s->render_started = false;
+    }
+    pvg_loop_run_sync(s, pvg_display_release_call, s);
+    return true;
+}
+
 static void pvg_qmetal_device_reset_call(void *opaque)
 {
     PvgResetCall *call = opaque;
@@ -2901,11 +2966,23 @@ static void pvg_qmetal_device_reset(PvgState *s, vfu_reset_type_t type)
     if (was_quiesced) {
         pvg_memory_resume(s);
     }
+    /* teardownDisplays, host side: workers stop and the mode target returns
+     * while lookups are not blocked (render jobs read guest memory). */
+    const bool display_running = pvg_display_reset_stop(s);
     pvg_host_work_invoke(&owner, pvg_qmetal_device_reset_call, &call);
+    int display_restart = 0;
+    if (display_running) {
+        display_restart = pvg_restart_workers(s);   /* and re-publishes the mode */
+    }
     if (was_quiesced) {
         pvg_memory_quiesce(s);
     }
     pvg_host_work_unref(&owner);
+    if (display_running) {
+        pvg_log(s, "[apple-gfx-ml]%s DEVICE_RESET_LIFECYCLE type=%d phase=display_republished "
+                "target=%d restart=%d %ux%u\n", display_restart || !s->display_target ? "[reset][ERROR]" : "",
+                (int)type, s->display_target ? 1 : 0, display_restart, s->fb_width, s->fb_height);
+    }
     if (call.status == QMU_OK) {
         pvg_log(s, "[apple-gfx-ml] DEVICE_RESET_LIFECYCLE type=%d qmu_status=%d "
                 "phase=qmu_reset_complete\n", (int)type, (int)call.status);

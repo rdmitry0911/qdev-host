@@ -90,6 +90,9 @@ static int refusals, plugin_errors, qmetal_errors, log_lines;
  *   plugin_reset_ok  the plugin's "DEVICE_RESET_LIFECYCLE ... qmu_reset_complete" line;
  *   ord_*            ordinal (log line number) of the last such line, to check the order. */
 static int qmu_reset_done, plugin_reset_ok, plugin_reset_err, line_seq, ord_plugin_reset, ord_rearm;
+/* teardownDisplays, host side: the plugin returned its display mode target before the PGDevice
+ * reset and published the mode again after it ("phase=display_republished target=1 restart=0"). */
+static int display_republish_ok;
 static char last_refusal[4096];
 static pthread_mutex_t host_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -144,6 +147,10 @@ static void host_log(void *host, int level, const char *fmt, ...)
     }
     if (strstr(line, "[apple-gfx-ml][reset][ERROR]")) {
         plugin_reset_err++;
+    }
+    if (strstr(line, "DEVICE_RESET_LIFECYCLE") &&
+        strstr(line, "phase=display_republished target=1 restart=0")) {
+        display_republish_ok++;
     }
     if (strstr(line, "firmware PCI identity") && strstr(line, "armed (")) {
         ord_rearm = line_seq;
@@ -893,9 +900,26 @@ int main(int argc, char **argv)
 
         /* the reset exactly as qdev-host drives it: quiesce -> reset -> resume */
         n0 = reset_done_count();
+        const int d0 = get_int(&display_republish_ok);
         r = ops->quiesce(priv);
         rr = ops->reset(priv, VFU_RESET_DEVICE);
         ops->resume(priv);
+        /* -[PGDevice teardownDisplays] (host decompile :47793) ends the old boot's displays: the
+         * mode target held on the QMetal renderer is returned before the PGDevice reset (a reset
+         * that rebuilds a lost VkDevice refuses a remaining owned output lease) and the mode is
+         * published again on the Session's renderer; the scanout keeps its geometry. */
+        {
+            qdp_scanout so;
+
+            for (int i = 0; i < 200 && get_int(&display_republish_ok) == d0; i++) {
+                usleep(10 * 1000);   /* the host-log writer thread is asynchronous */
+            }
+            CHECK(get_int(&display_republish_ok) == d0 + 1,
+                  "device reset returned the display target and published the mode again (+%d)",
+                  get_int(&display_republish_ok) - d0);
+            CHECK(ops->get_scanout(priv, &so) && so.enabled && so.width == 1920 && so.height == 1080,
+                  "scanout after the device reset: %ux%u enabled %d", so.width, so.height, so.enabled);
+        }
         CHECK(r == 0 && rr == 0 && reset_done_count() == n0 + 1 && plugin_reset_ok >= 1 &&
               plugin_reset_err == 0,
               "VFU_RESET_DEVICE (quiesced) applied the PGDevice reset once (QMetal lifecycle lines +%d)",
