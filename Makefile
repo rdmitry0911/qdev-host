@@ -35,7 +35,7 @@ QMETAL_LIBDIR ?=
 QMETAL_RPATH ?= $(QMETAL_LIBDIR)
 UNIQ_VGPU_SRC := $(addprefix plugins/uniq-vgpu/,uniq-vgpu.c pvg-memory.c pvg-process-vm.c pvg-dmabuf.c)
 UNIQ_VGPU_HDR := plugins/uniq-vgpu/pvg.h plugins/uniq-vgpu/pvg-process-vm.h \
-                 plugins/uniq-vgpu/pvg_backing.h \
+                 plugins/uniq-vgpu/pvg_backing.h plugins/uniq-vgpu/pvg_mapper_bridge.h \
                  $(wildcard plugins/uniq-vgpu/qmu-private/*.h)
 GLIB_ONLY_CFLAGS = $(shell pkg-config --cflags glib-2.0)
 GLIB_ONLY_LIBS   = $(shell pkg-config --libs glib-2.0)
