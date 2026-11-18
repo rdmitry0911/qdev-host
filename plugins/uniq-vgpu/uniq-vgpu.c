@@ -138,6 +138,7 @@ bool pvg_qmu_vt_bind(struct pvg_qmu_vt *vt, void *handle, long lmid, const char 
         { "qmu_session_will_resume",                          (void **)&vt->session_will_resume },
         { "qmu_session_did_resume",                           (void **)&vt->session_did_resume },
         { "qmu_suspend_state_validate",                       (void **)&vt->suspend_state_validate },
+        { "qmu_suspend_state_free",                           (void **)&vt->suspend_state_free },
     };
 
     (void)dlerror();
@@ -3599,7 +3600,11 @@ static int pvg_reload_load_and_create(PvgState *s, const char *new_path)
  * rolls back to the previous library, resumed from the same blob. */
 static bool pvg_vt_can_suspend(const struct pvg_qmu_vt *vt)
 {
-    return vt && vt->session_will_suspend && vt->session_finish_suspend;
+    /* The blob is allocated by the suspending instance; a co-resident instance
+     * loaded RTLD_DEEPBIND may resolve malloc to a different allocator than the
+     * plugin's (live: mimalloc free of a glibc blob -> segfault), so the blob is
+     * copied and released by its owner's own free. */
+    return vt && vt->session_will_suspend && vt->session_finish_suspend && vt->suspend_state_free;
 }
 static bool pvg_vt_can_resume(const struct pvg_qmu_vt *vt)
 {
@@ -3644,14 +3649,19 @@ static int pvg_backend_reload_body(PvgState *s, const char *new_path, int reset)
      * vtable is still A and before the reversible stop (whose producer quiesce
      * closes root admission for good, so a drain could not finish after it). */
     if (s->qmu_dev && !reset && pvg_vt_can_suspend(pvg_qvt)) {
+        void *owned = NULL;
         int q = pvg_qvt->session_will_suspend(s->qmu_dev);
-        if (q == 0) q = pvg_qvt->session_finish_suspend(s->qmu_dev, &blob, &blob_len);
+        if (q == 0) q = pvg_qvt->session_finish_suspend(s->qmu_dev, &owned, &blob_len);
+        if (q == 0 && owned) {
+            blob = g_memdup2(owned, blob_len);        /* plugin-owned copy */
+            pvg_qvt->suspend_state_free(owned);       /* released by the instance that made it */
+        }
         if (q != 0 || !blob) {
             /* QMetal refuses e.g. with live iosfc_mapper mappings (D-MAPPER) or a
              * drain timeout; the readers may already be quiesced, so the old
              * Session cannot simply continue: fall back to the legacy re-create. */
             pvg_log(s, "[apple-gfx-ml][reload][ERROR] suspend refused (%d): reload: guest GPU state lost\n", q);
-            free(blob);
+            g_free(blob);
             blob = NULL;
         } else {
             pvg_log(s, "[apple-gfx-ml][reload] suspend state captured: %zu bytes\n", blob_len);
@@ -3669,7 +3679,7 @@ static int pvg_backend_reload_body(PvgState *s, const char *new_path, int reset)
         r = pvg_stop_phase_reversible(s);
         if (r) {
             pthread_mutex_unlock(&s->backing_lock);
-            free(blob);
+            g_free(blob);
             g_free(old_path);
             return r;
         }
@@ -3700,18 +3710,18 @@ static int pvg_backend_reload_body(PvgState *s, const char *new_path, int reset)
                 pvg_log(s, "[apple-gfx-ml][reload][ERROR] rollback failed: reload: guest GPU state lost\n");
             }
             pthread_mutex_unlock(&s->backing_lock);
-            free(blob);
+            g_free(blob);
             g_free(old_path);
             return r;
         }
     }
     if (r) {
         pthread_mutex_unlock(&s->backing_lock);
-        free(blob);
+        g_free(blob);
         g_free(old_path);
         return r;   /* device dead; caller rolls back */
     }
-    free(blob);
+    g_free(blob);
     g_free(old_path);
     r = pvg_restart_workers(s);
     if (r) {
