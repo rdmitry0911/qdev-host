@@ -487,7 +487,7 @@ static void emit_dpba(aw_engine *e, aw_dsession *s)
     aw_builder b;
     aw_builder_init(&b, buf, sizeof buf);
     aw_build_header(&b, AW_MSG_DPBA, AW_FLAG_HOST_REQ, s->uuid, next_req_id(e));
-    aw_put_bytes(&b, AW_KEY_VAL, AW_VT_PLS, pls, pls_len); /* real bplist (H4)    */
+    aw_put_bytes(&b, AW_KEY_PBA, AW_VT_PLS, pls, pls_len); /* ,pba =pls (reference: guest VT Dpba handler) */
     size_t n = aw_build_finalize(&b);
     if (n) emit(e, buf, n);
 }
