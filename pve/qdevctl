@@ -165,7 +165,8 @@ def cmd_device_reload(a):
     cp, vmid, dev_id, backing = _target(a.pos, a.control, want_backing=True)
     for m in Q.device_reload(cp, backing, reset=not a.no_reset,
                              expect_gpurestart=a.expect_gpurestart,
-                             rollback=not a.no_rollback):
+                             rollback=not a.no_rollback,
+                             allow_guest_gpu_loss=a.allow_guest_gpu_loss):
         print(m)
 
 def cmd_hook(a):
@@ -292,6 +293,9 @@ def main():
                    help="tolerated gpuRestart delta across the reload (health gate; default 0)")
     s.add_argument("--no-rollback", action="store_true",
                    help="do NOT auto-rollback to the previous backend on a health-gate failure")
+    s.add_argument("--allow-guest-gpu-loss", action="store_true",
+                   help="reload even while a guest is attached (qdev-host refuses otherwise: the re-created "
+                        "backend Session does not carry the guest-programmed device state, the guest GPU hangs)")
     s.set_defaults(fn=cmd_device_reload)
     a = p.parse_args()
     try:

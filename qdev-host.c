@@ -736,15 +736,34 @@ static void ctl_command(ctl_t *c, char *line)
          * backend Session and re-create it on a freshly loaded, co-resident
          * backend build, re-adopting device state -> resume.  The vfio-user
          * connection and the device envelope stay up (stock QEMU, device
-         * BOUND).  "reload PATH [--reset]"; --reset arms the in-place device-
+         * BOUND).  "reload PATH [--reset] [--allow-guest-gpu-loss]"; --reset arms the in-place device-
          * reset re-handshake.  On failure the device may be left down: the
          * caller (qdevctl) rolls back by reloading the previous backend. */
-        char *arg = g_strstrip(line + 6);
         uint32_t flags = 0;
-        char *sp = strstr(arg, "--reset");
-        if (sp) { flags |= QDP_RELOAD_RESET; *sp = 0; arg = g_strstrip(arg); }
+        bool allow_gpu_loss = false, bad = false;
+        char *arg = NULL, *save = NULL;
+        for (char *t = strtok_r(line + 6, " \t", &save); t; t = strtok_r(NULL, " \t", &save)) {
+            if (!strcmp(t, "--reset")) flags |= QDP_RELOAD_RESET;
+            else if (!strcmp(t, "--allow-guest-gpu-loss")) allow_gpu_loss = true;
+            else if (t[0] == '-' || arg) bad = true;
+            else arg = t;
+        }
         if (!(abi >= 4 && v2.reload)) { ctl_reply(c, "err reload unsupported by plugin"); return; }
-        if (!*arg) { ctl_reply(c, "err usage: reload PATH [--reset]"); return; }
+        if (bad || !arg) { ctl_reply(c, "err usage: reload PATH [--reset] [--allow-guest-gpu-loss]"); return; }
+        /* Guard (debt RELOAD-LIVE-REINIT): the re-created backend Session does not carry the
+         * device state the guest programmed into the old one (protocol, FIFOs, tasks/channels),
+         * so a reload under an attached guest leaves the guest GPU hung (IOAccel GPU-restart
+         * loop, frozen scanout; apple-virgl evidence/runs/reload-deadlock-20261118T2110Z).
+         * Refuse it while a vfio-user client is attached unless the operator accepts that loss
+         * explicitly.  Checked before the quiesce: a refused reload touches nothing. */
+        if (attached && !allow_gpu_loss) {
+            LOG("reload %s refused: a vfio-user client (guest) is attached and an in-process reload "
+                "leaves the guest GPU uninitialized (RELOAD-LIVE-REINIT); --allow-guest-gpu-loss overrides", arg);
+            ctl_reply(c, "err reload refused: a vfio-user client (guest) is attached; an in-process reload "
+                      "leaves the guest GPU uninitialized (RELOAD-LIVE-REINIT); add --allow-guest-gpu-loss to override");
+            return;
+        }
+        if (attached) LOG("reload %s under an attached guest: --allow-guest-gpu-loss given", arg);
         bool did_q = false;
         if (v2.quiesce) {
             if (quiesce_cb(vfu) != 0) { ctl_reply(c, "err quiesce refused"); return; }
@@ -763,7 +782,7 @@ static void ctl_command(ctl_t *c, char *line)
             ctl_reply(c, "err backend report unsupported by plugin");
     } else {
         ctl_reply(c, "err unknown command (screendump FILE | frame | stats | uiinfo W H [WMM HMM] | "
-                  "abi | swap ARG | reload PATH [--reset] | backend)");
+                  "abi | swap ARG | reload PATH [--reset] [--allow-guest-gpu-loss] | backend)");
     }
 }
 static void ctl_process(ctl_t *c)
@@ -1569,7 +1588,7 @@ static void usage(void)
         "  --qemu-qmp PATH          the VM's QMP socket: forward keyboard/mouse with input-send-event\n"
         "                           (for VMs without a graphic console; --qemu-display wins if both are given)\n"
         "  --control PATH           control socket for automation: screendump FILE | frame | stats |\n"
-        "                           uiinfo W H [WMM HMM] | abi | swap ARG | reload PATH [--reset] | backend\n"
+        "                           uiinfo W H [WMM HMM] | abi | swap ARG | reload PATH [--reset] [--allow-guest-gpu-loss] | backend\n"
         "  --kms-copy               force the copy path (no udmabuf zero-copy)\n"
         "  --stats-interval S       print stats every S seconds (SIGUSR2 prints them once)\n"
         "  -v                       verbose\n"

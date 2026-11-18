@@ -22,7 +22,7 @@ GLIB_LIBS   := $(shell pkg-config --libs gio-unix-2.0 glib-2.0)
 DRM_CFLAGS  := $(shell pkg-config --cflags libdrm)
 DRM_LIBS    := $(shell pkg-config --libs libdrm)
 CFLAGS ?= -O2 -g -Wall -Wno-unused-parameter
-PLUGINS := plugins/tb-vga/tb-vga.so plugins/test-v2/test-v2.so
+PLUGINS := plugins/tb-vga/tb-vga.so plugins/test-v2/test-v2.so plugins/test-v2/test-v2-reload.so
 
 # uniq-vgpu (a GPU on the Apple ParavirtualizedGraphics protocol) links
 # QMetal's libmlapi.so and is built only when QMETAL_INCLUDE is given:
@@ -90,6 +90,10 @@ tools/vfu-test-client: tools/vfu-test-client.c $(VFU_DEP)
 
 plugins/%.so: plugins/%.c qdp.h $(VFU_DEP)
 	$(CC) $(CFLAGS) -fPIC -shared -I. $(VFU_CFLAGS) -o $@ $< $(VFU_LIBS) -lpthread
+
+# ABI 4 variant of test-v2 (counting reload) for tools/test-reload-guard.sh
+plugins/test-v2/test-v2-reload.so: plugins/test-v2/test-v2.c qdp.h $(VFU_DEP)
+	$(CC) $(CFLAGS) -fPIC -shared -I. $(VFU_CFLAGS) -DTEST_V2_RELOAD -o $@ $< $(VFU_LIBS) -lpthread
 
 plugins/uniq-vgpu/uniq-vgpu.so: $(UNIQ_VGPU_SRC) $(UNIQ_VGPU_HDR) qdp.h $(VFU_DEP)
 	@test -n "$(QMETAL_INCLUDE)" -a -n "$(QMETAL_LIBDIR)" || \

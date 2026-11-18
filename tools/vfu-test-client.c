@@ -19,6 +19,12 @@
  *                         IRQ record into region B at HZ (quiesce check)
  *   reset                 DEVICE_RESET
  *   sleep MS
+ *   ctl SOCK PREFIX CMD   send CMD to the qdev-host --control socket SOCK and fail unless
+ *                         the reply line starts with PREFIX (runs while this client is
+ *                         attached, e.g. the reload guard: tools/test-reload-guard.sh)
+ *
+ * SOCKET "-" runs the commands without a vfio-user connection (ctl and sleep only):
+ * the same checks with no client attached.
  *
  * "dma" maps (iova, size, file, offset):
  *   A 0x00100000 4 MiB memfd1 @0x100000     B 0x40000000 4 MiB memfd1 @0x800000
@@ -42,6 +48,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <sys/mman.h>
 #include <sys/eventfd.h>
@@ -359,6 +366,30 @@ static void cmd_remap(int n, unsigned hz)
     wr(0, 0x10, 0, 4); wr(0, 0x14, 0, 4);
 }
 
+/* One control-socket request: send CMD, read one reply line, check its prefix. */
+static void cmd_ctl(const char *path, const char *prefix, const char *cmd)
+{
+    struct sockaddr_un a = { .sun_family = AF_UNIX };
+    struct timeval tv = { .tv_sec = 30 };
+    char reply[1024];
+    size_t n = 0;
+    int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+
+    snprintf(a.sun_path, sizeof(a.sun_path), "%s", path);
+    if (s < 0 || connect(s, (struct sockaddr *)&a, sizeof(a)) < 0) DIE("connect %s: %s", path, strerror(errno));
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (dprintf(s, "%s\n", cmd) < 0) DIE("control write: %s", strerror(errno));
+    while (n + 1 < sizeof(reply)) {
+        ssize_t r = read(s, reply + n, 1);
+        if (r <= 0 || reply[n] == '\n') break;
+        n++;
+    }
+    reply[n] = 0;
+    close(s);
+    check(!strncmp(reply, prefix, strlen(prefix)), "control \"%s\" -> \"%s\" (expected prefix \"%s\")",
+          cmd, reply, prefix);
+}
+
 static const char *need(int argc, char **argv, int i, const char *cmd)
 {
     if (i >= argc) DIE("%s: missing argument", cmd);
@@ -369,12 +400,16 @@ int main(int argc, char **argv)
 {
     if (argc < 2) { fprintf(stderr, "usage: vfu-test-client SOCKET CMD...  (see the comment at the top of the source)\n"); return 2; }
     struct sockaddr_un a = { .sun_family = AF_UNIX };
-    snprintf(a.sun_path, sizeof(a.sun_path), "%s", argv[1]);
-    sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (connect(sock, (struct sockaddr *)&a, sizeof(a)) < 0) DIE("connect %s: %s", argv[1], strerror(errno));
-    negotiate();
+    bool attach = strcmp(argv[1], "-") != 0;
+    if (attach) {
+        snprintf(a.sun_path, sizeof(a.sun_path), "%s", argv[1]);
+        sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (connect(sock, (struct sockaddr *)&a, sizeof(a)) < 0) DIE("connect %s: %s", argv[1], strerror(errno));
+        negotiate();
+    }
     for (int i = 2; i < argc; i++) {
         const char *c = argv[i];
+        if (!attach && strcmp(c, "ctl") && strcmp(c, "sleep")) DIE("%s needs a vfio-user connection", c);
 #define ARG(k) need(argc, argv, i + (k), c)
         if (!strcmp(c, "info")) cmd_info();
         else if (!strcmp(c, "cfg")) cmd_cfg();
@@ -403,6 +438,7 @@ int main(int argc, char **argv)
         else if (!strcmp(c, "remap")) { int n = atoi(ARG(1)); unsigned hz = atoi(ARG(2)); i += 2; cmd_remap(n, hz); }
         else if (!strcmp(c, "reset")) check(xfer(VFIO_USER_DEVICE_RESET, NULL, 0, NULL, 0, NULL, 0, NULL) == 0, "DEVICE_RESET");
         else if (!strcmp(c, "sleep")) { usleep(atoi(ARG(1)) * 1000); i++; }
+        else if (!strcmp(c, "ctl")) { cmd_ctl(ARG(1), ARG(2), ARG(3)); i += 3; }
         else DIE("unknown command %s", c);
     }
     printf("%s (%d failed checks)\n", failures ? "FAILED" : "OK", failures);

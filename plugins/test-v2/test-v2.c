@@ -511,11 +511,38 @@ static void t2_teardown(void *priv)
     free(d);
 }
 
+#ifdef TEST_V2_RELOAD
+/* test-v2-reload.so (the same source built with -DTEST_V2_RELOAD): an ABI 4 variant with a
+ * counting reload() and a backend_report() of "reloads=N", for the host-side reload guard test
+ * (tools/test-reload-guard.sh): a reload the host refuses must never reach the plugin. */
+static unsigned t2_reloads;
+
+static int t2_reload(void *priv, const char *path, uint32_t flags)
+{
+    t2_reloads++;
+    if (g) TLOG(2, "reload #%u %s flags %#x", t2_reloads, path, flags);
+    return 0;
+}
+
+static const char *t2_backend_report(void *priv, char *buf, size_t len)
+{
+    snprintf(buf, len, "reloads=%u", t2_reloads);
+    return buf;
+}
+#endif
+
 static const qdp_device_ops ops = {
+#ifdef TEST_V2_RELOAD
+    .abi_version = 4,
+    .name = "test-v2-reload",
+    .reload = t2_reload,
+    .backend_report = t2_backend_report,
+#else
     /* Stays an ABI 2 plugin (no v3 operation): the v2 compatibility check of
      * newer hosts (tools/test-abi-v2.sh). */
     .abi_version = 2,
     .name = "test-v2",
+#endif
     .version = "0.1",
     .setup = t2_setup,
     .teardown = t2_teardown,

@@ -442,7 +442,8 @@ def device_backend(control_path) -> dict:
     return _parse_backend_report(reply)
 
 def device_reload(control_path, path: str, reset: bool = True,
-                  expect_gpurestart: int = 0, rollback: bool = True) -> list[str]:
+                  expect_gpurestart: int = 0, rollback: bool = True,
+                  allow_guest_gpu_loss: bool = False) -> list[str]:
     """In-process REAL-backend reload (v4): destroy the live backend Session and
     re-create it on the freshly loaded backend at `path`, re-adopting device
     state, with the vfio-user process kept alive (stock QEMU, device BOUND).
@@ -467,8 +468,15 @@ def device_reload(control_path, path: str, reset: bool = True,
     out.append(f"pre-reload: envelope={envelope_before.split()[0] if envelope_before else '?'} "
                f"reloads={reloads0} handshake_gen={gen0} qmu_errors={errs0} prev={prev_path}")
 
-    arg = f"reload {path}" + (" --reset" if reset else "")
+    # qdev-host refuses a reload while a guest is attached (the re-created backend Session
+    # does not carry the guest-programmed device state: RELOAD-LIVE-REINIT) unless the
+    # operator accepts the guest GPU loss explicitly.
+    flags = (" --reset" if reset else "") + (" --allow-guest-gpu-loss" if allow_guest_gpu_loss else "")
+    arg = f"reload {path}" + flags
     reply = control_cmd(control_path, arg, timeout=60.0)
+    if reply.startswith("err reload refused"):
+        # refused before any quiesce: nothing changed, nothing to roll back
+        raise QdevError(f"device-reload: {reply}")
     reload_ok = reply.startswith("ok")
     if reload_ok:
         out.append(f"backend reloaded in process: {reply[len('ok'):].strip()}")
@@ -477,7 +485,7 @@ def device_reload(control_path, path: str, reset: bool = True,
         if not (rollback and prev_path):
             raise QdevError(f"device-reload failed ({reason}); no rollback target")
         out.append(f"HEALTH-GATE FAIL ({reason}); auto-rollback -> {prev_path}")
-        rb = control_cmd(control_path, f"reload {prev_path}" + (" --reset" if reset else ""),
+        rb = control_cmd(control_path, f"reload {prev_path}" + flags,
                          timeout=60.0)
         if not rb.startswith("ok"):
             raise QdevError(f"device-reload: rollback to {prev_path} FAILED: {rb}")
