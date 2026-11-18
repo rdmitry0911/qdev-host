@@ -96,6 +96,15 @@ struct pvg_qmu_vt {
      * NULL on a libmlapi older than the port of the reset lifecycle; pvg_reset
      * then logs an [ERROR] (the guest's next boot would stall) and goes on. */
     __typeof__(qmu_session_reset_for_device_reset)                    *session_reset_for_device_reset;
+    /* Optional: the PGDevice suspend/resume state hand-over (apple-virgl plan
+     * 20261118 Q4-Q6; DSGP v2 blob = reference serializeSuspendState format).
+     * Plain pointer types, so the plugin builds against an older header; NULL
+     * on a libmlapi without the port -> reload uses the legacy re-create. */
+    int (*session_will_suspend)(qmu_session *s);
+    int (*session_finish_suspend)(qmu_session *s, void **blob, size_t *length);
+    int (*session_will_resume)(qmu_session *s, const void *blob, size_t length, uint32_t *error_code);
+    int (*session_did_resume)(qmu_session *s);
+    int (*suspend_state_validate)(const void *blob, size_t length, uint32_t *error_code);
     /* identity of the instance this vtable was bound from */
     void       *handle;        /* dlopen/dlmopen handle (base = the LM_ID_BASE copy) */
     long        lmid;          /* link-map namespace id (LM_ID_BASE for the base)    */

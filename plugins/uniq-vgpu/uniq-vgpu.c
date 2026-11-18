@@ -133,6 +133,11 @@ bool pvg_qmu_vt_bind(struct pvg_qmu_vt *vt, void *handle, long lmid, const char 
         { "qmu_get_private_ordinary_task_memory_v1",          (void **)&vt->get_private_ordinary_task_memory_v1 },
         { "qmu_display_set_mode_list",                        (void **)&vt->display_set_mode_list },
         { "qmu_session_reset_for_device_reset",               (void **)&vt->session_reset_for_device_reset },
+        { "qmu_session_will_suspend",                         (void **)&vt->session_will_suspend },
+        { "qmu_session_finish_suspend",                       (void **)&vt->session_finish_suspend },
+        { "qmu_session_will_resume",                          (void **)&vt->session_will_resume },
+        { "qmu_session_did_resume",                           (void **)&vt->session_did_resume },
+        { "qmu_suspend_state_validate",                       (void **)&vt->suspend_state_validate },
     };
 
     (void)dlerror();
@@ -3526,7 +3531,10 @@ out:
     return rc;
 }
 
-static int pvg_backend_reload_body(PvgState *s, const char *new_path, int reset)
+/* Load `new_path` as a fresh co-resident libmlapi instance, switch the active
+ * vtable to it and re-create the Session on it (re-adopting the parked
+ * PvgState).  Caller holds backing_lock; on failure the device is down. */
+static int pvg_reload_load_and_create(PvgState *s, const char *new_path)
 {
     const char *miss = NULL;
     struct pvg_qmu_vt nvt;
@@ -3535,46 +3543,8 @@ static int pvg_backend_reload_body(PvgState *s, const char *new_path, int reset)
     char uniq_path[PATH_MAX];
     int r;
 
-    if (!s || !new_path || !*new_path) {
-        return -EINVAL;
-    }
-    pthread_mutex_lock(&s->backing_lock);
-
-    /* On a re-entry after a FAILED reload the Session is already NULL (dead
-     * device): skip the stop + teardown and go straight to loading a (rollback)
-     * instance.  Otherwise do the reversible quiesce + symmetric teardown. */
-    if (s->qmu_dev) {
-        r = pvg_stop_phase_reversible(s);
-        if (r) {
-            pthread_mutex_unlock(&s->backing_lock);
-            return r;
-        }
-        /* crash-safe full in-process teardown: qmu_destroy joins the four QMetal
-         * workers and releases the VkDevice, then the host owners are leak-reset.
-         * Leaves s->qmu_dev == NULL, device state parked in PvgState. */
-        pvg_reload_teardown(s);
-    }
-    g_assert(!s->qmu_dev);
-
-    /* Load the new co-resident libmlapi as an INDEPENDENT instance in the BASE
-     * link-map namespace -- NOT a dlmopen(LM_ID_NEWLM) secondary namespace.  A
-     * secondary namespace SIGSEGVs in glibc add_to_global_resize() when the host
-     * Vulkan ICD performs an internal dlopen(..., RTLD_GLOBAL) during
-     * vkCreateDevice (the proprietary NVIDIA driver does this via
-     * dlopen("libpthread.so.0"); see pvg_stamp_unique_soname_copy).  The base
-     * namespace is where BOOT's vkCreateDevice already works on every driver.
-     *
-     * glibc aliases shared objects by SONAME, so to get an independent second
-     * copy we stamp a unique DT_SONAME into a sibling copy and dlopen that by
-     * path.  RTLD_DEEPBIND makes the fresh instance resolve its own symbols
-     * first, so the BOOT instance (loaded RTLD_GLOBAL) cannot preempt its 5000+
-     * exported symbols -- giving true independence -- while undefined symbols
-     * still bind to the shared, already-resident deps.  The old instance stays
-     * mapped for the life of the process (no dlclose -> no _dl_fini under the
-     * threads it already joined); RTLD_NODELETE pins it too. */
     r = pvg_stamp_unique_soname_copy(s, new_path, uniq_path, sizeof(uniq_path));
     if (r) {
-        pthread_mutex_unlock(&s->backing_lock);
         return r;   /* old instance already destroyed: caller rolls back */
     }
     ns = dlopen(uniq_path, RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE | RTLD_DEEPBIND);
@@ -3584,7 +3554,6 @@ static int pvg_backend_reload_body(PvgState *s, const char *new_path, int reset)
     if (!ns) {
         pvg_log(s, "[apple-gfx-ml][reload][ERROR] dlopen %s (unique-soname copy of %s): %s\n",
                 uniq_path, new_path, dlerror());
-        pthread_mutex_unlock(&s->backing_lock);
         return -ENOENT;
     }
     lmid = LM_ID_BASE;
@@ -3594,7 +3563,6 @@ static int pvg_backend_reload_body(PvgState *s, const char *new_path, int reset)
         pvg_log(s, "[apple-gfx-ml][reload][ERROR] %s missing %s (not a libmlapi?)\n",
                 new_path, miss ? miss : "(unknown)");
         /* old instance already destroyed: caller must roll back to a good one */
-        pthread_mutex_unlock(&s->backing_lock);
         return -ENOSYS;
     }
     /* Switch the active vtable: every qmu_* call now targets the NEW instance. */
@@ -3618,9 +3586,133 @@ static int pvg_backend_reload_body(PvgState *s, const char *new_path, int reset)
     if (r) {
         pvg_log(s, "[apple-gfx-ml][reload][ERROR] re-create Session on %s failed: %s\n",
                 new_path, strerror(-r));
-        pthread_mutex_unlock(&s->backing_lock);
         return r;   /* device dead; caller rolls back */
     }
+    return 0;
+}
+
+/* Plan Q4-Q6 / H1 (apple-virgl analysis/20261118-QMETAL-PLAN-SUSPEND-RESUME-RELOAD.md
+ * section 3): the transparent reload carries the guest-programmed device state
+ * across the Session re-creation as Apple's VM save/restore does -- willSuspend +
+ * finishSuspend on the old Session (blob = reference DSGP v2), then
+ * willResumeWithSuspendState + didResume on the new one.  B refusing the blob
+ * rolls back to the previous library, resumed from the same blob. */
+static bool pvg_vt_can_suspend(const struct pvg_qmu_vt *vt)
+{
+    return vt && vt->session_will_suspend && vt->session_finish_suspend;
+}
+static bool pvg_vt_can_resume(const struct pvg_qmu_vt *vt)
+{
+    return vt && vt->session_will_resume && vt->session_did_resume;
+}
+static int pvg_resume_from_blob(PvgState *s, const void *blob, size_t len, const char *who)
+{
+    uint32_t code = 0;
+    int q;
+
+    if (!pvg_vt_can_resume(pvg_qvt)) {
+        pvg_log(s, "[apple-gfx-ml][reload][ERROR] %s has no suspend/resume API: state hand-over refused\n", who);
+        return -ENOSYS;
+    }
+    q = pvg_qvt->session_will_resume(s->qmu_dev, blob, len, &code);
+    if (q != 0) {
+        pvg_log(s, "[apple-gfx-ml][reload][ERROR] %s refused the suspend state (willResume code %u)\n", who, code);
+        return -EPROTO;
+    }
+    q = pvg_qvt->session_did_resume(s->qmu_dev);
+    if (q != 0) {
+        pvg_log(s, "[apple-gfx-ml][reload][ERROR] %s didResume failed (%d)\n", who, q);
+        return -EIO;
+    }
+    pvg_log(s, "[apple-gfx-ml][reload] state hand-over: %s resumed from the %zu-byte suspend state\n", who, len);
+    return 0;
+}
+
+static int pvg_backend_reload_body(PvgState *s, const char *new_path, int reset)
+{
+    void *blob = NULL;
+    size_t blob_len = 0;
+    char *old_path = NULL;
+    int r;
+
+    if (!s || !new_path || !*new_path) {
+        return -EINVAL;
+    }
+    pthread_mutex_lock(&s->backing_lock);
+
+    /* Transparent reload (no --reset): suspend the live Session first, while the
+     * vtable is still A and before the reversible stop (whose producer quiesce
+     * closes root admission for good, so a drain could not finish after it). */
+    if (s->qmu_dev && !reset && pvg_vt_can_suspend(pvg_qvt)) {
+        int q = pvg_qvt->session_will_suspend(s->qmu_dev);
+        if (q == 0) q = pvg_qvt->session_finish_suspend(s->qmu_dev, &blob, &blob_len);
+        if (q != 0 || !blob) {
+            /* QMetal refuses e.g. with live iosfc_mapper mappings (D-MAPPER) or a
+             * drain timeout; the readers may already be quiesced, so the old
+             * Session cannot simply continue: fall back to the legacy re-create. */
+            pvg_log(s, "[apple-gfx-ml][reload][ERROR] suspend refused (%d): reload: guest GPU state lost\n", q);
+            free(blob);
+            blob = NULL;
+        } else {
+            pvg_log(s, "[apple-gfx-ml][reload] suspend state captured: %zu bytes\n", blob_len);
+        }
+    } else if (s->qmu_dev && !reset) {
+        pvg_log(s, "[apple-gfx-ml][reload] current libmlapi has no suspend API: legacy reload "
+                "(guest GPU state lost)\n");
+    }
+    old_path = s->qmu_path ? g_strdup(s->qmu_path) : NULL;
+
+    /* On a re-entry after a FAILED reload the Session is already NULL (dead
+     * device): skip the stop + teardown and go straight to loading a (rollback)
+     * instance.  Otherwise do the reversible quiesce + symmetric teardown. */
+    if (s->qmu_dev) {
+        r = pvg_stop_phase_reversible(s);
+        if (r) {
+            pthread_mutex_unlock(&s->backing_lock);
+            free(blob);
+            g_free(old_path);
+            return r;
+        }
+        /* crash-safe full in-process teardown: qmu_destroy joins the four QMetal
+         * workers and releases the VkDevice, then the host owners are leak-reset.
+         * Leaves s->qmu_dev == NULL, device state parked in PvgState. */
+        pvg_reload_teardown(s);
+    }
+    g_assert(!s->qmu_dev);
+
+    r = pvg_reload_load_and_create(s, new_path);
+    if (!r && blob) {
+        r = pvg_resume_from_blob(s, blob, blob_len, new_path);
+        if (r && old_path) {
+            /* Rollback (plan section 3 step 5): B refused the state; re-create A and
+             * resume it from the SAME blob.  The reload itself still fails. */
+            int rb;
+            pvg_log(s, "[apple-gfx-ml][reload] rolling back to %s with the same suspend state\n", old_path);
+            pvg_reload_teardown(s);
+            rb = pvg_reload_load_and_create(s, old_path);
+            if (!rb) rb = pvg_resume_from_blob(s, blob, blob_len, old_path);
+            if (!rb && pvg_restart_workers(s) == 0) {
+                g_free(s->qmu_path);
+                s->qmu_path = g_strdup(old_path);
+                pvg_log(s, "[apple-gfx-ml][reload] ROLLBACK OK: %s resumed, reload of %s refused\n",
+                        old_path, new_path);
+            } else {
+                pvg_log(s, "[apple-gfx-ml][reload][ERROR] rollback failed: reload: guest GPU state lost\n");
+            }
+            pthread_mutex_unlock(&s->backing_lock);
+            free(blob);
+            g_free(old_path);
+            return r;
+        }
+    }
+    if (r) {
+        pthread_mutex_unlock(&s->backing_lock);
+        free(blob);
+        g_free(old_path);
+        return r;   /* device dead; caller rolls back */
+    }
+    free(blob);
+    g_free(old_path);
     r = pvg_restart_workers(s);
     if (r) {
         pvg_log(s, "[apple-gfx-ml][reload][ERROR] restart workers failed: %s\n", strerror(-r));
@@ -3641,7 +3733,7 @@ static int pvg_backend_reload_body(PvgState *s, const char *new_path, int reset)
 
     pvg_log(s, "[apple-gfx-ml][reload] RELOAD #%" PRIu64 " OK -> %s lmid=%ld "
             "handshake_gen=%" PRIu64 " qmu_errors=%" PRIu64 " banner='%s'\n",
-            s->reload_count, new_path, lmid, s->handshake_generation,
+            s->reload_count, new_path, s->qmu_lmid, s->handshake_generation,
             s->qmu_error_count, s->backend_banner);
     pthread_mutex_unlock(&s->backing_lock);
     return 0;
@@ -3799,9 +3891,10 @@ static const char *pvg_backend_report(void *priv, char *buf, size_t len)
     g_snprintf(buf, len,
                "envelope=%s reloads=%" PRIu64 " handshake_gen=%" PRIu64
                " qmu_errors=%" PRIu64 " gpu_restarts=%" PRIu64 " lmid=%ld instance=%p"
-               " path=%s banner='%s'",
+               " state_handover=%d path=%s banner='%s'",
                PVG_ENVELOPE_VERSION, s->reload_count, s->handshake_generation,
                s->qmu_error_count, s->qmu_gpu_restart_count, s->qmu_lmid, s->qmu_ns,
+               (pvg_vt_can_suspend(pvg_qvt) && pvg_vt_can_resume(pvg_qvt)) ? 1 : 0,
                s->qmu_path ? s->qmu_path : "?", s->backend_banner);
     pthread_mutex_unlock(&s->backing_lock);
     return buf;

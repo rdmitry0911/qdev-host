@@ -428,6 +428,12 @@ int main(int argc, char **argv)
             reload_golden = argv[i + 2];
         }
     }
+    /* --reload-noapi LIB : a libmlapi WITHOUT the suspend/resume API (an older
+     * build) for step 10e's rollback check. */
+    const char *reload_noapi = NULL;
+    for (int i = 2; i + 1 < argc; i++) {
+        if (!strcmp(argv[i], "--reload-noapi")) reload_noapi = argv[i + 1];
+    }
     setvbuf(stdout, NULL, _IOLBF, 0);
 
     /* 1. plugin ABI */
@@ -1212,6 +1218,105 @@ int main(int argc, char **argv)
                     wr(PVG_REG_FIFO_ENABLE, 0);
                 } else {
                     ops->resume(priv);
+                }
+                r = ops->quiesce(priv); ops->dma_unregister(priv, &b); ops->resume(priv);
+                free(inst);
+            }
+            /* 10e. TRANSPARENT RELOAD WITH STATE HAND-OVER (apple-virgl plan 20261118 H1): a
+             * reload WITHOUT --reset under a booted guest suspends the old Session (reference
+             * willSuspend/finishSuspend -> DSGP v2 blob) and resumes the new one from it
+             * (willResumeWithSuspendState/didResume).  The guest does NOT re-handshake: the
+             * new Session must already be past UNINITIALIZED (PROTOCOL_VERSION reads 6), its
+             * FIFO_READ continues from the old Session's, the queued rest of the ring is
+             * consumed exactly once, no handshake bump, 0 new QMU errors.  With
+             * --reload-noapi, a B without the resume API refuses the state and the plugin
+             * rolls back to A resumed from the same blob (the reload reports failure, the
+             * guest keeps running). */
+                    {
+                const uint64_t fifo_gpa = B_IOVA + 0x100000;
+                uint8_t *fifo = guest + B_FILE_OFF + 0x100000;
+                const uint32_t nops = 200, half = 12 * 100, full = 12 * 200;
+                qdp_dma_region b = { B_IOVA, B_LEN, guest + B_FILE_OFF, memfd, B_FILE_OFF,
+                                     PROT_READ | PROT_WRITE };
+                char marker[64];
+                char *inst = mint_instance(reload_golden, sib, 97, root, marker, sizeof(marker));
+                CHECK(inst != NULL, "hand-over reload: mint instance (marker=%s)", inst ? marker : "FAILED");
+                r = ops->quiesce(priv); ops->dma_register(priv, &b); ops->resume(priv);
+                if (inst) {
+                    /* The root node is its own page (as a guest allocates it): the root FIFO's
+                     * stamp memory lives at the ring base page (createRootFifo), so sharing
+                     * that page would make stamp values read as task-root words. */
+                    const uint64_t root_gpa = B_IOVA + 0x0f0000;
+                    wr(PVG_REG_FIFO_ENABLE, 0);
+                    memset(guest + B_FILE_OFF + 0x0f0000, 0, 0x1000);   /* no children, tasks, displays */
+                    wr(PVG_REG_PROTOCOL_VERSION, 6);
+                    wr(PVG_REG_SHARED_STATE_PFN, (uint32_t)(root_gpa >> 12));
+                    wr(PVG_REG_FIFO_PFN, (uint32_t)(fifo_gpa >> 12));
+                    wr(PVG_REG_FIFO_OFFSET, 0x1000);
+                    wr(PVG_REG_FIFO_SIZE, 0x10000);
+                    wr(PVG_REG_FIFO_ENABLE, 1);
+                    for (uint32_t i = 0; i < nops; i++) {
+                        uint32_t nop[3] = { 0x03, 12, 0x6000 + i };
+                        memcpy(fifo + 0x1000 + 12 * i, nop, sizeof(nop));
+                    }
+                    wr(PVG_REG_FIFO_WRITE, half);
+                    CHECK(wait_reg(PVG_REG_FIFO_READ, half, 5.0), "hand-over reload: A consumed the first half (FIFO_READ %u)",
+                          rd(PVG_REG_FIFO_READ));
+                    ops->backend_report(priv, rep, sizeof(rep));
+                    CHECK(strstr(rep, " state_handover=1 ") != NULL, "hand-over reload: backend reports state_handover=1");
+                    char hs_before[64] = "";
+                    { char *p = strstr(rep, "handshake_gen="); if (p) sscanf(p, "%63s", hs_before); }
+                    int errs_before = get_int(&qmetal_errors);
+                    double t0r = now_s();
+                    r = ops->quiesce(priv);
+                    int rr = ops->reload(priv, inst, 0);     /* transparent: no --reset */
+                    ops->resume(priv);
+                    CHECK(r == 0 && rr == 0, "hand-over reload: quiesce+reload(no reset)+resume rc=%d/%d in %.0f ms",
+                          r, rr, (now_s() - t0r) * 1000.0);
+                    usleep(50 * 1000);
+                    char banner[256]; get_live_banner(banner, sizeof(banner));
+                    CHECK(strstr(banner, marker) != NULL, "hand-over reload: NEW banner live: %s", banner);
+                    CHECK(rd(PVG_REG_PROTOCOL_VERSION) == 6, "hand-over reload: B is past UNINITIALIZED "
+                          "without a re-handshake (PROTOCOL_VERSION %u)", rd(PVG_REG_PROTOCOL_VERSION));
+                    CHECK(rd(PVG_REG_FIFO_READ) == half, "hand-over reload: B continues A's FIFO_READ (%u)",
+                          rd(PVG_REG_FIFO_READ));
+                    wr(PVG_REG_FIFO_WRITE, full);
+                    CHECK(wait_reg(PVG_REG_FIFO_READ, full, 5.0), "hand-over reload: B consumes the queued rest "
+                          "(FIFO_READ %u)", rd(PVG_REG_FIFO_READ));
+                    ops->backend_report(priv, rep, sizeof(rep));
+                    char hs_after[64] = "";
+                    { char *p = strstr(rep, "handshake_gen="); if (p) sscanf(p, "%63s", hs_after); }
+                    CHECK(!strcmp(hs_before, hs_after), "hand-over reload: no handshake bump (%s -> %s)", hs_before, hs_after);
+                    CHECK(get_int(&qmetal_errors) == errs_before, "hand-over reload: 0 new QMU [ERROR] lines (%d)",
+                          get_int(&qmetal_errors) - errs_before);
+
+                    if (reload_noapi) {
+                        char *noapi = mint_instance(reload_noapi, sib, 96, root, marker, sizeof(marker));
+                        char before_path[512] = "";
+                        ops->backend_report(priv, rep, sizeof(rep));
+                        { char *p = strstr(rep, "path="); if (p) sscanf(p, "%511s", before_path); }
+                        int errs_rb = get_int(&qmetal_errors);
+                        r = ops->quiesce(priv);
+                        rr = noapi ? ops->reload(priv, noapi, 0) : 0;
+                        ops->resume(priv);
+                        CHECK(noapi && rr != 0, "hand-over rollback: B without the resume API refuses the state (rc=%d)", rr);
+                        ops->backend_report(priv, rep, sizeof(rep));
+                        char after_path[512] = "";
+                        { char *p = strstr(rep, "path="); if (p) sscanf(p, "%511s", after_path); }
+                        CHECK(!strcmp(before_path, after_path), "hand-over rollback: A is live again (%s)", after_path);
+                        CHECK(rd(PVG_REG_PROTOCOL_VERSION) == 6 && rd(PVG_REG_FIFO_READ) == full,
+                              "hand-over rollback: A resumed from the same state (protocol %u, FIFO_READ %u)",
+                              rd(PVG_REG_PROTOCOL_VERSION), rd(PVG_REG_FIFO_READ));
+                        uint32_t nop[3] = { 0x03, 12, 0x6fff };
+                        memcpy(fifo + 0x1000 + full, nop, sizeof(nop));
+                        wr(PVG_REG_FIFO_WRITE, full + 12);
+                        CHECK(wait_reg(PVG_REG_FIFO_READ, full + 12, 5.0), "hand-over rollback: A consumes new work "
+                              "(FIFO_READ %u)", rd(PVG_REG_FIFO_READ));
+                        printf("INFO hand-over rollback: QMU [ERROR] lines during the refused reload: %d (expected: the refusal)\n",
+                               get_int(&qmetal_errors) - errs_rb);
+                        free(noapi);
+                    }
+                    wr(PVG_REG_FIFO_ENABLE, 0);
                 }
                 r = ops->quiesce(priv); ops->dma_unregister(priv, &b); ops->resume(priv);
                 free(inst);

@@ -756,14 +756,27 @@ static void ctl_command(ctl_t *c, char *line)
          * loop, frozen scanout; apple-virgl evidence/runs/reload-deadlock-20261118T2110Z).
          * Refuse it while a vfio-user client is attached unless the operator accepts that loss
          * explicitly.  Checked before the quiesce: a refused reload touches nothing. */
-        if (attached && !allow_gpu_loss) {
+        /* The backend reports state_handover=1 when its live Session can be suspended
+         * and a resuming build re-adopts the guest-programmed device state (PGDevice
+         * suspend/resume port, DSGP v2 blob; a refusing new build rolls back to the
+         * old one with the same state).  A transparent reload (no --reset) under an
+         * attached guest then needs no override. */
+        bool handover = false;
+        if (attached && !(flags & QDP_RELOAD_RESET) && abi >= 4 && v2.backend_report) {
+            char rep[512];
+            if (v2.backend_report(priv, rep, sizeof(rep)) && strstr(rep, " state_handover=1 "))
+                handover = true;
+        }
+        if (attached && handover)
+            LOG("reload %s under an attached guest: backend state hand-over (suspend/resume)", arg);
+        if (attached && !allow_gpu_loss && !handover) {
             LOG("reload %s refused: a vfio-user client (guest) is attached and an in-process reload "
                 "leaves the guest GPU uninitialized (RELOAD-LIVE-REINIT); --allow-guest-gpu-loss overrides", arg);
             ctl_reply(c, "err reload refused: a vfio-user client (guest) is attached; an in-process reload "
                       "leaves the guest GPU uninitialized (RELOAD-LIVE-REINIT); add --allow-guest-gpu-loss to override");
             return;
         }
-        if (attached) LOG("reload %s under an attached guest: --allow-guest-gpu-loss given", arg);
+        if (attached && !handover) LOG("reload %s under an attached guest: --allow-guest-gpu-loss given", arg);
         bool did_q = false;
         if (v2.quiesce) {
             if (quiesce_cb(vfu) != 0) { ctl_reply(c, "err quiesce refused"); return; }
