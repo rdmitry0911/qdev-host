@@ -438,8 +438,15 @@ static int vt_resolve_buffer(void *ctx, const uint8_t uuid[16], uint64_t mapping
             const size_t ps = bridge->page_size ? (size_t)bridge->page_size : 4096u;
             size_t y_stride = (r.plane_count >= 1 && r.planes[0].bytes_per_row)
                                   ? (size_t)r.planes[0].bytes_per_row : (size_t)r.width;
+            /* Plane addresses (IOSurface semantics, guest descriptor = reference
+             * populate_plane_descriptor): kIOSurfacePlaneOffset is the plane's offset
+             * from the START OF THE BUFFER, so a planar surface's planes are addressed
+             * buffer + planes[i].offset; base_offset (kIOSurfaceOffset) places only a
+             * non-planar image. */
+            const int planar = r.plane_count >= 1;
+            size_t y_off = planar ? (size_t)r.planes[0].offset : (size_t)r.base_offset;
             size_t uv_off = (r.plane_count >= 2) ? (size_t)r.planes[1].offset
-                                                 : y_stride * (size_t)r.height;
+                                                 : y_off + y_stride * (size_t)r.height;
             size_t uv_stride = (r.plane_count >= 2 && r.planes[1].bytes_per_row)
                                    ? (size_t)r.planes[1].bytes_per_row : y_stride;
             size_t total = (size_t)(r.alloc_size ? r.alloc_size
@@ -451,7 +458,7 @@ static int vt_resolve_buffer(void *ctx, const uint8_t uuid[16], uint64_t mapping
                  * contiguous): compose the frame in a host shadow of the allocation
                  * (seeded from the guest pages so untouched bytes are preserved) and
                  * scatter it back in vt_copy_frame. Contract: vt_scatter.h. */
-                size_t need = (size_t)r.base_offset + uv_off + uv_stride * (((size_t)r.height + 1) / 2);
+                size_t need = uv_off + uv_stride * (((size_t)r.height + 1) / 2);
                 if (total < need) total = need;
                 if (r.page_count > PVG_BRIDGE_MAX_PAGES || total > (size_t)r.page_count * ps) {
                     vt_log(d, 1, "mapper id %llu: %u scattered pages cover less than the %zu B surface; dropping",
@@ -483,8 +490,11 @@ static int vt_resolve_buffer(void *ctx, const uint8_t uuid[16], uint64_t mapping
             memcpy(out->uuid, uuid, 16);
             out->mapping_id = mapping_id;
             out->landing = land;
-            out->y = p + (size_t)r.base_offset;              out->y_stride = y_stride;
-            out->uv = p + (size_t)r.base_offset + uv_off;    out->uv_stride = uv_stride;
+            out->y = p + y_off;                             out->y_stride = y_stride;
+            out->uv = p + uv_off;                           out->uv_stride = uv_stride;
+            vt_log(d, 1, "mapper id %llu layout: base_off %llu planes %u y_off %zu y_stride %zu uv_off %zu uv_stride %zu alloc %llu",
+                   (unsigned long long)mapping_id, (unsigned long long)r.base_offset, r.plane_count,
+                   y_off, y_stride, uv_off, uv_stride, (unsigned long long)r.alloc_size);
             out->width = w; out->height = h;
             vt_log(d, 2, "mapper id %llu resolved via bridge (%s): gpa %#llx %ux%u y_stride %zu uv@%zu",
                    (unsigned long long)mapping_id, land ? "scatter" : "contiguous",
