@@ -50,6 +50,13 @@ timeout 10 python3 tools/qdev-control.py "$RUN/ctl.sock" "uiinfo 1600 900" "uiin
 grep -q "< err plugin has no ui_info (ABI 2)" "$OUT/t2-display.uiinfo.log" && grep -q "< err usage: uiinfo W H \[WMM HMM\]" "$OUT/t2-display.uiinfo.log" \
     && grep -q "< ok [0-9]* 640x480" "$OUT/t2-display.uiinfo.log" && grep -q "plugin test-v2 0.1 (ABI 2" "$OUT/t2-display.host.log"
 result $? "uiinfo to the ABI 2 plugin: 'err plugin has no ui_info (ABI 2)', usage error, scanout unchanged"
+# Display1 SetUIInfo to the same plugin: QEMU's reply for a console without ui_info
+# (ui/dbus-console.c: org.qemu.Display1.Error.Unsupported "SetUIInfo is not supported");
+# a zero side completes without asking the plugin (tools/display1-uiinfo-test.c)
+timeout 10 ./tools/display1-uiinfo-test "unix:path=$RUN/d1.sock" 1630 572 org.qemu.Display1.Error.Unsupported \
+    "SetUIInfo is not supported" > "$OUT/t2-display.setuiinfo.log" 2>&1 \
+    && timeout 10 ./tools/display1-uiinfo-test "unix:path=$RUN/d1.sock" 0 572 ok >> "$OUT/t2-display.setuiinfo.log" 2>&1
+result $? "Display1 SetUIInfo to the ABI 2 plugin: Error.Unsupported 'SetUIInfo is not supported'; 0x572 completes"
 stop_host
 
 step "test-v2: initial get_scanout() after setup (no frame_ready), QDP_RESET_EXIT on the lost client"

@@ -3044,42 +3044,59 @@ static void pvg_dma_unregister(void *priv, const qdp_dma_region *region)
  * Physical size: the request's mm, or (provisional policy, to be measured)
  * 4.8 px/mm, i.e. the reference 1920 px over 400 mm. */
 
-/* NULL when one requested mode can be offered, else the reason:
- * - 1..65535 per side: u16 fields of the display shared-state page;
- * - at least 800x600 (design policy: the viewer's minimum window);
+/* NULL when one requested mode can be offered, else the reason. The size
+ * limits are the reference's; there is no minimum other than 1x1:
+ * - 1..65535 per side. Host: -[_PGDisplayNub testUpdateModeList:] writes each
+ *   mode's width/height as u16 fields (+0x210/+0x212 of a 16-byte entry; at
+ *   most 0x80 entries) of the display shared-state page
+ *   (ParavirtualizedGraphics-host-lc.c:53052-53210); -[_PGDisplayMode
+ *   initWithSizeInPixels:refreshRateInHz:] validates no size (:76210) and
+ *   -[_PGDisplay setModeList:] only needs a non-empty list (:76857). Guest:
+ *   edidInit encodes (w-1),(h-1) as u16 in the DisplayID type-I timing
+ *   (com.apple.driver.AppleParavirtGPU.c:261-430) and
+ *   AppleParavirtFramebuffer::validateDetailedTiming takes horizontal and
+ *   vertical active < 0x10000, blanking <= 0x10000 (:5973);
  * - at most 16777216 pixels: at 4 bytes they fit the reference framebuffer's
  *   64 MiB IOFBMemorySize (and the eee1 primary backing);
  * - the guest's edidInit (AppleParavirtGPU 25C56, 0x6a4) drops a mode whose
  *   DisplayID pixel clock ((h+10000)(w+10000)*refresh16 + 0x270fffff) /
- *   0x27100000 exceeds 0x1000000 (10 kHz units); a single-mode list would
- *   then leave the guest without a mode;
+ *   0x27100000 exceeds 0x1000000 (10 kHz units; blanking fixed at 9999+1)
+ *   ("Dropping unsupportable displayMode"); a single-mode list would then
+ *   leave the guest without a mode. validateDetailedTiming's upper bound,
+ *   max pixel clock <= 0x2710000000 Hz, is the same limit in Hz. Its lower
+ *   bound, min pixel clock > 9999 Hz, always holds: the clock is rounded up
+ *   to whole 10 kHz units, so any accepted mode has at least 10000 Hz (1x1 at
+ *   60 Hz is 600121 units), and no check is needed. Within the two limits
+ *   above, 60 Hz cannot exceed the clock (the largest, 65535x256, is 4648122
+ *   units); it is checked before the 60 Hz rule so that it stays in force
+ *   when E1 adds rates (65535x256 reaches it from 216.568 Hz). The guest
+ *   compares the clock truncated to 32 bits; the full value is compared here,
+ *   since the DisplayID field holds only 24 bits;
  * - 60 Hz only: another rate needs the eee1 kext's VBL period port first
  *   (design debt E1). */
 static const char *pvg_ui_info_refusal(const qdp_ui_info *in)
 {
-    uint64_t refresh16, clock;
+    uint64_t refresh16;
+    unsigned __int128 clock;
 
     if (in->flags) {
         return "unknown flags";
     }
-    if (in->refresh_mhz != 60000) {
-        return "only 60 Hz is offered (eee1 VBL period port E1 pending)";
-    }
     if (!in->width || !in->height || in->width > 0xffff || in->height > 0xffff) {
         return "a side outside 1..65535";
-    }
-    if (in->width < 800 || in->height < 600) {
-        return "smaller than 800x600";
     }
     if ((uint64_t)in->width * in->height > 16777216ull) {
         return "more than 16777216 pixels (64 MiB framebuffer)";
     }
-    /* testUpdateModeList: floor(Hz * 65536 + 0.5) */
+    /* testUpdateModeList: floor(Hz * 65536 + 0.5); 128 bits: any u32 mHz */
     refresh16 = ((uint64_t)in->refresh_mhz * 65536u + 500u) / 1000u;
-    clock = (((uint64_t)in->height + 10000) * ((uint64_t)in->width + 10000) * refresh16 +
-             0x270fffffull) / 0x27100000ull;
-    if ((uint32_t)clock > 0x1000000u) {
+    clock = (((unsigned __int128)in->height + 10000) * ((uint64_t)in->width + 10000) * refresh16 +
+             0x270fffffu) / 0x27100000u;
+    if (clock > 0x1000000u) {
         return "pixel clock above the guest EDID limit";
+    }
+    if (in->refresh_mhz != 60000) {
+        return "only 60 Hz is offered (eee1 VBL period port E1 pending)";
     }
     return NULL;
 }

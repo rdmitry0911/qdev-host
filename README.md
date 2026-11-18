@@ -486,7 +486,16 @@ fullscreen entered or left) in device pixels, with the physical size when known
 (`0` = unknown). It runs on the main loop and returns `0` (accepted),
 `QDP_UI_INFO_UNCHANGED` or `-errno`. The plugin decides what the guest is offered;
 the scanout follows when the guest presents at the new size. A v1 or v2 plugin
-loads as before; `SetUIInfo` is then accepted and ignored.
+loads as before. The result is the `SetUIInfo` reply, with the error names of
+QEMU's own console (`ui/dbus-console.c`, `ui/dbus-error.c`): `0` and
+`QDP_UI_INFO_UNCHANGED` complete the call; `-ENOTSUP` (no `ui_info()` in the
+plugin, or it does not follow UI sizes) answers
+`org.qemu.Display1.Error.Unsupported` "SetUIInfo is not supported", as QEMU does
+for a console without `ui_info`; `-EINVAL` (outside the device's mode limits;
+the plugin logs which) answers `org.qemu.Display1.Error.Invalid`; any other
+error `org.qemu.Display1.Error.Failed`. A request with a zero side completes
+without reaching the plugin. uniq-vgpu's limits are the reference's: 1..65535
+pixels per side, at most 16777216 pixels, the guest EDID's pixel clock, 60 Hz.
 
 Version 1:
 

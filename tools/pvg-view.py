@@ -35,7 +35,8 @@ ap.add_argument('--size', default='1600x900'); ap.add_argument('--title', defaul
 ap.add_argument('--guest-size', default=None); ap.add_argument('--no-resize', action='store_true')
 a = ap.parse_args()
 W, H = (int(v) for v in a.size.split('x'))
-MIN_W, MIN_H = 800, 600          # device pixels; the uniq-vgpu plugin refuses less
+MIN_W, MIN_H = 800, 600          # device pixels: the viewer's own minimum window (the
+                                 # uniq-vgpu plugin accepts 1x1 and up)
 SETTLE_S = 1.0                   # quiet time before a window size is requested
 
 # evdev keycode -> QEMU qnum (AT set 1; extended keys get 0x80|code)

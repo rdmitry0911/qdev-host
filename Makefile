@@ -61,7 +61,7 @@ ifneq ($(VIDEOTOOLBOX),)
 PLUGINS += $(VT_DIR)/apple-videotoolbox.so
 endif
 
-all: qdev-host $(PLUGINS) tools/display1-input-bench tools/vfu-test-client pve/libqdev-vugpu-guard.so
+all: qdev-host $(PLUGINS) tools/display1-input-bench tools/display1-uiinfo-test tools/vfu-test-client pve/libqdev-vugpu-guard.so
 
 vfu: $(VFU_LOCAL)/lib/libvfio-user.so.0
 
@@ -78,11 +78,20 @@ dbus/dbus-display1.c dbus/dbus-display1.h: dbus/dbus-display1.xml
 	cd dbus && gdbus-codegen dbus-display1.xml --glib-min-required 2.64 --output-directory . \
 	    --interface-prefix org.qemu. --c-namespace QemuDBus --generate-c-code dbus-display1
 
-qdev-host: qdev-host.c kms-sink.c kms-sink.h dbus/dbus-display1.c dbus/dbus-display1.h qdp.h $(VFU_DEP)
+qdev-host: qdev-host.c kms-sink.c kms-sink.h ui-info-reply.h dbus/dbus-display1.c dbus/dbus-display1.h qdp.h $(VFU_DEP)
 	$(CC) $(CFLAGS) -I. $(VFU_CFLAGS) $(GLIB_CFLAGS) $(DRM_CFLAGS) -o $@ qdev-host.c kms-sink.c dbus/dbus-display1.c $(VFU_LIBS) $(GLIB_LIBS) $(DRM_LIBS) -ldl -lpthread
 
 tools/display1-input-bench: tools/display1-input-bench.c
 	$(CC) $(CFLAGS) $(GLIB_CFLAGS) -o $@ $< $(GLIB_LIBS)
+
+# Display1 SetUIInfo reply of qdev-host (ui-info-reply.h): unit cases without
+# arguments ("make ui-info-reply-test"), a live call against a running
+# qdev-host with ADDRESS W H EXPECT (tools/test-abi-v2.sh).
+tools/display1-uiinfo-test: tools/display1-uiinfo-test.c ui-info-reply.h qdp.h $(VFU_DEP)
+	$(CC) $(CFLAGS) -I. $(VFU_CFLAGS) $(GLIB_CFLAGS) -o $@ $< $(GLIB_LIBS)
+
+ui-info-reply-test: tools/display1-uiinfo-test
+	tools/display1-uiinfo-test
 
 # test client for plugins without a VM: speaks vfio-user itself, needs only the protocol header
 tools/vfu-test-client: tools/vfu-test-client.c $(VFU_DEP)
@@ -147,7 +156,7 @@ install: all
 	install -D -m 644 plugins/tb-vga/edid-1280x800.bin $(DESTDIR)$(PREFIX)/share/qdev-host/edid-1280x800.bin
 
 clean:
-	rm -f qdev-host plugins/*/*.so pve/libqdev-vugpu-guard.so plugins/uniq-vgpu/selftest tools/display1-input-bench tools/vfu-test-client dbus/dbus-display1.c dbus/dbus-display1.h
+	rm -f qdev-host plugins/*/*.so pve/libqdev-vugpu-guard.so plugins/uniq-vgpu/selftest tools/display1-input-bench tools/display1-uiinfo-test tools/vfu-test-client dbus/dbus-display1.c dbus/dbus-display1.h
 	rm -rf $(VT_DIR)/build
 
 distclean: clean
@@ -155,4 +164,4 @@ distclean: clean
 
 PREFIX ?= /usr/local
 comma := ,
-.PHONY: all clean distclean install vfu uniq-vgpu-selftest
+.PHONY: all clean distclean install vfu uniq-vgpu-selftest ui-info-reply-test
