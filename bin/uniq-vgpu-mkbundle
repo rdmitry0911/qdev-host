@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""uniq-vgpu-mkbundle: assemble a uniq-vgpu update bundle.
+
+A bundle is the unit `uniq-vgpu update` consumes: a directory with a manifest,
+a SHA256SUMS over every file, and the payload (a VARIABLE backing .so for a
+host-backend warm swap). The manifest's ENVELOPE tag is what the ABI-gate
+compares against the running resident.
+
+  uniq-vgpu-mkbundle OUTDIR --name NAME --version VER --envelope ENV \
+      [--kind host-backend] [--backing PATH.so]
+
+Example (VT host-backend warm bundle from increment 1's backing):
+  uniq-vgpu-mkbundle /tmp/vt-hevc --name vt-hevc --version 0.3-warmswapB \
+      --envelope vtpv-envelope-1 --backing .../build/backing_B.so
+"""
+import argparse, hashlib, json, os, shutil, sys
+
+MANIFEST = "uniq-vgpu-bundle.json"
+SCHEMA = "uniq-vgpu-bundle/1"
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="uniq-vgpu-mkbundle", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("outdir")
+    ap.add_argument("--name", required=True)
+    ap.add_argument("--version", required=True)
+    ap.add_argument("--envelope", required=True, help="ENVELOPE tag (the ABI-gate key)")
+    ap.add_argument("--kind", default="host-backend")
+    ap.add_argument("--backing", help="path to the VARIABLE backing .so (host-backend)")
+    ap.add_argument("--extra", action="append", default=[],
+                    help="extra file to include as RELPATH=SRCPATH (repeatable)")
+    a = ap.parse_args()
+
+    out = os.path.abspath(a.outdir)
+    os.makedirs(out, exist_ok=True)
+    manifest = {"schema": SCHEMA, "name": a.name, "version": a.version,
+                "envelope": a.envelope, "kind": a.kind}
+
+    if a.backing:
+        os.makedirs(os.path.join(out, "backing"), exist_ok=True)
+        rel = os.path.join("backing", os.path.basename(a.backing))
+        shutil.copyfile(a.backing, os.path.join(out, rel))
+        manifest["backing"] = rel
+
+    for spec in a.extra:
+        rel, _, src = spec.partition("=")
+        if not src:
+            sys.exit(f"--extra must be RELPATH=SRCPATH: {spec}")
+        dst = os.path.join(out, rel)
+        os.makedirs(os.path.dirname(dst) or out, exist_ok=True)
+        shutil.copyfile(src, dst)
+
+    with open(os.path.join(out, MANIFEST), "w") as f:
+        json.dump(manifest, f, indent=2)
+        f.write("\n")
+
+    # SHA256SUMS over every file except SHA256SUMS itself
+    lines = []
+    for root, _, files in os.walk(out):
+        for fn in sorted(files):
+            if fn == "SHA256SUMS":
+                continue
+            fp = os.path.join(root, fn)
+            rel = os.path.relpath(fp, out)
+            lines.append(f"{sha256_file(fp)}  ./{rel}")
+    lines.sort(key=lambda l: l.split("  ", 1)[1])
+    with open(os.path.join(out, "SHA256SUMS"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+    print(f"bundle written: {out}")
+    print(f"  name={a.name} version={a.version} envelope={a.envelope} kind={a.kind}")
+    if a.backing:
+        print(f"  backing={manifest['backing']}")
+    print(f"  {len(lines)} file(s) in SHA256SUMS")
+
+
+if __name__ == "__main__":
+    main()

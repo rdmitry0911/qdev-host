@@ -1,0 +1,598 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""uniq-vgpu: one-command live-update for the uniq-vGPU host stack.
+
+Increment 3 of the fixed-resident-kext / variable-host-backend architecture
+(see evidence/runs/applegva-warmswap-20261116/WARM-SWAP-ARCHITECTURE.md). A THIN
+wrapper over the PROVEN increment-1 warm-swap primitives `qdevctl device-swap`
+and `qdevctl device-abi`; it ORCHESTRATES, it does not reimplement them.
+
+  uniq-vgpu update <bundle> [TARGET] [--dry-run] [--reset hotplug] ...
+                 verify -> envelope ABI-gate (warm vs reboot) -> stage ->
+                 device-swap -> HEALTH GATE -> commit; auto-rollback on failure.
+  uniq-vgpu rollback [TARGET]        symmetric warm swap back to the previous bundle
+  uniq-vgpu status  [TARGET]         active bundle + envelope/ABI + ioreg triplet + health
+
+TARGET selects the device the primitives act on, and is passed straight through
+to qdevctl:
+  --control PATH        a qdev-host --control socket (raw/off-VM/bring-up harness)
+  VMID ID               a PVE qdev-host device (resolves its control socket)
+
+A BUNDLE is a directory holding:
+  uniq-vgpu-bundle.json   manifest: {schema,name,version,envelope,kind,backing}
+  SHA256SUMS              sha256 of every bundle file (verify gate; verify.sh-style)
+  <payload...>            e.g. backing/<name>.so  (the VARIABLE backing to swap in)
+
+The ABI-gate compares the bundle's ENVELOPE tag to the running resident's
+envelope (read live via `qdevctl device-abi`). SAME envelope => WARM path (even
+if the bundle ADDS commands/capabilities); DIFFERENT envelope => REBOOT required
+(the frozen conduit/handshake changed) -- staged, never silently rebooted.
+"""
+import argparse, hashlib, json, os, shutil, subprocess, sys, tempfile, time
+
+BUNDLE_MANIFEST = "uniq-vgpu-bundle.json"
+BUNDLE_SCHEMA = "uniq-vgpu-bundle/1"
+SHA256SUMS = "SHA256SUMS"
+DEFAULT_STATE_DIR = os.environ.get("UNIQ_VGPU_STATE_DIR", "/var/lib/uniq-vgpu")
+
+# distinct, scriptable exit codes
+EX_OK = 0
+EX_ERR = 1            # usage / verify / primitive error
+EX_HEALTH = 3        # health gate failed (auto-rollback performed)
+EX_REBOOT = 20       # update staged but needs a guest reboot (envelope changed)
+
+
+class UpdateError(Exception):
+    pass
+
+
+# --------------------------------------------------------------- small helpers
+def log(msg):
+    print(msg, flush=True)
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def find_qdevctl(explicit):
+    if explicit:
+        return explicit
+    # next to this script's repo (bin/uniq-vgpu -> pve/qdevctl), then PATH, then PVE install
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, "..", "pve", "qdevctl"),
+                 shutil.which("qdevctl"),
+                 "/usr/sbin/qdevctl", "/usr/bin/qdevctl"):
+        if cand and os.path.exists(cand):
+            return os.path.abspath(cand)
+    raise UpdateError("qdevctl not found (use --qdevctl PATH)")
+
+
+# --------------------------------------------------------- qdevctl primitive wrappers
+class Primitives:
+    """Thin shell-out wrapper over the increment-1 warm-swap primitives."""
+
+    def __init__(self, qdevctl, target):
+        self.qdevctl = qdevctl
+        self.target = list(target)   # ['--control', PATH]  or  ['VMID', 'ID']
+
+    def _run(self, *extra):
+        cmd = [sys.executable, self.qdevctl] + list(extra)
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+
+    def device_abi(self):
+        """-> dict(envelope, plugin, version, qdp_abi, raw)."""
+        rc, out, err = self._run("device-abi", *self.target)
+        if rc != 0:
+            raise UpdateError(f"device-abi failed: {err or out}")
+        d = {"raw": out}
+        for tok in out.split():
+            if "=" in tok:
+                k, v = tok.split("=", 1)
+                d[k] = v
+        if "envelope" not in d:
+            raise UpdateError(f"device-abi: no envelope in reply: {out!r}")
+        return d
+
+    def device_swap(self, backing, reset=None):
+        args = ["device-swap"]
+        # --control must precede positionals; VMID ID are positionals before BACKING
+        if self.target and self.target[0] == "--control":
+            args += self.target + [backing]
+        else:
+            args += self.target + [backing]
+        if reset:
+            args += ["--reset", reset]
+        rc, out, err = self._run(*args)
+        if rc != 0:
+            raise UpdateError(f"device-swap {backing} failed: {err or out}")
+        return out
+
+
+# ------------------------------------------------------------------- the bundle
+class Bundle:
+    def __init__(self, path):
+        self.path = os.path.abspath(path)
+        if not os.path.isdir(self.path):
+            raise UpdateError(f"bundle not a directory: {self.path}")
+        mpath = os.path.join(self.path, BUNDLE_MANIFEST)
+        if not os.path.exists(mpath):
+            raise UpdateError(f"not a uniq-vgpu bundle (no {BUNDLE_MANIFEST}): {self.path}")
+        with open(mpath) as f:
+            self.manifest = json.load(f)
+        for k in ("name", "version", "envelope", "kind"):
+            if k not in self.manifest:
+                raise UpdateError(f"bundle manifest missing '{k}'")
+
+    @property
+    def name(self):
+        return self.manifest["name"]
+
+    @property
+    def envelope(self):
+        return self.manifest["envelope"]
+
+    @property
+    def kind(self):
+        return self.manifest["kind"]
+
+    @property
+    def version(self):
+        return self.manifest["version"]
+
+    def backing_path(self):
+        b = self.manifest.get("backing")
+        if not b:
+            raise UpdateError(f"bundle '{self.name}' has no 'backing' (kind={self.kind})")
+        p = os.path.join(self.path, b)
+        if not os.path.exists(p):
+            raise UpdateError(f"bundle backing missing on disk: {b}")
+        return p
+
+    # ------- verify: sha of every bundle file (verify.sh-style), portable core
+    def verify(self):
+        """Check every file against SHA256SUMS. Returns (ok, lines)."""
+        sums = os.path.join(self.path, SHA256SUMS)
+        if not os.path.exists(sums):
+            raise UpdateError(f"bundle has no {SHA256SUMS}")
+        out = []
+        ok = True
+        with open(sums) as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not line.strip():
+                    continue
+                want, _, rel = line.partition("  ")
+                rel = rel.lstrip("./") if rel else rel
+                fp = os.path.join(self.path, rel)
+                if not os.path.exists(fp):
+                    out.append(f"MISSING  {rel}")
+                    ok = False
+                    continue
+                got = sha256_file(fp)
+                if got == want:
+                    out.append(f"OK       {rel}")
+                else:
+                    out.append(f"MISMATCH {rel} (want {want[:12]} got {got[:12]})")
+                    ok = False
+        # A layout-specific release verify.sh (ldd gate) is honored when present.
+        vsh = os.path.join(self.path, "tools", "verify.sh")
+        if os.path.exists(vsh):
+            p = subprocess.run(["sh", vsh, self.path], capture_output=True, text=True)
+            out.append(f"verify.sh: {'OK' if p.returncode == 0 else 'FAIL'} "
+                       f"({(p.stdout + p.stderr).strip().splitlines()[-1] if (p.stdout+p.stderr).strip() else ''})")
+            ok = ok and p.returncode == 0
+        return ok, out
+
+
+# ------------------------------------------------------------------- state file
+class State:
+    """Durable record of the active + previous bundle for commit/rollback."""
+
+    def __init__(self, state_dir):
+        self.dir = os.path.abspath(state_dir)
+        self.file = os.path.join(self.dir, "state.json")
+        self.stage_dir = os.path.join(self.dir, "backings")
+        self.data = {}
+        if os.path.exists(self.file):
+            with open(self.file) as f:
+                self.data = json.load(f)
+
+    def save(self):
+        os.makedirs(self.dir, exist_ok=True)
+        tmp = self.file + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self.file)
+
+    def stage_backing(self, src, name):
+        """Copy a backing alongside the active one, atomically. Returns dst path."""
+        os.makedirs(self.stage_dir, exist_ok=True)
+        digest = sha256_file(src)[:16]
+        dst = os.path.join(self.stage_dir, f"{name}-{digest}{os.path.splitext(src)[1]}")
+        fd, tmp = tempfile.mkstemp(dir=self.stage_dir, prefix=".stage-")
+        os.close(fd)
+        shutil.copyfile(src, tmp)
+        with open(tmp, "rb") as f:
+            os.fsync(f.fileno())
+        os.replace(tmp, dst)
+        return dst
+
+
+# ------------------------------------------------------------------ health gate
+def read_health(args):
+    """Collect counters from the configured source. Returns dict (any subset of
+    qmu_error, panics, gpu_hang, gpuRestart) or {} if no source. Missing keys are
+    'not applicable', present keys are gated."""
+    counters = {}
+    if args.health_cmd:
+        p = subprocess.run(args.health_cmd, shell=True, capture_output=True, text=True)
+        txt = p.stdout.strip()
+        parsed = None
+        try:
+            parsed = json.loads(txt)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            for k, v in parsed.items():
+                counters[_norm_key(k)] = int(v)
+        else:
+            for tok in txt.replace(",", " ").split():
+                if "=" in tok:
+                    k, v = tok.split("=", 1)
+                    try:
+                        counters[_norm_key(k)] = int(v)
+                    except ValueError:
+                        pass
+    if args.health_log and os.path.exists(args.health_log):
+        txt = open(args.health_log, errors="replace").read()
+        low = txt.lower()
+        counters.setdefault("qmu_error", low.count("qmu error"))
+        counters.setdefault("panics", _count_words(low, ("panic",)))
+        counters.setdefault("gpu_hang", low.count("gpu_hang") + low.count("gpu hang"))
+        counters.setdefault("gpuRestart", _count_substr(txt, ("gpurestart",)))
+    return counters
+
+
+def _norm_key(k):
+    k = k.strip().lower().replace(" ", "_").replace("-", "_")
+    if k in ("gpurestart", "gpu_restart"):
+        return "gpuRestart"
+    if k in ("qmu_error", "qmu_errors", "errors", "error"):
+        return "qmu_error"
+    if k in ("panic", "panics"):
+        return "panics"
+    if k in ("gpu_hang", "hang", "hangs"):
+        return "gpu_hang"
+    return k
+
+
+def _count_words(low, words):
+    import re
+    n = 0
+    for w in words:
+        n += len(re.findall(r"\b" + re.escape(w) + r"\b", low))
+    return n
+
+
+def _count_substr(txt, subs):
+    low = txt.lower()
+    return sum(low.count(s) for s in subs)
+
+
+def health_gate(pre, post, expect_gpurestart_max):
+    """Apply the architecture health gate. Returns (ok, lines)."""
+    lines = []
+    ok = True
+    for key, label in (("qmu_error", "QMU ERROR"), ("panics", "panics"), ("gpu_hang", "gpu_hang")):
+        v = post.get(key)
+        if v is None:
+            lines.append(f"  {label}: n/a (no source)")
+        elif v == 0:
+            lines.append(f"  {label}: 0  OK")
+        else:
+            lines.append(f"  {label}: {v}  FAIL (must be 0)")
+            ok = False
+    # gpuRestart: a warm swap may cause one controlled restart (the blink); more
+    # than expect-max, or a decrease, is a failure.
+    pr = post.get("gpuRestart")
+    if pr is None:
+        lines.append("  gpuRestart: n/a (no source)")
+    else:
+        base = (pre or {}).get("gpuRestart", 0)
+        delta = pr - base
+        if 0 <= delta <= expect_gpurestart_max:
+            lines.append(f"  gpuRestart: {base}->{pr} (+{delta})  OK (expected 0..{expect_gpurestart_max})")
+        else:
+            lines.append(f"  gpuRestart: {base}->{pr} ({delta:+d})  FAIL (expected +0..{expect_gpurestart_max})")
+            ok = False
+    return ok, lines
+
+
+# ------------------------------------------------------------------- ioreg triplet
+def read_ioreg_triplet(args):
+    """Guest-side version triplet for `status`. Off-VM this is unavailable."""
+    txt = None
+    if args.ioreg_cmd:
+        p = subprocess.run(args.ioreg_cmd, shell=True, capture_output=True, text=True)
+        txt = p.stdout
+    elif args.ioreg_file and os.path.exists(args.ioreg_file):
+        txt = open(args.ioreg_file, errors="replace").read()
+    if not txt:
+        return None
+    trip = {}
+    for line in txt.splitlines():
+        line = line.strip()
+        for key in ("AGVAEnvelopeVersion", "AGVAGuestDriverVersion", "AGVAHostDriverVersion",
+                    "AGVAHandshakeGeneration", "EnvelopeVersion", "GuestDriverVersion",
+                    "HostDriverVersion", "HandshakeGeneration",
+                    "UniqVGPUBackendVersion"):
+            if key in line:
+                _, _, val = line.partition("=")
+                trip[key] = val.strip().strip('"') or line
+    return trip or None
+
+
+# --------------------------------------------------------------------- commands
+def resolve_target(args):
+    if args.control:
+        return ["--control", args.control]
+    if args.vmid and args.id:
+        return [str(args.vmid), args.id]
+    raise UpdateError("need a target: --control PATH, or VMID ID")
+
+
+def cmd_update(args):
+    prim = Primitives(find_qdevctl(args.qdevctl), resolve_target(args))
+    st = State(args.state_dir)
+
+    if args.rollback:
+        return _do_rollback(args, prim, st)
+
+    bundle = Bundle(args.bundle)
+    log(f"bundle: {bundle.name} {bundle.version}  envelope={bundle.envelope}  kind={bundle.kind}")
+
+    # 1. VERIFY
+    ok, vlines = bundle.verify()
+    for l in vlines:
+        log(f"  verify {l}")
+    if not ok:
+        raise UpdateError("bundle verification FAILED")
+    log("verify: OK")
+
+    # 2. ABI-GATE
+    abi = prim.device_abi()
+    running_env = abi["envelope"]
+    warm = (bundle.envelope == running_env)
+    log(f"abi-gate: bundle envelope={bundle.envelope}  resident envelope={running_env}  "
+        f"=> {'WARM (in-place swap)' if warm else 'REBOOT required (envelope changed)'}")
+
+    backing = bundle.backing_path() if bundle.kind == "host-backend" else None
+
+    # 3. DRY-RUN
+    if args.dry_run:
+        log("")
+        log("DRY-RUN plan:")
+        log(f"  changes: resident backend -> bundle '{bundle.name}' {bundle.version}")
+        if warm:
+            log(f"  path: WARM  (stage {os.path.basename(backing)} -> qdevctl device-swap"
+                f"{' --reset ' + args.reset if args.reset else ''} -> health gate -> commit)")
+            log("  on health-gate failure: AUTO-ROLLBACK (symmetric device-swap to previous)")
+        else:
+            log("  path: REBOOT  (stage host + guest; one guest reboot required; nothing swapped live)")
+        log(f"  rollback-to on failure: {st.data.get('active', {}).get('backing', 'A (boot default)')}")
+        return EX_OK
+
+    # 4. REBOOT path
+    if not warm:
+        staged = st.stage_backing(backing, bundle.name) if backing else None
+        st.data["pending_reboot"] = {
+            "bundle": bundle.name, "version": bundle.version,
+            "envelope": bundle.envelope, "staged_backing": staged,
+            "resident_envelope": running_env, "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+        st.save()
+        log("")
+        log("=== REBOOT REQUIRED ===")
+        log(f"This update changes the envelope/ABI ({running_env} -> {bundle.envelope}).")
+        log("The FROZEN conduit/handshake differs, so a warm swap is NOT safe.")
+        log("Host (and guest) components are staged; apply with ONE guest reboot:")
+        log(f"  staged backing: {staged}")
+        log("No live swap was performed. Reboot the guest to switch.")
+        return EX_REBOOT
+
+    # 5. WARM path
+    if not backing:
+        raise UpdateError(f"warm path needs a host-backend backing; kind={bundle.kind}")
+    prev_backing = st.data.get("active", {}).get("backing") or args.rollback_to or "A"
+    staged = st.stage_backing(backing, bundle.name)
+    log(f"staged: {staged}  (previous active: {prev_backing})")
+
+    pre = read_health(args) if not args.no_health else {}
+    log(f"health baseline: {pre or '(none)'}")
+
+    log(f"device-swap -> {os.path.basename(staged)}" + (f" --reset {args.reset}" if args.reset else ""))
+    swap_out = prim.device_swap(staged, reset=args.reset)
+    log(f"  {swap_out}")
+
+    # HEALTH GATE
+    if args.no_health:
+        log("health gate: SKIPPED (--no-health)")
+        hok = True
+    else:
+        if args.health_settle:
+            time.sleep(args.health_settle)
+        # verify the device still answers (envelope intact) as part of health
+        try:
+            abi2 = prim.device_abi()
+            abi_alive = (abi2["envelope"] == running_env)
+        except UpdateError:
+            abi_alive = False
+        post = read_health(args)
+        hok, hlines = health_gate(pre, post, args.expect_gpurestart)
+        log(f"health gate ({post or 'no counters'}):")
+        for l in hlines:
+            log(l)
+        log(f"  device-abi still responding, envelope intact: {'OK' if abi_alive else 'FAIL'}")
+        hok = hok and abi_alive
+
+    if hok:
+        st.data["active"] = {"bundle": bundle.name, "version": bundle.version,
+                             "envelope": bundle.envelope, "backing": staged,
+                             "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+        st.data["previous"] = {"backing": prev_backing}
+        st.data.pop("pending_reboot", None)
+        st.save()
+        log("")
+        log(f"=== COMMITTED: resident now serving '{bundle.name}' {bundle.version} (no guest reboot) ===")
+        return EX_OK
+
+    # AUTO-ROLLBACK
+    log("")
+    log("=== HEALTH GATE FAILED -> AUTO-ROLLBACK ===")
+    try:
+        out = prim.device_swap(prev_backing)
+        log(f"  rolled back: {out}")
+    except UpdateError as e:
+        log(f"  rollback ALSO failed: {e}")
+        raise
+    log(f"resident reverted to previous backing ({prev_backing}); update aborted.")
+    return EX_HEALTH
+
+
+def _do_rollback(args, prim, st):
+    active = st.data.get("active")
+    prev = st.data.get("previous", {}).get("backing", "A")
+    if not active:
+        log("no recorded active bundle; rolling back to boot default 'A'")
+    else:
+        log(f"rolling back '{active['bundle']}' {active['version']} -> previous backing {prev}")
+    pre = read_health(args) if not args.no_health else {}
+    out = prim.device_swap(prev, reset=args.reset)
+    log(f"  {out}")
+    hok = True
+    if not args.no_health:
+        if args.health_settle:
+            time.sleep(args.health_settle)
+        post = read_health(args)
+        hok, hlines = health_gate(pre, post, args.expect_gpurestart)
+        log("health gate:")
+        for l in hlines:
+            log(l)
+    if not hok:
+        log("WARNING: health gate failed after rollback (resident state uncertain)")
+    # swap active/previous bookkeeping
+    if active:
+        st.data["previous"] = {"backing": active["backing"]}
+    st.data["active"] = {"bundle": "(rolled-back)", "version": "", "envelope": "",
+                         "backing": prev, "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+    st.save()
+    log("rollback complete." if hok else "rollback done (health uncertain).")
+    return EX_OK if hok else EX_HEALTH
+
+
+def cmd_rollback(args):
+    prim = Primitives(find_qdevctl(args.qdevctl), resolve_target(args))
+    st = State(args.state_dir)
+    return _do_rollback(args, prim, st)
+
+
+def cmd_status(args):
+    prim = Primitives(find_qdevctl(args.qdevctl), resolve_target(args))
+    st = State(args.state_dir)
+    abi = prim.device_abi()
+    log("uniq-vgpu status")
+    log(f"  resident (host, live):  envelope={abi.get('envelope')}  plugin={abi.get('plugin')}  "
+        f"version={abi.get('version')}  qdp_abi={abi.get('qdp_abi')}")
+    active = st.data.get("active")
+    if active:
+        log(f"  active bundle:          {active.get('bundle')} {active.get('version')}  "
+            f"(envelope={active.get('envelope')}, swapped {active.get('at')})")
+        log(f"  backing:                {active.get('backing')}")
+    else:
+        log("  active bundle:          (boot default; no uniq-vgpu update applied)")
+    if st.data.get("pending_reboot"):
+        pr = st.data["pending_reboot"]
+        log(f"  PENDING REBOOT:         {pr['bundle']} {pr['version']} (envelope {pr['envelope']}) staged")
+    trip = read_ioreg_triplet(args)
+    if trip:
+        log("  guest ioreg triplet:")
+        for k, v in trip.items():
+            log(f"      {k} = {v}")
+    else:
+        log("  guest ioreg triplet:    (guest offline / off-VM; host envelope above is the gate value)")
+    if not args.no_health:
+        h = read_health(args)
+        log(f"  health:                 {h or '(no source configured)'}")
+    return EX_OK
+
+
+# ------------------------------------------------------------------------ parse
+def add_target_opts(p):
+    p.add_argument("--control", help="qdev-host --control socket (raw/off-VM target)")
+    p.add_argument("--vmid", type=int, help="PVE VMID (with ID)")
+    p.add_argument("--id", help="PVE qdev-host device id (with --vmid)")
+    p.add_argument("--qdevctl", help="path to qdevctl (default: auto-detect)")
+    p.add_argument("--state-dir", default=DEFAULT_STATE_DIR,
+                   help=f"active/previous bundle state (default {DEFAULT_STATE_DIR})")
+
+
+def add_health_opts(p):
+    p.add_argument("--health-log", help="scan a log file for QMU ERROR / panic / gpu_hang / gpuRestart")
+    p.add_argument("--health-cmd", help="run a command; parse key=val or JSON counters")
+    p.add_argument("--expect-gpurestart", type=int, default=1,
+                   help="max allowed gpuRestart delta across a warm swap (default 1)")
+    p.add_argument("--health-settle", type=float, default=0.0,
+                   help="seconds to wait after a swap before reading health")
+    p.add_argument("--no-health", action="store_true", help="skip the health gate (not recommended)")
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="uniq-vgpu", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    u = sub.add_parser("update", help="verify -> ABI-gate -> warm swap (or reboot) -> health -> commit")
+    u.add_argument("bundle", nargs="?", help="bundle directory")
+    u.add_argument("--dry-run", action="store_true", help="print what would change (warm vs reboot); no swap")
+    u.add_argument("--rollback", action="store_true", help="symmetric warm swap back to the previous bundle")
+    u.add_argument("--rollback-to", help="backing to treat as 'previous' when none is recorded (default A)")
+    u.add_argument("--reset", choices=["hotplug"], default=None,
+                   help="trigger the guest re-handshake via QMP device_del+add (process stays alive)")
+    add_target_opts(u)
+    add_health_opts(u)
+    u.add_argument("--ioreg-cmd"); u.add_argument("--ioreg-file")
+    u.set_defaults(fn=cmd_update)
+
+    r = sub.add_parser("rollback", help="symmetric warm swap back to the previous bundle")
+    r.add_argument("--reset", choices=["hotplug"], default=None)
+    add_target_opts(r)
+    add_health_opts(r)
+    r.set_defaults(fn=cmd_rollback)
+
+    s = sub.add_parser("status", help="active bundle + envelope/ABI + ioreg triplet + health")
+    add_target_opts(s)
+    add_health_opts(s)
+    s.add_argument("--ioreg-cmd", help="command that prints the guest ioreg triplet")
+    s.add_argument("--ioreg-file", help="file holding the guest ioreg triplet")
+    s.set_defaults(fn=cmd_status)
+
+    args = ap.parse_args(argv)
+    if args.cmd == "update" and not args.rollback and not args.bundle:
+        ap.error("update needs a bundle (or --rollback)")
+    try:
+        return args.fn(args) or EX_OK
+    except UpdateError as e:
+        print(f"uniq-vgpu: {e}", file=sys.stderr)
+        return EX_ERR
+
+
+if __name__ == "__main__":
+    sys.exit(main())
