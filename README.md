@@ -467,8 +467,9 @@ plugin, or it does not follow UI sizes) answers
 for a console without `ui_info`; `-EINVAL` (outside the device's mode limits;
 the plugin logs which) answers `org.qemu.Display1.Error.Invalid`; any other
 error `org.qemu.Display1.Error.Failed`. A request with a zero side completes
-without reaching the plugin. apple-pvg's limits are the reference's: 1..65535
-pixels per side, at most 16777216 pixels, the guest EDID's pixel clock, 60 Hz.
+without reaching the plugin. apple-pvg's limits are the reference's: 1..16384
+pixels per side (Virtualization.framework's display validation), at most
+16777216 pixels, the guest EDID's pixel clock, 60 Hz.
 
 Version 1:
 
