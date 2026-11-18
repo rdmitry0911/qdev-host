@@ -132,6 +132,7 @@ bool pvg_qmu_vt_bind(struct pvg_qmu_vt *vt, void *handle, long lmid, const char 
         { "qmu_get_private_ordinary_physical_comparison_v1",  (void **)&vt->get_private_ordinary_physical_comparison_v1 },
         { "qmu_get_private_ordinary_task_memory_v1",          (void **)&vt->get_private_ordinary_task_memory_v1 },
         { "qmu_display_set_mode_list",                        (void **)&vt->display_set_mode_list },
+        { "qmu_session_reset_for_device_reset",               (void **)&vt->session_reset_for_device_reset },
     };
 
     (void)dlerror();
@@ -2856,6 +2857,65 @@ static void pvg_teardown(void *priv)
      * threads stay until process exit (libraries pinned). */
 }
 
+typedef struct PvgResetCall {
+    PvgState *state;
+    qmu_status status;
+} PvgResetCall;
+
+static void pvg_qmetal_device_reset_call(void *opaque)
+{
+    PvgResetCall *call = opaque;
+
+    call->status = qmu_session_reset_for_device_reset(call->state->qmu_dev);
+}
+
+/* The QMetal PGDevice-reset boundary for a guest-visible device reset.  Runs
+ * under host-work admission like an MMIO access.  A failure is reported loudly
+ * but never aborts the reset path (the identity re-arm still has to happen). */
+static void pvg_qmetal_device_reset(PvgState *s, vfu_reset_type_t type)
+{
+    PvgResetCall call = { .state = s, .status = QMU_INVALID_ARGUMENT };
+    PvgHostWork owner;
+
+    if (!qmu_session_reset_for_device_reset) {
+        pvg_log(s, "[apple-gfx-ml][reset][ERROR] type=%d: this libmlapi has no "
+                "qmu_session_reset_for_device_reset; the PGDevice reset is NOT applied and the "
+                "guest's next boot sequence will stall\n", (int)type);
+        return;
+    }
+    if (!pvg_mmio_admit(s, &owner)) {
+        pvg_log(s, "[apple-gfx-ml][reset][ERROR] type=%d: device stopped, QMetal reset not applied\n",
+                (int)type);
+        return;
+    }
+    /* The host runs reset() quiesced: this thread holds the guest-memory table
+     * write lock (pvg_memory_quiesce) until resume.  QMetal's reset drains work
+     * that is already accepted (EXEC3 translators, the old epoch's final submit
+     * and its stamp delivery) and those workers read/write guest memory through
+     * lookups that wait for that lock: reset would wait on them while they wait
+     * on reset.  The reference reset runs under QEMU's RCU read side, which never
+     * blocks lookups, so lift the write side for the duration of the call (the
+     * map itself is unchanged by a reset) and take it back before returning to
+     * the host.  IRQs stay held (latched) throughout. */
+    bool was_quiesced = s->mem.quiesced;
+    if (was_quiesced) {
+        pvg_memory_resume(s);
+    }
+    pvg_host_work_invoke(&owner, pvg_qmetal_device_reset_call, &call);
+    if (was_quiesced) {
+        pvg_memory_quiesce(s);
+    }
+    pvg_host_work_unref(&owner);
+    if (call.status == QMU_OK) {
+        pvg_log(s, "[apple-gfx-ml] DEVICE_RESET_LIFECYCLE type=%d qmu_status=%d "
+                "phase=qmu_reset_complete\n", (int)type, (int)call.status);
+    } else {
+        pvg_log(s, "[apple-gfx-ml][reset][ERROR] DEVICE_RESET_LIFECYCLE type=%d qmu_status=%d "
+                "phase=qmu_reset_failed%s\n", (int)type, (int)call.status,
+                call.status == QMU_NOT_SUPPORTED ? " (native_eeee_source session: reset unqualified)" : "");
+    }
+}
+
 static int pvg_reset(void *priv, vfu_reset_type_t type)
 {
     PvgState *s = priv;
@@ -2873,10 +2933,21 @@ static int pvg_reset(void *priv, vfu_reset_type_t type)
         pvg_log(s, "[apple-gfx-ml][WARN] device stopped; a new client gets a dead device\n");
         return 0;
     }
-    /* Fork agfx_reset: no device state change; QMetal resets through the
-     * guest's MMIO (FIFO_ENABLE 1->0 is the FIFO teardown boundary). */
-    pvg_log(s, "[apple-gfx-ml] device reset type=%d: no device state change\n", (int)type);
+    /* Reference: QEMU apple-gfx-pci.m apple_gfx_pci_reset() is [pgdev reset] on
+     * EVERY device reset ("New rerference logs and driver/apple-gfx-pci.m"
+     * :121-124); -[PGDevice reset] (host decompile ParavirtualizedGraphics-
+     * host-lc.c:50724-50743) = setRootPage(0), setBinaryVersion(0),
+     * setEFIDisplay(0).  A guest reboot never writes the kext's FIFO_ENABLE
+     * 1->0 teardown, so without this call QMetal keeps the old epoch /
+     * protocol / IOSFC state and ignores the next boot's register sequence
+     * (the new kext stalls at its first host wait, GET_DEVICE_INFO).  It must
+     * run BEFORE the firmware identity re-arms and the guest touches BAR0.
+     * Only the guest-visible device resets (DEVICE / FLR) reach it: renderer
+     * reload and warm swap are plugin ops (pvg_backend_reload, pvg_swap) that
+     * never enter pvg_reset, and LOST_CONN returned above. */
+    pvg_log(s, "[apple-gfx-ml] device reset type=%d\n", (int)type);
     if (type == VFU_RESET_DEVICE || type == VFU_RESET_PCI_FLR) {
+        pvg_qmetal_device_reset(s, type);
         pvg_fw_identity_rearm(s, type == VFU_RESET_DEVICE ? "device reset" : "FLR");
     }
     return 0;

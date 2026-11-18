@@ -92,6 +92,10 @@ struct pvg_qmu_vt {
     /* Optional (newer than the first qdev package's QMetal): NULL when the
      * instance does not export it, exactly like the private getters. */
     __typeof__(qmu_display_set_mode_list)                             *display_set_mode_list;
+    /* Optional: the PGDevice reset boundary (reference -[PGDevice reset]).
+     * NULL on a libmlapi older than the port of the reset lifecycle; pvg_reset
+     * then logs an [ERROR] (the guest's next boot would stall) and goes on. */
+    __typeof__(qmu_session_reset_for_device_reset)                    *session_reset_for_device_reset;
     /* identity of the instance this vtable was bound from */
     void       *handle;        /* dlopen/dlmopen handle (base = the LM_ID_BASE copy) */
     long        lmid;          /* link-map namespace id (LM_ID_BASE for the base)    */
@@ -144,6 +148,7 @@ bool pvg_qmu_vt_bind(struct pvg_qmu_vt *vt, void *handle, long lmid, const char 
 #define qmu_vk_encode_submit_owned_display_frame             (pvg_qvt->vk_encode_submit_owned_display_frame)
 #define qmu_vk_prepare_owned_display_frame                   (pvg_qvt->vk_prepare_owned_display_frame)
 #define qmu_display_set_mode_list                            (pvg_qvt->display_set_mode_list)
+#define qmu_session_reset_for_device_reset                   (pvg_qvt->session_reset_for_device_reset)
 
 /* ------------------------------------------------------------ atomics */
 #define pvg_atomic_read(p)        __atomic_load_n((p), __ATOMIC_SEQ_CST)

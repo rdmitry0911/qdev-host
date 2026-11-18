@@ -36,6 +36,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -83,6 +84,12 @@ static int irq_calls, irq_delivered, frame_calls, cursor_calls, msi_enabled;
 static int in_quiesce, irq_in_quiesce;
 static uint64_t last_seq;
 static int refusals, plugin_errors, qmetal_errors, log_lines;
+/* PGDevice-reset evidence, counted from the host log (no double on the call):
+ *   qmu_reset_done   QMetal's own "QMU_DEVICE_RESET_LIFECYCLE phase=complete" line, i.e. the
+ *                    real qmu_session_reset_for_device_reset ran to its end;
+ *   plugin_reset_ok  the plugin's "DEVICE_RESET_LIFECYCLE ... qmu_reset_complete" line;
+ *   ord_*            ordinal (log line number) of the last such line, to check the order. */
+static int qmu_reset_done, plugin_reset_ok, plugin_reset_err, line_seq, ord_plugin_reset, ord_rearm;
 static char last_refusal[4096];
 static pthread_mutex_t host_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -126,6 +133,21 @@ static void host_log(void *host, int level, const char *fmt, ...)
     va_end(ap);
     pthread_mutex_lock(&host_lock);
     log_lines++;
+    line_seq++;
+    if (strstr(line, "QMU_DEVICE_RESET_LIFECYCLE phase=complete status=0")) {
+        qmu_reset_done++;
+    }
+    if (strstr(line, "[apple-gfx-ml] DEVICE_RESET_LIFECYCLE type=") &&
+        strstr(line, "phase=qmu_reset_complete")) {
+        plugin_reset_ok++;
+        ord_plugin_reset = line_seq;
+    }
+    if (strstr(line, "[apple-gfx-ml][reset][ERROR]")) {
+        plugin_reset_err++;
+    }
+    if (strstr(line, "firmware PCI identity") && strstr(line, "armed (")) {
+        ord_rearm = line_seq;
+    }
     if (strstr(line, "[apple-gfx-ml][memory][ERROR]")) {
         refusals++;
         snprintf(last_refusal, sizeof(last_refusal), "%s", line);
@@ -297,6 +319,47 @@ static char *mint_instance(const char *golden, const char *sibdir, int cycle,
 
 #define MiB (1024ull * 1024)
 #define GUEST_FILE_SIZE (64 * MiB)
+/* Reset evidence snapshot: wait briefly for the log writer thread, then read the counters. */
+static int reset_done_count(void)
+{
+    usleep(150 * 1000);
+    pthread_mutex_lock(&host_lock);
+    int n = qmu_reset_done;
+    pthread_mutex_unlock(&host_lock);
+    return n;
+}
+
+/* The kext's boot register sequence as QMetal sees it on a cold boot (oracle: cold-boot log
+ * lines 63-1034 of evidence/runs/vm118-retire-old-bundle-20261118T102554Z/host-run/
+ * qdev-host-vm118.log): IOSFC_ENABLE, IOSFC TASK_PFN (createTask -> IOSFC_READY),
+ * PROTOCOL_VERSION (-> GFX_INIT), the root FIFO tuple, FIFO_ENABLE (-> GFX_READY).  Returns the
+ * PROTOCOL_VERSION readback (6 = accepted, 0x80000006 = rejected feedback).  The IOSFC_MAP_ADDR
+ * framebuffer map of the real boot is NOT driven here (coverage gap, see the commit message). */
+static uint32_t fw_boot_sequence(uint64_t task_gpa, uint64_t shared_gpa, uint64_t fifo_gpa)
+{
+    uint32_t pv;
+
+    wr(PVG_REG_IOSFC_ENABLE, 1);
+    wr(PVG_REG_IOSFC_TASK_PFN, (uint32_t)(task_gpa >> 12));
+    wr(PVG_REG_IOSFC_TASK_SIZE, 0x1000);
+    wr(PVG_REG_PROTOCOL_VERSION, 6);
+    pv = rd(PVG_REG_PROTOCOL_VERSION);
+    wr(PVG_REG_SHARED_STATE_PFN, (uint32_t)(shared_gpa >> 12));
+    wr(PVG_REG_FIFO_PFN, (uint32_t)(fifo_gpa >> 12));
+    wr(PVG_REG_FIFO_OFFSET, 0x1000);
+    wr(PVG_REG_FIFO_SIZE, 0x10000);
+    wr(PVG_REG_FIFO_ENABLE, 1);
+    return pv;
+}
+
+static void reset_deadlock_watchdog(int sig)
+{
+    (void)sig;
+    printf("FAIL reset under quiesce did not return within the watchdog (wait cycle)\n");
+    fflush(stdout);
+    _exit(2);
+}
+
 #define A_IOVA 0ull                   /* [0, 48 MiB) at file offset 0 */
 #define A_LEN (48 * MiB)
 #define B_IOVA 0x100000000ull         /* [4 GiB, +16 MiB) at file offset 48 MiB */
@@ -438,9 +501,18 @@ int main(int argc, char **argv)
     if (fw_identity) {
         uint16_t v16 = 0;
 
+        int n0 = reset_done_count();
+
         r = ops->reset(priv, VFU_RESET_DEVICE);
         CHECK(r == 0 && IDS() == 0x106beeee, "device reset before any BAR0 access: %08x (firmware identity)",
               IDS());
+        /* Reference apple_gfx_pci_reset = [pgdev reset] on every device reset: the QMetal reset
+         * boundary runs (here on a fresh Session: benign) and BEFORE the identity re-arms. */
+        CHECK(reset_done_count() == n0 + 1 && plugin_reset_err == 0 && ord_plugin_reset &&
+              ord_plugin_reset < ord_rearm,
+              "device reset applied the PGDevice reset once (%d) before the identity re-arm "
+              "(plugin line #%d < re-arm line #%d)", reset_done_count() - n0, ord_plugin_reset,
+              ord_rearm);
         (void)rd(PVG_REG_DISPLAY_PORT_COUNT);
         CHECK(IDS() == 0x1b36eee1, "first BAR0 read switches config space: %08x (want 1b36eee1)", IDS());
         (void)rd(PVG_REG_DISPLAY_PORT_COUNT);
@@ -448,19 +520,28 @@ int main(int argc, char **argv)
         CHECK(IDS() == 0x1b36eee1, "later BAR0 accesses keep it: %08x", IDS());
         r = ops->reset(priv, VFU_RESET_DEVICE);
         CHECK(r == 0 && IDS() == 0x106beeee, "device reset (guest reboot) re-arms: %08x", IDS());
+        CHECK(reset_done_count() == n0 + 2 && ord_plugin_reset < ord_rearm,
+              "guest-reboot device reset applied the PGDevice reset again (total %d)",
+              reset_done_count() - n0);
         /* a refused (2-byte) access counts too: it is still the guest touching BAR0 */
         bar0_cb(NULL, (char *)&v16, 2, PVG_REG_FIFO_SIZE, true);
         CHECK(IDS() == 0x1b36eee1, "first BAR0 write (refused size) switches: %08x", IDS());
         r = ops->reset(priv, VFU_RESET_PCI_FLR);
         CHECK(r == 0 && IDS() == 0x106beeee, "FLR re-arms: %08x", IDS());
+        CHECK(reset_done_count() == n0 + 3 && ord_plugin_reset < ord_rearm && plugin_reset_err == 0,
+              "FLR applied the PGDevice reset (total %d) before the re-arm", reset_done_count() - n0);
         CHECK(cfg[0xa] == 0x80 && cfg[0xb] == 0x03 && cfg[0x2c] == 0 && cfg[0x2e] == 0,
               "class and subsystem unchanged by the identity switch");
     } else if (personality) {
         /* without fw-* args nothing switches */
         (void)rd(PVG_REG_DISPLAY_PORT_COUNT);
         CHECK(IDS() == (0x106b0000u | personality), "BAR0 access leaves IDs %08x", IDS());
+        int n0 = reset_done_count();
+
         r = ops->reset(priv, VFU_RESET_DEVICE);
         CHECK(r == 0 && IDS() == (0x106b0000u | personality), "device reset leaves IDs %08x", IDS());
+        CHECK(reset_done_count() == n0 + 1 && plugin_reset_err == 0,
+              "device reset applied the PGDevice reset once (%d)", reset_done_count() - n0);
     }
     if (personality) {
         /* The client goes away: with exit-on-disconnect (default on) the
@@ -473,7 +554,14 @@ int main(int argc, char **argv)
         if (failures) {
             return 1;
         }
+        int n_lost = reset_done_count();
+
         r = ops->reset(priv, VFU_RESET_LOST_CONN);
+        if (reset_done_count() != n_lost) {
+            printf("FAIL reset(VFU_RESET_LOST_CONN) applied the PGDevice reset (not a device reset)\n");
+            return 1;
+        }
+        printf("PASS reset(VFU_RESET_LOST_CONN) did not apply the PGDevice reset\n");
         if (r != QDP_RESET_EXIT) {
             printf("FAIL reset(VFU_RESET_LOST_CONN) returned %d with exit-on-disconnect on\n", r);
             return 1;
@@ -759,7 +847,90 @@ int main(int argc, char **argv)
         CHECK(get_int(&plugin_errors) == errors0, "no plugin [ERROR] line from ui_info");
     }
 
-    /* 10. reset of the device keeps the device (fork semantics) */
+    /* 10. GUEST REBOOT: device reset while the old root-FIFO epoch is live, with NO guest
+     * FIFO_ENABLE 1->0 (a reboot never runs the kext's teardown).
+     * Reference: QEMU apple_gfx_pci_reset() = [pgdev reset] on every device reset
+     * (reference/New rerference logs and driver/apple-gfx-pci.m:121-124) =
+     * setRootPage(0), setBinaryVersion(0), setEFIDisplay(0) (host decompile
+     * ParavirtualizedGraphics-host-lc.c:50724-50743).  Before the reset reached QMetal, boot 2's
+     * IOSFC_ENABLE/TASK_PFN/PROTOCOL_VERSION/FIFO_ENABLE sequence was ignored (state machine
+     * only advances from IOSFC_READY/UNINITIALIZED, FIFO writes dropped unless GFX_READY) and the
+     * first root FIFO write never dispatched (boot 2 of the VM118 run stalled at GET_DEVICE_INFO).
+     * The real libmlapi is the unit under test; the only double is the host-services callbacks. */
+    {
+        const uint64_t task1 = A_IOVA + 0x300000, fifo1 = A_IOVA + 0x400000, shared1 = A_IOVA + 0x500000;
+        const uint64_t task2 = A_IOVA + 0x380000, fifo2 = A_IOVA + 0x600000, shared2 = A_IOVA + 0x700000;
+        uint32_t nop[3] = { 0x03 /* NOP, no barriers */, 12, 0x4201 };
+        uint32_t pv;
+        int n0, rr, irq0;
+
+        /* boot 1: two root commands, so the old write/read pointer (24) is above boot 2's first write */
+        pv = fw_boot_sequence(task1, shared1, fifo1);
+        CHECK(pv == 6, "boot 1: PROTOCOL_VERSION accepted (0x%x)", pv);
+        memcpy(guest + fifo1 + 0x1000, nop, sizeof(nop));
+        nop[2] = 0x4202;
+        memcpy(guest + fifo1 + 0x1000 + 12, nop, sizeof(nop));
+        memset(guest + fifo1, 0, 4);
+        wr(PVG_REG_FIFO_WRITE, 24);
+        CHECK(wait_reg(PVG_REG_FIFO_READ, 24, 5.0), "boot 1: both root commands drained, FIFO_READ %u",
+              rd(PVG_REG_FIFO_READ));
+
+        /* the reset exactly as qdev-host drives it: quiesce -> reset -> resume */
+        n0 = reset_done_count();
+        r = ops->quiesce(priv);
+        rr = ops->reset(priv, VFU_RESET_DEVICE);
+        ops->resume(priv);
+        CHECK(r == 0 && rr == 0 && reset_done_count() == n0 + 1 && plugin_reset_ok >= 1 &&
+              plugin_reset_err == 0,
+              "VFU_RESET_DEVICE (quiesced) applied the PGDevice reset once (QMetal lifecycle lines +%d)",
+              reset_done_count() - n0);
+        CHECK(rd(PVG_REG_FIFO_ENABLE) == 0 && rd(PVG_REG_FIFO_READ) == 0 &&
+              rd(PVG_REG_PROTOCOL_VERSION) == 0,
+              "old epoch retired by the reset alone: FIFO_ENABLE %u FIFO_READ %u PROTOCOL_VERSION 0x%x",
+              rd(PVG_REG_FIFO_ENABLE), rd(PVG_REG_FIFO_READ), rd(PVG_REG_PROTOCOL_VERSION));
+
+        /* boot 2: same register sequence, new tuple, FIRST write (12) below boot 1's last (24) */
+        pv = fw_boot_sequence(task2, shared2, fifo2);
+        CHECK(pv == 6, "boot 2: PROTOCOL_VERSION accepted again (0x%x; 0x80000006 = ignored)", pv);
+        nop[2] = 0x4301;
+        memcpy(guest + fifo2 + 0x1000, nop, sizeof(nop));
+        memset(guest + fifo2, 0, 4);
+        msi_enabled = 1;
+        irq0 = get_int(&irq_delivered);
+        wr(PVG_REG_FIFO_WRITE, 12);
+        CHECK(wait_reg(PVG_REG_FIFO_READ, 12, 5.0),
+              "boot 2: first root FIFO write dispatches (FIFO_READ %u, want 12)", rd(PVG_REG_FIFO_READ));
+        for (int i = 0; i < 5000 && get_int(&irq_delivered) == irq0; i++) {
+            usleep(1000);
+        }
+        /* The completion stamp's memory readback is NOT asserted: steps 6/7b already fail on
+         * unmodified main (QMetal cbc1c006d no longer writes the NOP stamp where this selftest
+         * reads it; 4 pre-existing failures), so only the MSI that signals it is checked. */
+        CHECK(get_int(&irq_delivered) > irq0, "boot 2: completion MSI delivered (+%d)",
+              get_int(&irq_delivered) - irq0);
+        (void)rd(PVG_REG_EVENT_STAMPS);
+
+        /* a doorbell already posted inside QMetal when the host quiesces for the reset: the
+         * reset drains accepted work, which needs guest-memory lookups -- it must not wait on a
+         * quiesce the same thread holds (watchdog = a wait cycle, not a slow reset).  Race-
+         * dependent and NOT a proof of the plugin's quiesce lift in pvg_qmetal_device_reset: a NOP
+         * makes no Vulkan submit, so the old epoch's final-submit wait is not exercised (the
+         * lift-disabled experiment also passed; an in-flight render at reset is a live-gate item). */
+        nop[2] = 0x4302;
+        memcpy(guest + fifo2 + 0x1000 + 12, nop, sizeof(nop));
+        signal(SIGALRM, reset_deadlock_watchdog);
+        wr(PVG_REG_FIFO_WRITE, 24);
+        r = ops->quiesce(priv);
+        alarm(30);
+        rr = ops->reset(priv, VFU_RESET_DEVICE);
+        alarm(0);
+        ops->resume(priv);
+        CHECK(r == 0 && rr == 0 && plugin_reset_err == 0 && rd(PVG_REG_FIFO_ENABLE) == 0,
+              "reset with a posted doorbell under quiesce returned (no wait cycle)");
+        (void)rd(PVG_REG_EVENT_STAMPS);
+    }
+
+    /* 10a. reset of the device keeps the device (fork semantics) */
     r = ops->reset(priv, VFU_RESET_DEVICE);
     CHECK(r == 0 && rd(PVG_REG_DISPLAY_PORT_COUNT) == 1, "VFU_RESET_DEVICE: %d, registers live", r);
 
@@ -776,6 +947,11 @@ int main(int argc, char **argv)
      * differs per cycle), a distinct independent instance handle each cycle,
      * device state re-adopted (FIFO re-arms + consumes), handshake_gen == cycle,
      * 0 new QMU errors, 0 abort/leak/join-hang. */
+    int resets_before_reload = reset_done_count(), plugin_resets_before_reload;
+
+    pthread_mutex_lock(&host_lock);
+    plugin_resets_before_reload = plugin_reset_ok;
+    pthread_mutex_unlock(&host_lock);
     if (reload_n > 0 && reload_golden) {
         CHECK(ops->abi_version >= 4 && ops->reload && ops->backend_report,
               "plugin exposes qdp v4 reload + backend_report (abi %u)", ops->abi_version);
@@ -909,6 +1085,29 @@ int main(int argc, char **argv)
                 free(good);
             }
         }
+    }
+
+    /* Warm-swap / renderer-reload non-regression: neither flow is a guest-visible device reset, so
+     * neither may apply the PGDevice reset (audit: pvg_backend_reload/pvg_swap never enter
+     * pvg_reset).  Counted from the real QMetal lifecycle line and the plugin's reset line. */
+    if (reload_n > 0 && reload_golden) {
+        int plugin_now;
+
+        pthread_mutex_lock(&host_lock);
+        plugin_now = plugin_reset_ok;
+        pthread_mutex_unlock(&host_lock);
+        CHECK(reset_done_count() == resets_before_reload && plugin_now == plugin_resets_before_reload,
+              "%d reload cycles + rollback applied no PGDevice reset (QMetal lifecycle lines +%d)",
+              reload_n, reset_done_count() - resets_before_reload);
+    }
+    if (ops->swap && access("plugins/uniq-vgpu/backing_A.so", R_OK) == 0) {
+        int n_swap = reset_done_count();
+
+        r = ops->quiesce(priv);
+        int rs = ops->swap(priv, "plugins/uniq-vgpu/backing_A.so");
+        ops->resume(priv);
+        CHECK(r == 0 && rs == 0 && reset_done_count() == n_swap,
+              "warm swap of the VARIABLE backing (rc=%d) applied no PGDevice reset", rs);
     }
 
     /* 11. quit stop phase */
