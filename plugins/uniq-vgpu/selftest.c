@@ -826,27 +826,33 @@ int main(int argc, char **argv)
      * list becomes the one requested size (served by the EFI mode registers
      * too), a repeat is reported unchanged, out-of-bounds requests change
      * nothing, and the scanout keeps its size until the guest presents.
-     * Bounds are the reference's (uniq-vgpu.c pvg_ui_info_refusal): 1..65535
-     * per side and no other minimum (host testUpdateModeList u16 page fields,
+     * Bounds are the reference's (uniq-vgpu.c pvg_ui_info_refusal): 1..16384
+     * per side (Virtualization.framework -[VZMacGraphicsDisplayConfiguration
+     * validateWithError:] @0x7ffb165b9eb0) and no other minimum (host
+     * testUpdateModeList u16 page fields,
      * _PGDisplayMode init without a size check; guest edidInit u16 (w-1),(h-1),
      * validateDetailedTiming active < 0x10000), at most 16777216 pixels (64 MiB
      * IOFBMemorySize), the guest edidInit pixel clock ((h+10000)(w+10000)*
      * refresh16 + 0x270fffff) / 0x27100000 <= 0x1000000, flags 0, and 60 Hz only
-     * (design debt E1). The clock cases: 65535x256 is 4648122 units at 60 Hz,
-     * 16777164 at 216.567 Hz (in bounds, then refused as not 60 Hz) and
-     * 16777241 at 216.568 Hz (above the clock limit). */
+     * (design debt E1). The clock cases: 16384x1024 (the largest clock within
+     * the side and pixel bounds) is 1745144 units at 60 Hz, 16777197 at
+     * 576.819 Hz (in bounds, then refused as not 60 Hz) and 16777227 at
+     * 576.820 Hz (above the clock limit). */
     {
         qdp_ui_info ui = { .size = sizeof(ui), .width = 1600, .height = 900 };
         static const struct { uint32_t w, h, mhz, flags; const char *what, *reason; } bad[] = {
-            { 0, 900, 0, 0, "0x900", "refused: a side outside 1..65535" },
-            { 1600, 0, 0, 0, "1600x0", "refused: a side outside 1..65535" },
-            { 0x10000, 1000, 0, 0, "65536x1000", "refused: a side outside 1..65535" },
-            { 1000, 0x10000, 0, 0, "1000x65536", "refused: a side outside 1..65535" },
+            { 0, 900, 0, 0, "0x900", "refused: a side outside 1..16384" },
+            { 1600, 0, 0, 0, "1600x0", "refused: a side outside 1..16384" },
+            { 0x10000, 1000, 0, 0, "65536x1000", "refused: a side outside 1..16384" },
+            { 1000, 0x10000, 0, 0, "1000x65536", "refused: a side outside 1..16384" },
+            { 16385, 1024, 0, 0, "16385x1024 (VZ maximum 16384)", "refused: a side outside 1..16384" },
+            { 1024, 16385, 0, 0, "1024x16385 (VZ maximum 16384)", "refused: a side outside 1..16384" },
+            { 65535, 256, 0, 0, "65535x256 (PG u16, above VZ 16384)", "refused: a side outside 1..16384" },
             { 4097, 4096, 0, 0, "4097x4096 (16781312 pixels)", "refused: more than 16777216 pixels" },
             { 8192, 4096, 0, 0, "8192x4096", "refused: more than 16777216 pixels" },
-            { 65535, 256, 216568, 0, "65535x256 @ 216.568 Hz (clock 16777241 > 0x1000000)",
+            { 16384, 1024, 576820, 0, "16384x1024 @ 576.820 Hz (clock 16777227 > 0x1000000)",
               "refused: pixel clock above the guest EDID limit" },
-            { 65535, 256, 216567, 0, "65535x256 @ 216.567 Hz (clock 16777164, in bounds)",
+            { 16384, 1024, 576819, 0, "16384x1024 @ 576.819 Hz (clock 16777197, in bounds)",
               "refused: only 60 Hz is offered" },
             { 1600, 900, 59940, 0, "1600x900 @ 59.94 Hz", "refused: only 60 Hz is offered" },
             { 1600, 900, 120000, 0, "1600x900 @ 120 Hz", "refused: only 60 Hz is offered" },
@@ -856,7 +862,7 @@ int main(int argc, char **argv)
          * policy's edges, the pixel bound and the largest 60 Hz clock */
         static const struct { uint32_t w, h; } good[] = {
             { 1630, 572 }, { 1324, 626 }, { 1, 1 }, { 799, 600 }, { 800, 599 },
-            { 4096, 4096 }, { 65535, 256 }, { 256, 65535 },
+            { 4096, 4096 }, { 16384, 1024 }, { 1024, 16384 },
         };
         int errors0 = get_int(&plugin_errors);
         uint32_t m0, m1;
