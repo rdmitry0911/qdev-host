@@ -40,6 +40,8 @@ EX_OK = 0
 EX_ERR = 1            # usage / verify / primitive error
 EX_HEALTH = 3        # health gate failed (auto-rollback performed)
 EX_REBOOT = 20       # update staged but needs a guest reboot (envelope changed)
+EX_GUEST = 21        # host warm-updated, but a guest kext install is still required
+EX_PENDING = 22      # identity swapped, but the REAL backend-process reload is pending (lane)
 
 
 class UpdateError(Exception):
@@ -145,6 +147,12 @@ class Bundle:
     def version(self):
         return self.manifest["version"]
 
+    @property
+    def backend_reload(self):
+        # 'device-swap' (in-process backing .so / identity descriptor) | 'backend-process'
+        # (REAL renderer libmlapi/QMetal/air -- needs a qdev-host backend-process reload).
+        return self.manifest.get("backend_reload", "device-swap")
+
     def backing_path(self):
         b = self.manifest.get("backing")
         if not b:
@@ -152,6 +160,21 @@ class Bundle:
         p = os.path.join(self.path, b)
         if not os.path.exists(p):
             raise UpdateError(f"bundle backing missing on disk: {b}")
+        return p
+
+    # ------- guest kext payload (apply): the FIXED resident driver, if the
+    # bundle ships one. None => host-only bundle (pure warm backend swap).
+    @property
+    def kext(self):
+        return self.manifest.get("kext")
+
+    def kext_path(self):
+        k = self.kext
+        if not k or not k.get("bundle"):
+            return None
+        p = os.path.join(self.path, k["bundle"])
+        if not os.path.exists(p):
+            raise UpdateError(f"bundle kext payload missing on disk: {k['bundle']}")
         return p
 
     # ------- verify: sha of every bundle file (verify.sh-style), portable core
@@ -349,25 +372,14 @@ def resolve_target(args):
     raise UpdateError("need a target: --control PATH, or VMID ID")
 
 
-def cmd_update(args):
-    prim = Primitives(find_qdevctl(args.qdevctl), resolve_target(args))
-    st = State(args.state_dir)
+def run_host_update(args, prim, st, bundle, dry_run):
+    """HOST side: ABI-gate -> (dry-run plan | reboot staging | warm swap+health+commit).
 
-    if args.rollback:
-        return _do_rollback(args, prim, st)
-
-    bundle = Bundle(args.bundle)
-    log(f"bundle: {bundle.name} {bundle.version}  envelope={bundle.envelope}  kind={bundle.kind}")
-
-    # 1. VERIFY
-    ok, vlines = bundle.verify()
-    for l in vlines:
-        log(f"  verify {l}")
-    if not ok:
-        raise UpdateError("bundle verification FAILED")
-    log("verify: OK")
-
-    # 2. ABI-GATE
+    Returns (exit_code, info) where info has keys: warm(bool), running_env,
+    committed(bool), kind('dryrun'|'reboot'|'warm'|'warm-rollback'), staged.
+    The log output + exit codes are the increment-3 `update` contract, reused
+    verbatim by both `update` and `apply`."""
+    # ABI-GATE
     abi = prim.device_abi()
     running_env = abi["envelope"]
     warm = (bundle.envelope == running_env)
@@ -375,22 +387,35 @@ def cmd_update(args):
         f"=> {'WARM (in-place swap)' if warm else 'REBOOT required (envelope changed)'}")
 
     backing = bundle.backing_path() if bundle.kind == "host-backend" else None
+    info = {"warm": warm, "running_env": running_env, "committed": False,
+            "kind": None, "staged": None}
 
-    # 3. DRY-RUN
-    if args.dry_run:
+    # DRY-RUN
+    if dry_run:
         log("")
         log("DRY-RUN plan:")
         log(f"  changes: resident backend -> bundle '{bundle.name}' {bundle.version}")
         if warm:
-            log(f"  path: WARM  (stage {os.path.basename(backing)} -> qdevctl device-swap"
-                f"{' --reset ' + args.reset if args.reset else ''} -> health gate -> commit)")
+            log(f"  path: WARM  (stage {os.path.basename(backing) if backing else '(no backing)'} "
+                f"-> qdevctl device-swap{' --reset ' + args.reset if args.reset else ''} "
+                f"-> health gate -> commit)")
+            if bundle.backend_reload == "backend-process":
+                if getattr(args, "backend_reload_cmd", None):
+                    log("  backend reload: REAL renderer (libmlapi/QMetal/air) reloaded via "
+                        "--backend-reload-cmd (qdev-host backend-process restart + vfio reconnect)")
+                else:
+                    log("  backend reload: device-swap updates ONLY the identity; the REAL renderer "
+                        "reload is PENDING the backend-process swap lane (pass --backend-reload-cmd)")
+            else:
+                log("  backend reload: in-process device-swap of the backing .so / identity descriptor")
             log("  on health-gate failure: AUTO-ROLLBACK (symmetric device-swap to previous)")
         else:
             log("  path: REBOOT  (stage host + guest; one guest reboot required; nothing swapped live)")
         log(f"  rollback-to on failure: {st.data.get('active', {}).get('backing', 'A (boot default)')}")
-        return EX_OK
+        info["kind"] = "dryrun"
+        return EX_OK, info
 
-    # 4. REBOOT path
+    # REBOOT path
     if not warm:
         staged = st.stage_backing(backing, bundle.name) if backing else None
         st.data["pending_reboot"] = {
@@ -406,13 +431,16 @@ def cmd_update(args):
         log("Host (and guest) components are staged; apply with ONE guest reboot:")
         log(f"  staged backing: {staged}")
         log("No live swap was performed. Reboot the guest to switch.")
-        return EX_REBOOT
+        info["kind"] = "reboot"
+        info["staged"] = staged
+        return EX_REBOOT, info
 
-    # 5. WARM path
+    # WARM path
     if not backing:
         raise UpdateError(f"warm path needs a host-backend backing; kind={bundle.kind}")
     prev_backing = st.data.get("active", {}).get("backing") or args.rollback_to or "A"
     staged = st.stage_backing(backing, bundle.name)
+    info["staged"] = staged
     log(f"staged: {staged}  (previous active: {prev_backing})")
 
     pre = read_health(args) if not args.no_health else {}
@@ -421,6 +449,43 @@ def cmd_update(args):
     log(f"device-swap -> {os.path.basename(staged)}" + (f" --reset {args.reset}" if args.reset else ""))
     swap_out = prim.device_swap(staged, reset=args.reset)
     log(f"  {swap_out}")
+
+    # REAL-BACKEND RELOAD ROUTING.
+    # `device-swap` reloads an in-process plugin-.so backend (apple-videotoolbox)
+    # or swaps the apple-pvg IDENTITY descriptor (tag/backend_version/hold_ms). It
+    # does NOT reload the display-GPU's real renderer (libmlapi/QMetal/air), which
+    # is RTLD_NODELETE-pinned for process life. A bundle that changes the real
+    # renderer declares backend_reload="backend-process": the renderer reload must
+    # go through a qdev-host backend-process restart on the same vfio-user socket
+    # (+ vfio reconnect, which the warm-swap resident survives, no guest reboot).
+    info["backend_reload"] = bundle.backend_reload
+    info["backend_pending"] = False
+    if bundle.backend_reload == "backend-process":
+        reload_cmd = getattr(args, "backend_reload_cmd", None)
+        if reload_cmd:
+            log(f"real-backend reload: running backend-process reload hook")
+            p = subprocess.run(reload_cmd, shell=True, capture_output=True, text=True)
+            log(f"  reload hook rc={p.returncode}: {(p.stdout + p.stderr).strip().splitlines()[-1] if (p.stdout+p.stderr).strip() else ''}")
+            if p.returncode != 0:
+                log("  backend-process reload FAILED -> treating as health failure")
+                try:
+                    out = prim.device_swap(prev_backing)
+                    log(f"  rolled back identity: {out}")
+                except UpdateError as e:
+                    log(f"  rollback ALSO failed: {e}")
+                    raise
+                info["kind"] = "warm-rollback"
+                return EX_HEALTH, info
+        else:
+            info["backend_pending"] = True
+            log("")
+            log("  *** REAL-BACKEND RELOAD PENDING ***")
+            log("  device-swap updated ONLY the identity descriptor (tag/backend_version).")
+            log("  The real host renderer (libmlapi/QMetal/air) is RTLD_NODELETE-pinned and")
+            log("  was NOT reloaded. Route it through the qdev-host backend-process swap")
+            log("  (process restart on the same vfio-user socket + vfio reconnect; the")
+            log("  warm-swap resident survives, no guest reboot) -- pending lane")
+            log("  L-WARMSWAP-BACKEND-PROC. Provide its mechanism via --backend-reload-cmd.")
 
     # HEALTH GATE
     if args.no_health:
@@ -449,10 +514,21 @@ def cmd_update(args):
                              "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
         st.data["previous"] = {"backing": prev_backing}
         st.data.pop("pending_reboot", None)
+        if info.get("backend_pending"):
+            st.data["pending_backend_reload"] = {
+                "bundle": bundle.name, "version": bundle.version,
+                "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
         st.save()
         log("")
+        if info.get("backend_pending"):
+            log(f"=== IDENTITY SWAPPED for '{bundle.name}' {bundle.version} (no guest reboot); "
+                f"REAL renderer reload PENDING backend-process swap ===")
+            info["kind"] = "warm"
+            return EX_PENDING, info
         log(f"=== COMMITTED: resident now serving '{bundle.name}' {bundle.version} (no guest reboot) ===")
-        return EX_OK
+        info["committed"] = True
+        info["kind"] = "warm"
+        return EX_OK, info
 
     # AUTO-ROLLBACK
     log("")
@@ -464,7 +540,257 @@ def cmd_update(args):
         log(f"  rollback ALSO failed: {e}")
         raise
     log(f"resident reverted to previous backing ({prev_backing}); update aborted.")
-    return EX_HEALTH
+    info["kind"] = "warm-rollback"
+    return EX_HEALTH, info
+
+
+def cmd_update(args):
+    prim = Primitives(find_qdevctl(args.qdevctl), resolve_target(args))
+    st = State(args.state_dir)
+
+    if args.rollback:
+        return _do_rollback(args, prim, st)
+
+    bundle = Bundle(args.bundle)
+    log(f"bundle: {bundle.name} {bundle.version}  envelope={bundle.envelope}  kind={bundle.kind}")
+
+    # 1. VERIFY
+    ok, vlines = bundle.verify()
+    for l in vlines:
+        log(f"  verify {l}")
+    if not ok:
+        raise UpdateError("bundle verification FAILED")
+    log("verify: OK")
+
+    rc, _info = run_host_update(args, prim, st, bundle, args.dry_run)
+    return rc
+
+
+# ======================================================================= apply
+# `apply` is the one-shot install/update entry point. It drives the HOST side
+# (warm swap or reboot-staging, via run_host_update) AND the GUEST side (the
+# FIXED resident kext): push+install over an exec channel if one exists, else
+# print the exact `sudo uniq-vgpu-guest-install ...` one-liner for the user.
+
+class GuestSSH:
+    """An SSH exec channel to the guest (auto-detected from --guest-ssh)."""
+
+    def __init__(self, spec, ssh_opts=None):
+        # spec: [user@]host[:port]
+        user_host, _, port = spec.partition(":")
+        self.port = port or "22"
+        self.user_host = user_host
+        self.ssh_opts = ssh_opts or ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+                                     "-o", "StrictHostKeyChecking=accept-new"]
+
+    def desc(self):
+        return f"ssh {self.user_host} (port {self.port})"
+
+    def exec(self, remote_cmd, timeout=120):
+        cmd = ["ssh"] + self.ssh_opts + ["-p", self.port, self.user_host, remote_cmd]
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+
+    def push(self, local, remote, timeout=120):
+        cmd = ["scp"] + self.ssh_opts + ["-P", self.port, local, f"{self.user_host}:{remote}"]
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if p.returncode != 0:
+            raise UpdateError(f"scp {local} failed: {(p.stderr or p.stdout).strip()}")
+
+
+def detect_guest_channel(args):
+    """Auto-detect a guest exec channel. Returns a channel or None.
+    Precedence: explicit --guest-ssh. (qemu-agent hook left for a QGA target.)"""
+    if getattr(args, "guest_ssh", None):
+        return GuestSSH(args.guest_ssh)
+    return None
+
+
+def read_guest_resident_kext(channel, args):
+    """Read the guest's live resident-kext identity. Returns dict or None.
+    Off-channel, honor --guest-kextstat-file (a captured `kmutil inspect`/kextstat)."""
+    txt = None
+    if channel:
+        try:
+            rc, out, err = channel.exec(
+                "kmutil inspect --show-kext-uuids -A "
+                "/Library/KernelCollections/AuxiliaryKernelExtensions.kc 2>/dev/null "
+                "| grep -i uniqvgpu || true")
+            txt = out
+        except Exception as e:
+            log(f"  (guest probe failed: {e})")
+            return None
+    elif getattr(args, "guest_kextstat_file", None) and os.path.exists(args.guest_kextstat_file):
+        txt = open(args.guest_kextstat_file, errors="replace").read()
+    if not txt or not txt.strip():
+        return None
+    # a line like: dev.uniqvgpu.driver  0.1.0  /Library/.../UniqVGPU.kext  (UUID)
+    import re
+    m = re.search(r"([0-9A-Fa-f]{8}-[0-9A-Fa-f-]{27,})", txt)
+    return {"present": True, "raw": txt.strip(), "uuid": (m.group(1).upper() if m else None)}
+
+
+def cmd_apply(args):
+    prim = Primitives(find_qdevctl(args.qdevctl), resolve_target(args))
+    st = State(args.state_dir)
+
+    if args.rollback:
+        log("apply --rollback: HOST side (symmetric warm swap to previous backing)")
+        rc = _do_rollback(args, prim, st)
+        log("")
+        log("GUEST side: the resident kext is FIXED across warm swaps and was NOT")
+        log("changed by a warm apply, so nothing to roll back in the guest.")
+        log("If a previous apply did a KEXT change (reboot path), revert it in the guest:")
+        log("  sudo uniq-vgpu-guest-install --rollback")
+        return rc
+
+    bundle = Bundle(args.bundle)
+    log(f"bundle: {bundle.name} {bundle.version}  envelope={bundle.envelope}  kind={bundle.kind}"
+        + (f"  kext={bundle.kext.get('id')}" if bundle.kext else "  (host-only, no kext)"))
+
+    # 1. VERIFY
+    ok, vlines = bundle.verify()
+    for l in vlines:
+        log(f"  verify {l}")
+    if not ok:
+        raise UpdateError("bundle verification FAILED")
+    log("verify: OK")
+
+    # 2. optional unit stage/switch (PVE VMID target): repoint the device unit at
+    # the staged host bundle so a later (re)start uses this backend. Off-VM
+    # (--control) the running harness IS the unit, so this is a no-op note.
+    if args.host_bundle_dir:
+        log(f"host-stage: bundle host libs staged at {args.host_bundle_dir}")
+        if not args.control:
+            log(f"  unit-switch: point {args.vmid}-{args.id or 'pvg0'} --plugin at "
+                f"{args.host_bundle_dir} (systemctl daemon-reload) for the next (re)start")
+
+    # 3. HOST side: warm swap or reboot-staging
+    log("")
+    log("--- HOST side ---")
+    host_rc, info = run_host_update(args, prim, st, bundle, args.dry_run)
+
+    # 4. GUEST side: the FIXED resident kext
+    log("")
+    log("--- GUEST side (resident kext) ---")
+    guest_required = False
+    guest_done = False
+    guest_oneliner = None
+
+    if not bundle.kext:
+        log("bundle ships NO kext (host-only backend update); guest untouched.")
+    else:
+        k = bundle.kext
+        kp = bundle.kext_path()
+        channel = detect_guest_channel(args)
+        running = read_guest_resident_kext(channel, args) if (channel or args.guest_kextstat_file) else None
+        want_uuid = (k.get("uuid") or "").upper()
+
+        if running and want_uuid and running.get("uuid") == want_uuid:
+            log(f"guest resident kext already current: {k.get('id')} ({want_uuid}) -- no guest action")
+        else:
+            guest_required = True
+            if running:
+                log(f"guest resident kext differs ({running.get('uuid')}) from bundle "
+                    f"({want_uuid or k.get('binary_sha256','?')[:12]}) -> kext install/update needed")
+            else:
+                log(f"guest resident kext not detected -> kext install needed "
+                    f"({k.get('id')} {want_uuid or ''})")
+
+            # the exact one-liner the user runs IN the guest (kext relpath in bundle)
+            guest_oneliner = f"sudo uniq-vgpu-guest-install {os.path.basename(kp)}"
+
+            if args.dry_run:
+                log(f"  DRY-RUN: would {'push+install over ' + channel.desc() if channel and not args.no_guest_exec else 'print the guest one-liner'}")
+            elif channel and not args.no_guest_exec:
+                log(f"exec channel: {channel.desc()} -> pushing kext + running guest-install remotely")
+                guest_done = _push_and_install_guest(channel, kp, k, args)
+            else:
+                log("no guest exec channel (auto-detect found none) -> run this IN the guest:")
+                log(f"  1) copy the kext into the guest, e.g.:")
+                log(f"       scp {kp} <guest>:~/{os.path.basename(kp)}")
+                log(f"  2) {guest_oneliner}")
+
+    # 5. VERDICT
+    log("")
+    log("=== apply verdict ===")
+    if args.dry_run:
+        plan = "WARM (no reboot)" if info["warm"] else "REBOOT (envelope changed)"
+        log(f"  host: {plan}")
+        if info["warm"] and bundle.backend_reload == "backend-process" and not getattr(args, "backend_reload_cmd", None):
+            log("  host backend: REAL renderer reload PENDING backend-process swap lane (identity-only via device-swap)")
+        log(f"  guest kext: {'install required' if guest_required else 'no change'}")
+        if guest_required and guest_oneliner:
+            log(f"  guest command: {guest_oneliner}")
+        return EX_OK
+
+    if not info["warm"]:
+        # reboot path: host staged, guest kext + reboot required
+        log("  REBOOT REQUIRED (envelope/ABI changed): nothing was swapped live.")
+        if bundle.kext:
+            log(f"  Install the guest kext then reboot: {guest_oneliner or 'sudo uniq-vgpu-guest-install <kext>'}")
+        log("  Re-run apply (or start the VM) after the guest reboot to serve the new envelope.")
+        return EX_REBOOT
+
+    if host_rc == EX_HEALTH:
+        log("  HOST health gate FAILED -> auto-rolled-back; guest untouched.")
+        return EX_HEALTH
+
+    # host identity swapped, but the REAL renderer reload is pending the backend-process lane
+    if host_rc == EX_PENDING or info.get("backend_pending"):
+        log("  HOST: identity descriptor swapped (no reboot), but the REAL renderer reload")
+        log("  (libmlapi/QMetal/air) is PENDING the qdev-host backend-process swap lane.")
+        log("  Re-run with --backend-reload-cmd <mechanism> once that lane lands to reload the renderer live.")
+        if guest_required:
+            log(f"  GUEST KEXT also required: {guest_oneliner}")
+        return EX_PENDING
+
+    # host warm-committed
+    if guest_done:
+        log("  WARM-UPDATED (host, no reboot) + guest kext installed over the exec channel.")
+        log("  Reboot the guest to load the new resident kext (host backend already live).")
+        return EX_OK
+    if guest_required:
+        log("  WARM-UPDATED (host, no reboot). GUEST KEXT INSTALL REQUIRED:")
+        log(f"    run in the guest:  {guest_oneliner}")
+        return EX_GUEST
+    log("  WARM-UPDATED, no reboot (host backend swapped; resident kext already current).")
+    return EX_OK
+
+
+def _push_and_install_guest(channel, kext_payload, kmeta, args):
+    """Push the kext payload + the guest-install script and run it under sudo,
+    forwarding the bundle's expected sha/uuid/id so the guest STOP-IF gates fire."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    installer = os.path.join(here, "uniq-vgpu-guest-install")
+    rpayload = f"/tmp/{os.path.basename(kext_payload)}"
+    rinstaller = "/tmp/uniq-vgpu-guest-install"
+    gate = ""
+    if kmeta.get("binary_sha256"):
+        gate += f" --expect-sha {kmeta['binary_sha256']}"
+    if kmeta.get("uuid"):
+        gate += f" --expect-uuid {kmeta['uuid']}"
+    if kmeta.get("id"):
+        gate += f" --id {kmeta['id']}"
+    try:
+        channel.push(kext_payload, rpayload)
+        if os.path.exists(installer):
+            channel.push(installer, rinstaller)
+        reboot_flag = "" if args.guest_reboot else "--no-reboot"
+        rc, out, err = channel.exec(
+            f"chmod +x {rinstaller}; sudo {rinstaller} {rpayload} --yes {reboot_flag}{gate}",
+            timeout=600)
+        for line in (out or "").splitlines():
+            log(f"    guest| {line}")
+        if rc != 0:
+            for line in (err or "").splitlines():
+                log(f"    guest-err| {line}")
+            log(f"  guest-install returned rc={rc}")
+            return False
+        return True
+    except Exception as e:
+        log(f"  guest push/install failed: {e}")
+        return False
 
 
 def _do_rollback(args, prim, st):
@@ -521,6 +847,10 @@ def cmd_status(args):
     if st.data.get("pending_reboot"):
         pr = st.data["pending_reboot"]
         log(f"  PENDING REBOOT:         {pr['bundle']} {pr['version']} (envelope {pr['envelope']}) staged")
+    if st.data.get("pending_backend_reload"):
+        pb = st.data["pending_backend_reload"]
+        log(f"  PENDING BACKEND RELOAD: {pb['bundle']} {pb['version']} identity swapped; real renderer "
+            f"reload via backend-process lane (swapped {pb['at']})")
     trip = read_ioreg_triplet(args)
     if trip:
         log("  guest ioreg triplet:")
@@ -566,10 +896,37 @@ def main(argv=None):
     u.add_argument("--rollback-to", help="backing to treat as 'previous' when none is recorded (default A)")
     u.add_argument("--reset", choices=["hotplug"], default=None,
                    help="trigger the guest re-handshake via QMP device_del+add (process stays alive)")
+    u.add_argument("--backend-reload-cmd",
+                   help="command that reloads the REAL host renderer (backend-process restart + vfio "
+                        "reconnect) for a backend_reload=backend-process bundle; run after device-swap")
     add_target_opts(u)
     add_health_opts(u)
     u.add_argument("--ioreg-cmd"); u.add_argument("--ioreg-file")
     u.set_defaults(fn=cmd_update)
+
+    ap_ = sub.add_parser("apply", help="one-shot install/update: HOST warm-swap (or reboot-stage) + GUEST kext")
+    ap_.add_argument("bundle", nargs="?", help="bundle directory (host backend + optional guest kext)")
+    ap_.add_argument("--dry-run", action="store_true",
+                     help="print the plan (warm vs reboot; guest-needed or not); no swap, no guest touch")
+    ap_.add_argument("--rollback", action="store_true", help="symmetric warm swap back to the previous backing")
+    ap_.add_argument("--rollback-to", help="backing to treat as 'previous' when none is recorded (default A)")
+    ap_.add_argument("--reset", choices=["hotplug"], default=None,
+                     help="trigger the guest re-handshake via QMP device_del+add (process stays alive)")
+    ap_.add_argument("--backend-reload-cmd",
+                     help="command that reloads the REAL host renderer (qdev-host backend-process restart "
+                          "+ vfio reconnect) for a backend_reload=backend-process bundle; run after device-swap")
+    ap_.add_argument("--host-bundle-dir", help="staged host bundle dir to repoint the device unit at (PVE target)")
+    ap_.add_argument("--guest-ssh", help="guest exec channel: [user@]host[:port] (auto-push + install the kext)")
+    ap_.add_argument("--no-guest-exec", action="store_true",
+                     help="never exec in the guest; only PRINT the sudo uniq-vgpu-guest-install one-liner")
+    ap_.add_argument("--guest-reboot", action="store_true",
+                     help="let the remote guest-install reboot the guest (default: --no-reboot)")
+    ap_.add_argument("--guest-kextstat-file",
+                     help="off-channel: a captured `kmutil inspect`/kextstat to read the resident kext uuid from")
+    add_target_opts(ap_)
+    add_health_opts(ap_)
+    ap_.add_argument("--ioreg-cmd"); ap_.add_argument("--ioreg-file")
+    ap_.set_defaults(fn=cmd_apply)
 
     r = sub.add_parser("rollback", help="symmetric warm swap back to the previous bundle")
     r.add_argument("--reset", choices=["hotplug"], default=None)
@@ -585,8 +942,8 @@ def main(argv=None):
     s.set_defaults(fn=cmd_status)
 
     args = ap.parse_args(argv)
-    if args.cmd == "update" and not args.rollback and not args.bundle:
-        ap.error("update needs a bundle (or --rollback)")
+    if args.cmd in ("update", "apply") and not args.rollback and not args.bundle:
+        ap.error(f"{args.cmd} needs a bundle (or --rollback)")
     try:
         return args.fn(args) or EX_OK
     except UpdateError as e:

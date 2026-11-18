@@ -37,6 +37,20 @@ def main():
     ap.add_argument("--envelope", required=True, help="ENVELOPE tag (the ABI-gate key)")
     ap.add_argument("--kind", default="host-backend")
     ap.add_argument("--backing", help="path to the VARIABLE backing .so (host-backend)")
+    ap.add_argument("--backend-reload", choices=["device-swap", "backend-process"],
+                    default="device-swap",
+                    help="how a WARM update reloads the backend: 'device-swap' = the backing .so / "
+                         "identity descriptor is swapped in-process (apple-videotoolbox plugin-.so, or "
+                         "the apple-pvg identity tag/backend_version); 'backend-process' = the REAL host "
+                         "renderer (libmlapi/QMetal/air) changed and must be reloaded by restarting the "
+                         "qdev-host backend process on the same vfio-user socket (device-swap alone only "
+                         "updates the identity string; the renderer is RTLD_NODELETE-pinned).")
+    ap.add_argument("--kext", help="path to the FIXED resident guest kext (.kext dir or .tar) for `apply`")
+    ap.add_argument("--kext-id", default="dev.uniqvgpu.driver", help="guest kext CFBundleIdentifier")
+    ap.add_argument("--kext-sha", help="expected kext binary sha256 (STOP-IF gate in the guest)")
+    ap.add_argument("--kext-uuid", help="expected kext LC_UUID (guest install verify + apply skip-if-current)")
+    ap.add_argument("--kext-build", action="append", default=[],
+                    help="a macOS BuildVersion this kext is validated on (repeatable, e.g. 25G342 25C56)")
     ap.add_argument("--extra", action="append", default=[],
                     help="extra file to include as RELPATH=SRCPATH (repeatable)")
     a = ap.parse_args()
@@ -44,13 +58,31 @@ def main():
     out = os.path.abspath(a.outdir)
     os.makedirs(out, exist_ok=True)
     manifest = {"schema": SCHEMA, "name": a.name, "version": a.version,
-                "envelope": a.envelope, "kind": a.kind}
+                "envelope": a.envelope, "kind": a.kind,
+                "backend_reload": a.backend_reload}
 
     if a.backing:
         os.makedirs(os.path.join(out, "backing"), exist_ok=True)
         rel = os.path.join("backing", os.path.basename(a.backing))
         shutil.copyfile(a.backing, os.path.join(out, rel))
         manifest["backing"] = rel
+
+    if a.kext:
+        os.makedirs(os.path.join(out, "kext"), exist_ok=True)
+        rel = os.path.join("kext", os.path.basename(a.kext))
+        src = os.path.abspath(a.kext)
+        if os.path.isdir(src):
+            shutil.copytree(src, os.path.join(out, rel), dirs_exist_ok=True)
+        else:
+            shutil.copyfile(src, os.path.join(out, rel))
+        kmeta = {"bundle": rel, "id": a.kext_id}
+        if a.kext_sha:
+            kmeta["binary_sha256"] = a.kext_sha
+        if a.kext_uuid:
+            kmeta["uuid"] = a.kext_uuid.upper()
+        if a.kext_build:
+            kmeta["validated_builds"] = a.kext_build
+        manifest["kext"] = kmeta
 
     for spec in a.extra:
         rel, _, src = spec.partition("=")
@@ -81,6 +113,9 @@ def main():
     print(f"  name={a.name} version={a.version} envelope={a.envelope} kind={a.kind}")
     if a.backing:
         print(f"  backing={manifest['backing']}")
+    if a.kext:
+        print(f"  kext={manifest['kext']['bundle']} id={manifest['kext']['id']}"
+              + (f" uuid={manifest['kext'].get('uuid')}" if manifest['kext'].get('uuid') else ""))
     print(f"  {len(lines)} file(s) in SHA256SUMS")
 
 
