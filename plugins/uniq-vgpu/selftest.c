@@ -262,10 +262,15 @@ static bool wait_reg(uint32_t off, uint32_t want, double timeout_s)
  * Mint a BANNER-DISTINGUISHABLE, ABI-identical libmlapi copy for reload cycle
  * `cycle` from a golden build: copy it into a private per-instance directory
  * (so its $ORIGIN RUNPATH resolves its own fresh libair2spirv/libMetal), then
- * overwrite the compiled-in build banner (marker + git, both fixed-length) with
- * cycle-distinct values.  Each dlmopen(LM_ID_NEWLM) of the result is an
- * independent co-resident instance whose live banner differs from every other.
- * Returns a malloc'd path to the minted libmlapi.so, or NULL. */
+ * overwrite the compiled-in build MARKER (QMETAL_BUILD_MARKER, CMake default
+ * "20260402_1308_FORCE_REBUILD_V3", fixed length) with a cycle-distinct value.
+ * The golden is the SAME libmlapi the plugin is built and booted against (the
+ * production session ABI), so the fixture no longer pins a historical build's
+ * git hash (it required ae78d0ef's "2994552d"; main's builds carry a 9-char
+ * short hash): the git field is left as built and only the marker, which the
+ * per-cycle NEW-banner check matches, is rewritten.  Each load of the result
+ * is an independent co-resident instance whose live banner differs from every
+ * other.  Returns a malloc'd path to the minted libmlapi.so, or NULL. */
 static int mint_replace(uint8_t *buf, size_t n, const char *from, const char *to)
 {
     size_t fl = strlen(from), tl = strlen(to);
@@ -281,7 +286,7 @@ static char *mint_instance(const char *golden, const char *sibdir, int cycle,
 {
     char dir[512], out[640], link[640], tgt[640];
     const char *sibs[] = { "libair2spirv.so.1", "libair2spirv.so", "libMetal.so" };
-    char git[9], marker[31];
+    char marker[31];
     uint8_t *buf;
     long n;
     FILE *f;
@@ -300,13 +305,15 @@ static char *mint_instance(const char *golden, const char *sibdir, int cycle,
     if (!buf || fread(buf, 1, n, f) != (size_t)n) { free(buf); fclose(f); return NULL; }
     fclose(f);
 
-    /* cycle-distinct, fixed-length banner fields (base: ae78d0ef build) */
-    snprintf(git, sizeof(git), "rl%06d", cycle);                      /* 8 chars */
+    /* cycle-distinct, fixed-length marker; the golden must carry main's banner
+     * format and the default build marker (else the mint is refused, loudly) */
     snprintf(marker, sizeof(marker), "RELOADCYCLE_%02d_INPROC_WARMSWAP", cycle); /* 30 chars */
-    if (strlen(git) != 8 || strlen(marker) != 30) { free(buf); return NULL; }
-    if (mint_replace(buf, n, "2994552d", git) ||
+    if (strlen(marker) != 30 ||
+        !memmem(buf, n, "libmlapi built %s git=%s marker=%s", 34) ||
         mint_replace(buf, n, "20260402_1308_FORCE_REBUILD_V3", marker)) {
-        free(buf); return NULL;   /* golden must be the known base build */
+        fprintf(stderr, "mint: %s lacks the libmlapi banner format or the default build marker\n",
+                golden);
+        free(buf); return NULL;
     }
     snprintf(out, sizeof(out), "%s/libmlapi.so", dir);
     f = fopen(out, "wb");
@@ -356,6 +363,15 @@ static void reset_deadlock_watchdog(int sig)
 {
     (void)sig;
     printf("FAIL reset under quiesce did not return within the watchdog (wait cycle)\n");
+    fflush(stdout);
+    _exit(2);
+}
+
+static const char *inflight_phase = "?";
+static void reload_inflight_watchdog(int sig)
+{
+    (void)sig;
+    printf("FAIL in-flight reload: %s did not return within the watchdog (wait cycle)\n", inflight_phase);
     fflush(stdout);
     _exit(2);
 }
@@ -1083,6 +1099,98 @@ int main(int argc, char **argv)
                 char banner[256]; get_live_banner(banner, sizeof(banner));
                 CHECK(strstr(banner, marker) != NULL, "rollback: good banner live after recovery: %s", banner);
                 free(good);
+            }
+
+            /* 10d. RELOAD WITH ACCEPTED GUEST-MEMORY WORK IN FLIGHT -- the live hang shape
+             * (apple-virgl evidence/runs/uiinfo-main-candidate-20261118T1813Z G7 and
+             * reload-deadlock-20261118T2110Z): qdev-host serializes BAR0 MMIO and the control
+             * socket on its main loop, so the guest's doorbell is ACCEPTED before the host
+             * quiesces for `reload`, and QMetal's FIFO worker is still consuming the ring when
+             * the quiesce takes the guest-memory table write side.  The reload drain
+             * (qmu_session_quiesce_host_callback_producers: accepted-work barrier, FIFO/EXEC3/
+             * display worker joins, qmu_vk_wait_all_retired) waits for that worker, whose next
+             * lookup waits for the write side the SAME thread holds.  QMetal's contract for
+             * that drain: "no main-AIO/BQL dependency locks may be held" (qmu_session.cpp).
+             * The precondition is ASSERTED, not assumed: FIFO_READ < FIFO_WRITE after a 100 ms
+             * hold under the quiesce (the worker is parked behind the write side).  Watchdog
+             * = a wait cycle (SIGALRM -> FAIL + _exit). */
+            {
+                const uint64_t fifo_gpa = B_IOVA + 0x100000;
+                uint8_t *fifo = guest + B_FILE_OFF + 0x100000;
+                const uint32_t nops = 5000, wptr = 12 * 5000;   /* 60000 of the 64 KiB ring */
+                qdp_dma_region b = { B_IOVA, B_LEN, guest + B_FILE_OFF, memfd, B_FILE_OFF,
+                                     PROT_READ | PROT_WRITE };
+                char marker[64];
+                char *inst = mint_instance(reload_golden, sib, 98, root, marker, sizeof(marker));
+                uint32_t fr = 0;
+                int attempt, parked = 0;
+
+                CHECK(inst != NULL, "in-flight reload: mint instance (marker=%s)", inst ? marker : "FAILED");
+                r = ops->quiesce(priv); ops->dma_register(priv, &b); ops->resume(priv);
+                signal(SIGALRM, reload_inflight_watchdog);
+                for (attempt = 1; inst && attempt <= 5 && !parked; attempt++) {
+                    /* the guest's boot handshake on the current Session, then a full ring */
+                    wr(PVG_REG_FIFO_ENABLE, 0);
+                    wr(PVG_REG_PROTOCOL_VERSION, 6);
+                    wr(PVG_REG_SHARED_STATE_PFN, (uint32_t)(fifo_gpa >> 12));
+                    wr(PVG_REG_FIFO_PFN, (uint32_t)(fifo_gpa >> 12));
+                    wr(PVG_REG_FIFO_OFFSET, 0x1000);
+                    wr(PVG_REG_FIFO_SIZE, 0x10000);
+                    wr(PVG_REG_FIFO_ENABLE, 1);
+                    for (uint32_t i = 0; i < nops; i++) {
+                        uint32_t nop[3] = { 0x03, 12, 0x5000 + i };
+                        memcpy(fifo + 0x1000 + 12 * i, nop, sizeof(nop));
+                    }
+                    memset(fifo, 0, 4);
+                    wr(PVG_REG_FIFO_WRITE, wptr);          /* doorbell accepted ... */
+                    r = ops->quiesce(priv);                /* ... then the host quiesces */
+                    usleep(100 * 1000);
+                    inflight_phase = "precondition FIFO_READ readback under the quiesce";
+                    alarm(30);
+                    fr = rd(PVG_REG_FIFO_READ);
+                    alarm(0);
+                    parked = r == 0 && fr < wptr;
+                    if (!parked) {
+                        ops->resume(priv);                 /* the worker beat the quiesce: retry */
+                    }
+                }
+                CHECK(parked, "in-flight reload precondition: accepted FIFO work parked behind the "
+                      "quiesce (FIFO_READ %u < FIFO_WRITE %u, attempt %d)", fr, wptr, attempt - 1);
+                if (parked) {
+                    double tr0 = now_s();
+                    int errs_before = get_int(&qmetal_errors);
+
+                    inflight_phase = "reload under the quiesce with accepted FIFO work in flight";
+                    alarm(30);
+                    int rr = ops->reload(priv, inst, QDP_RELOAD_RESET);
+                    alarm(0);
+                    ops->resume(priv);
+                    CHECK(rr == 0, "in-flight reload: quiesce+reload+resume with accepted FIFO work "
+                          "in flight returned rc=%d in %.0f ms (no wait cycle)", rr, (now_s() - tr0) * 1000.0);
+                    usleep(50 * 1000);
+                    char banner[256]; get_live_banner(banner, sizeof(banner));
+                    CHECK(strstr(banner, marker) != NULL, "in-flight reload: NEW banner live: %s", banner);
+                    /* the re-created Session serves the guest's next re-handshake */
+                    uint32_t nop[3] = { 0x03, 12, 0x4298 };
+                    wr(PVG_REG_PROTOCOL_VERSION, 6);
+                    wr(PVG_REG_SHARED_STATE_PFN, (uint32_t)(fifo_gpa >> 12));
+                    wr(PVG_REG_FIFO_PFN, (uint32_t)(fifo_gpa >> 12));
+                    wr(PVG_REG_FIFO_OFFSET, 0x1000);
+                    wr(PVG_REG_FIFO_SIZE, 0x10000);
+                    wr(PVG_REG_FIFO_ENABLE, 1);
+                    memcpy(fifo + 0x1000, nop, sizeof(nop));
+                    wr(PVG_REG_FIFO_WRITE, 12);
+                    CHECK(wait_reg(PVG_REG_FIFO_READ, 12, 5.0),
+                          "in-flight reload: re-created session consumes FIFO NOP (FIFO_READ %u)",
+                          rd(PVG_REG_FIFO_READ));
+                    CHECK(get_int(&qmetal_errors) == errs_before,
+                          "in-flight reload: 0 new QMU [ERROR] lines (%d)", get_int(&qmetal_errors) - errs_before);
+                    wr(PVG_REG_FIFO_ENABLE, 0);
+                } else {
+                    ops->resume(priv);
+                }
+                r = ops->quiesce(priv); ops->dma_unregister(priv, &b); ops->resume(priv);
+                free(inst);
             }
         }
     }

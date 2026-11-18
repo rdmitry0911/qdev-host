@@ -3449,7 +3449,7 @@ out:
     return rc;
 }
 
-int pvg_backend_reload(PvgState *s, const char *new_path, int reset)
+static int pvg_backend_reload_body(PvgState *s, const char *new_path, int reset)
 {
     const char *miss = NULL;
     struct pvg_qmu_vt nvt;
@@ -3568,6 +3568,45 @@ int pvg_backend_reload(PvgState *s, const char *new_path, int reset)
             s->qmu_error_count, s->backend_banner);
     pthread_mutex_unlock(&s->backing_lock);
     return 0;
+}
+
+/* The host runs reload() quiesced (qdev-host: quiesce -> reload -> resume, all on its
+ * main loop): this thread holds the guest-memory table write side (pvg_memory_quiesce)
+ * for the whole call.  The reload drain -- qmu_session_quiesce_host_callback_producers
+ * (accepted-work barrier, FIFO/EXEC3/display worker joins), qmu_destroy's
+ * qmu_vk_wait_all_retired -- waits for work the guest's doorbells already handed to
+ * QMetal, and that work reads/writes guest memory through lookups that wait for the
+ * same write side: reload would wait on them while they wait on reload.  Observed live
+ * (apple-virgl evidence/runs/uiinfo-main-candidate-20261118T1813Z G7: qdev-host
+ * deadlocked, guest lost) and deterministically in selftest step 10d (root-FIFO worker
+ * qmu_process_root_fifo -> pvg_map -> rdlock vs this thread in
+ * qmu_session_quiesce_host_callback_producers).  QMetal's contract for that drain is
+ * that its caller holds no lock accepted work depends on ("no main-AIO/BQL dependency
+ * locks may be held", qmu_session.cpp); the reference teardown runs under QEMU's RCU
+ * read side, which never blocks lookups.  A reload does not change the guest memory
+ * map, and no map change can arrive during the call (DMA map/unmap reach the plugin
+ * only from the same host main loop, which is inside this call), so lift the write side
+ * for the duration -- the same lift pvg_qmetal_device_reset makes for the same drain
+ * shape -- and take it back before returning to the host.  IRQs stay held (latched)
+ * throughout; the host's resume delivers them.  Lifting also keeps the re-created
+ * Session's own lookups on this thread off a read lock of a write side it holds. */
+int pvg_backend_reload(PvgState *s, const char *new_path, int reset)
+{
+    bool was_quiesced;
+    int r;
+
+    if (!s) {
+        return -EINVAL;
+    }
+    was_quiesced = s->mem.quiesced;
+    if (was_quiesced) {
+        pvg_memory_resume(s);
+    }
+    r = pvg_backend_reload_body(s, new_path, reset);
+    if (was_quiesced) {
+        pvg_memory_quiesce(s);
+    }
+    return r;
 }
 
 /* =========================================================== warm swap (v3)
