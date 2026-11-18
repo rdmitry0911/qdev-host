@@ -45,6 +45,7 @@ typedef struct aw_out_buffer {
     uint8_t  *uv;          /* NV12 chroma plane destination (may be NULL)        */
     size_t    uv_stride;
     uint32_t  width, height;
+    void     *landing;     /* integrator-private (e.g. a scatter shadow); engine copies/ignores it */
 } aw_out_buffer;
 
 /* queue-1 emit sink: one complete host->guest message (a vtpv message or a bare
