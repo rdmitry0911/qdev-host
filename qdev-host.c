@@ -38,6 +38,7 @@
 #include "qdp.h"
 #include "dbus/dbus-display1.h"
 #include "kms-sink.h"
+#include "ui-info-reply.h"
 
 #define DISPLAY1_ROOT "/org/qemu/Display1"
 #define DBUS_TIMEOUT  5000
@@ -993,12 +994,21 @@ static gboolean handle_register_listener(QemuDBusDisplay1Console *object, GDBusM
 static gboolean handle_set_uiinfo(QemuDBusDisplay1Console *o, GDBusMethodInvocation *inv, guint16 wmm, guint16 hmm,
                                   gint xoff, gint yoff, guint w, guint h, gpointer data)
 {
-    /* Forwarded to a v3 plugin (it may offer the guest this size); without
-     * one the guest keeps choosing its mode, as before. Display1 has no
-     * error for a refused size: the call completes either way. */
-    if (w && h) host_ui_info(w, h, wmm, hmm, "Display1");
-    else DBG("SetUIInfo %ux%u ignored (no size)", w, h);
-    qemu_dbus_display1_console_complete_set_uiinfo(o, inv);
+    /* Forwarded to a v3 plugin (it may offer the guest this size). Its result
+     * is the reply (ui-info-reply.h): accepted or unchanged complete the call;
+     * no ui_info / not followed -> Display1.Error.Unsupported as QEMU's own
+     * console answers, a refused size -> Display1.Error.Invalid, a stopped or
+     * failed device -> Display1.Error.Failed. A zero side (no size) completes
+     * without asking the plugin, as before. */
+    if (!w || !h) {
+        DBG("SetUIInfo %ux%u ignored (no size)", w, h);
+        qemu_dbus_display1_console_complete_set_uiinfo(o, inv);
+        return TRUE;
+    }
+    char msg[160];
+    const char *err = ui_info_dbus_error(host_ui_info(w, h, wmm, hmm, "Display1"), w, h, msg, sizeof(msg));
+    if (err) g_dbus_method_invocation_return_dbus_error(inv, err, msg);
+    else qemu_dbus_display1_console_complete_set_uiinfo(o, inv);
     return TRUE;
 }
 /* Input forwarding: Keyboard/Mouse of the exported console are relayed to the
