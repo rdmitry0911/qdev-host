@@ -50,9 +50,9 @@ endif
 #   make VIDEOTOOLBOX=1
 # Its module unit tests (no VM) run with: make apple-videotoolbox-test
 VT_DIR := plugins/apple-videotoolbox
-VT_SRC := $(addprefix $(VT_DIR)/,apple-videotoolbox.c vtpv_vaapi.c vtpv_h264.c vtpv_virtq.c \
-          aw_wire.c aw_sbuf.c aw_bplist.c aw_session.c)
-VT_HDR := $(addprefix $(VT_DIR)/,vtpv_proto.h vtpv_vaapi.h vtpv_h264.h vtpv_virtq.h \
+VT_SRC := $(addprefix $(VT_DIR)/,apple-videotoolbox.c vtpv_vaapi.c vtpv_nvdec.c vtpv_h264.c \
+          vtpv_virtq.c aw_wire.c aw_sbuf.c aw_bplist.c aw_session.c)
+VT_HDR := $(addprefix $(VT_DIR)/,vtpv_proto.h vtpv_vaapi.h vtpv_nvdec.h vtpv_h264.h vtpv_virtq.h \
           aw_wire.h aw_sbuf.h aw_bplist.h aw_session.h)
 VT_VA_CFLAGS := $(shell pkg-config --cflags libva libva-drm 2>/dev/null)
 VT_VA_LIBS   := $(shell pkg-config --libs libva libva-drm 2>/dev/null)
@@ -131,7 +131,7 @@ uniq-vgpu-selftest: plugins/uniq-vgpu/uniq-vgpu.so plugins/uniq-vgpu/apple-pvg.s
 $(VT_DIR)/apple-videotoolbox.so: $(VT_SRC) $(VT_HDR) qdp.h $(VFU_DEP)
 	@test -n "$(VT_VA_LIBS)" || { echo "apple-videotoolbox needs libva (pkg-config libva libva-drm)" >&2; exit 1; }
 	$(CC) $(CFLAGS) -fPIC -shared -I. -I$(VT_DIR) $(VFU_CFLAGS) $(VT_VA_CFLAGS) \
-	    -o $@ $(VT_SRC) $(VFU_LIBS) $(VT_VA_LIBS) -lpthread
+	    -o $@ $(VT_SRC) $(VFU_LIBS) $(VT_VA_LIBS) -lpthread -ldl
 
 # Module unit tests without a VM (protocol handler always; VA-API backend live
 # on a render node, skipped if none; plugin ABI smoke).
