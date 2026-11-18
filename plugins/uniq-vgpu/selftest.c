@@ -94,6 +94,9 @@ static int qmu_reset_done, plugin_reset_ok, plugin_reset_err, line_seq, ord_plug
  * reset and published the mode again after it ("phase=display_republished target=1 restart=0"). */
 static int display_republish_ok;
 static char last_refusal[4096];
+/* ui_info refusals: the plugin's "[display][WARN] ui_info ... refused: <reason>" lines */
+static int ui_info_refusals;
+static char last_ui_info_refusal[4096];
 static pthread_mutex_t host_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int host_irq_trigger(void *host, uint32_t subindex)
@@ -154,6 +157,10 @@ static void host_log(void *host, int level, const char *fmt, ...)
     }
     if (strstr(line, "firmware PCI identity") && strstr(line, "armed (")) {
         ord_rearm = line_seq;
+    }
+    if (strstr(line, "[apple-gfx-ml][display][WARN] ui_info ") && strstr(line, " refused: ")) {
+        ui_info_refusals++;
+        snprintf(last_ui_info_refusal, sizeof(last_ui_info_refusal), "%s", line);
     }
     if (strstr(line, "[apple-gfx-ml][memory][ERROR]")) {
         refusals++;
@@ -218,6 +225,28 @@ static int get_int(int *v)
     r = *v;
     pthread_mutex_unlock(&host_lock);
     return r;
+}
+
+/* The plugin logs from its own writer thread: wait (at most 2 s) until more
+ * than n ui_info refusal lines were seen, and copy the last one. */
+static bool wait_ui_info_refusal(int n, char *out, size_t len)
+{
+    for (int i = 0; i < 2000; i++) {
+        bool seen;
+
+        pthread_mutex_lock(&host_lock);
+        seen = ui_info_refusals > n;
+        if (seen) {
+            snprintf(out, len, "%s", last_ui_info_refusal);
+        }
+        pthread_mutex_unlock(&host_lock);
+        if (seen) {
+            return true;
+        }
+        usleep(1000);
+    }
+    snprintf(out, len, "(no refusal line within 2 s)");
+    return false;
 }
 
 /* ------------------------------------------------------------- helpers */
@@ -825,15 +854,40 @@ int main(int argc, char **argv)
     /* 9b. UI size requests (qdp v3 ui_info, display-modes=follow): the mode
      * list becomes the one requested size (served by the EFI mode registers
      * too), a repeat is reported unchanged, out-of-bounds requests change
-     * nothing, and the scanout keeps its size until the guest presents. */
+     * nothing, and the scanout keeps its size until the guest presents.
+     * Bounds are the reference's (uniq-vgpu.c pvg_ui_info_refusal): 1..65535
+     * per side and no other minimum (host testUpdateModeList u16 page fields,
+     * _PGDisplayMode init without a size check; guest edidInit u16 (w-1),(h-1),
+     * validateDetailedTiming active < 0x10000), at most 16777216 pixels (64 MiB
+     * IOFBMemorySize), the guest edidInit pixel clock ((h+10000)(w+10000)*
+     * refresh16 + 0x270fffff) / 0x27100000 <= 0x1000000, flags 0, and 60 Hz only
+     * (design debt E1). The clock cases: 65535x256 is 4648122 units at 60 Hz,
+     * 16777164 at 216.567 Hz (in bounds, then refused as not 60 Hz) and
+     * 16777241 at 216.568 Hz (above the clock limit). */
     {
         qdp_ui_info ui = { .size = sizeof(ui), .width = 1600, .height = 900 };
-        static const struct { uint32_t w, h, mhz, flags; const char *what; } bad[] = {
-            { 799, 600, 0, 0, "799x600" }, { 800, 599, 0, 0, "800x599" },
-            { 0x10000, 1000, 0, 0, "65536x1000" }, { 8192, 4096, 0, 0, "8192x4096" },
-            { 1600, 900, 59940, 0, "59.94 Hz" }, { 1600, 900, 0, 1, "flag 1" },
+        static const struct { uint32_t w, h, mhz, flags; const char *what, *reason; } bad[] = {
+            { 0, 900, 0, 0, "0x900", "refused: a side outside 1..65535" },
+            { 1600, 0, 0, 0, "1600x0", "refused: a side outside 1..65535" },
+            { 0x10000, 1000, 0, 0, "65536x1000", "refused: a side outside 1..65535" },
+            { 1000, 0x10000, 0, 0, "1000x65536", "refused: a side outside 1..65535" },
+            { 4097, 4096, 0, 0, "4097x4096 (16781312 pixels)", "refused: more than 16777216 pixels" },
+            { 8192, 4096, 0, 0, "8192x4096", "refused: more than 16777216 pixels" },
+            { 65535, 256, 216568, 0, "65535x256 @ 216.568 Hz (clock 16777241 > 0x1000000)",
+              "refused: pixel clock above the guest EDID limit" },
+            { 65535, 256, 216567, 0, "65535x256 @ 216.567 Hz (clock 16777164, in bounds)",
+              "refused: only 60 Hz is offered" },
+            { 1600, 900, 59940, 0, "1600x900 @ 59.94 Hz", "refused: only 60 Hz is offered" },
+            { 1600, 900, 120000, 0, "1600x900 @ 120 Hz", "refused: only 60 Hz is offered" },
+            { 1600, 900, 0, 1, "1600x900 flag 1", "refused: unknown flags" },
         };
-        int errors0 = get_int(&plugin_errors), refused = 0;
+        /* accepted: the VM118 window sizes, the 1x1 minimum, the former 800x600
+         * policy's edges, the pixel bound and the largest 60 Hz clock */
+        static const struct { uint32_t w, h; } good[] = {
+            { 1630, 572 }, { 1324, 626 }, { 1, 1 }, { 799, 600 }, { 800, 599 },
+            { 4096, 4096 }, { 65535, 256 }, { 256, 65535 },
+        };
+        int errors0 = get_int(&plugin_errors);
         uint32_t m0, m1;
         qdp_scanout so;
 
@@ -849,19 +903,30 @@ int main(int argc, char **argv)
         for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
             qdp_ui_info b = { .size = sizeof(b), .width = bad[i].w, .height = bad[i].h,
                               .refresh_mhz = bad[i].mhz, .flags = bad[i].flags };
-            int rb = ops->ui_info(priv, &b);
+            int n0 = get_int(&ui_info_refusals), rb;
+            char line[4096];
+            bool logged;
 
-            refused += rb == -EINVAL;
-            if (rb != -EINVAL) {
-                printf("INFO ui_info %s returned %d\n", bad[i].what, rb);
-            }
+            rb = ops->ui_info(priv, &b);
+            logged = wait_ui_info_refusal(n0, line, sizeof(line));
+            wr(PVG_REG_IOSFC_CMD, 0);
+            m0 = rd(PVG_REG_IOSFC_DATA);
+            CHECK(rb == -EINVAL && logged && strstr(line, bad[i].reason) && m0 == ((900u << 16) | 1600u),
+                  "ui_info %s: %d (-EINVAL), '%s'; list unchanged (0x%08x) [%s]", bad[i].what, rb,
+                  bad[i].reason, m0, line);
         }
-        wr(PVG_REG_IOSFC_CMD, 0);
-        m0 = rd(PVG_REG_IOSFC_DATA);
-        CHECK(refused == (int)(sizeof(bad) / sizeof(bad[0])) && m0 == ((900u << 16) | 1600u),
-              "%d of %zu out-of-bounds requests refused with -EINVAL (min 800x600, 16777216 "
-              "pixels, 60 Hz, sides <= 65535, flags 0); list unchanged (0x%08x)", refused,
-              sizeof(bad) / sizeof(bad[0]), m0);
+        for (size_t i = 0; i < sizeof(good) / sizeof(good[0]); i++) {
+            qdp_ui_info g = { .size = sizeof(g), .width = good[i].w, .height = good[i].h };
+
+            r = ops->ui_info(priv, &g);
+            wr(PVG_REG_IOSFC_CMD, 0);
+            m0 = rd(PVG_REG_IOSFC_DATA);
+            wr(PVG_REG_IOSFC_CMD, 1);
+            m1 = rd(PVG_REG_IOSFC_DATA);
+            CHECK(r == 0 && m0 == ((good[i].h << 16) | good[i].w) && m1 == 0,
+                  "ui_info %ux%u accepted: %d; mode list [%ux%u] (IOSFC_DATA 0x%08x, then 0x%08x)",
+                  good[i].w, good[i].h, r, good[i].w, good[i].h, m0, m1);
+        }
         ui.width = 2560;
         ui.height = 1440;
         ui.width_mm = 600;
