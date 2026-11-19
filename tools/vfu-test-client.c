@@ -31,6 +31,8 @@
  *   ctl SOCK PREFIX CMD   send CMD to the qdev-host --control socket SOCK and fail unless
  *                         the reply line starts with PREFIX (runs while this client is
  *                         attached, e.g. the reload guard: tools/test-reload-guard.sh)
+ *   ctlhc SOCK PREFIX CMD the same, but half-close the socket after sending (as socat does): a
+ *                         reply the host defers (reload with --vm-qmp) must still arrive
  *
  * SOCKET "-" runs the commands without a vfio-user connection (ctl and sleep only):
  * the same checks with no client attached.
@@ -453,14 +455,14 @@ static void cmd_r32max(int region, uint64_t off, unsigned max_ms)
           region, (unsigned long long)off, v, ms, max_ms);
 }
 
-static bool ctl_line(const char *path, const char *cmd, char *reply, size_t max);
+static bool ctl_line(const char *path, const char *cmd, char *reply, size_t max, bool half_close);
 
 static void cmd_qmpcheck(const char *ctl, unsigned n)
 {
     char rep[1024];
     const char *b, *e;
     unsigned long long begin = 0, end = 0;
-    if (!ctl_line(ctl, "backend", rep, sizeof(rep))) DIE("qmpcheck: control %s", ctl);
+    if (!ctl_line(ctl, "backend", rep, sizeof(rep), false)) DIE("qmpcheck: control %s", ctl);
     if ((b = strstr(rep, "reload_begin_ns="))) begin = strtoull(b + 16, NULL, 10);
     if ((e = strstr(rep, "reload_end_ns="))) end = strtoull(e + 14, NULL, 10);
     pthread_mutex_lock(&qf.lock);
@@ -474,7 +476,7 @@ static void cmd_qmpcheck(const char *ctl, unsigned n)
 }
 
 /* One control-socket request: send CMD, read one reply line. */
-static bool ctl_line(const char *path, const char *cmd, char *reply, size_t max)
+static bool ctl_line(const char *path, const char *cmd, char *reply, size_t max, bool half_close)
 {
     struct sockaddr_un a = { .sun_family = AF_UNIX };
     struct timeval tv = { .tv_sec = 30 };
@@ -485,6 +487,7 @@ static bool ctl_line(const char *path, const char *cmd, char *reply, size_t max)
     if (s < 0 || connect(s, (struct sockaddr *)&a, sizeof(a)) < 0) DIE("connect %s: %s", path, strerror(errno));
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     if (dprintf(s, "%s\n", cmd) < 0) DIE("control write: %s", strerror(errno));
+    if (half_close) shutdown(s, SHUT_WR);          /* as `echo CMD | socat - UNIX-CONNECT:SOCK` does */
     while (n + 1 < max) {
         ssize_t r = read(s, reply + n, 1);
         if (r <= 0 || reply[n] == '\n') break;
@@ -496,10 +499,10 @@ static bool ctl_line(const char *path, const char *cmd, char *reply, size_t max)
 }
 
 /* One control-socket request: send CMD, read one reply line, check its prefix. */
-static void cmd_ctl(const char *path, const char *prefix, const char *cmd)
+static void cmd_ctl(const char *path, const char *prefix, const char *cmd, bool half_close)
 {
     char reply[1024];
-    ctl_line(path, cmd, reply, sizeof(reply));
+    ctl_line(path, cmd, reply, sizeof(reply), half_close);
     check(!strncmp(reply, prefix, strlen(prefix)), "control \"%s\" -> \"%s\" (expected prefix \"%s\")",
           cmd, reply, prefix);
 }
@@ -523,7 +526,7 @@ int main(int argc, char **argv)
     }
     for (int i = 2; i < argc; i++) {
         const char *c = argv[i];
-        if (!attach && strcmp(c, "ctl") && strcmp(c, "sleep") && strcmp(c, "qmpfake") && strcmp(c, "qmpcheck")) DIE("%s needs a vfio-user connection", c);
+        if (!attach && strcmp(c, "ctl") && strcmp(c, "ctlhc") && strcmp(c, "sleep") && strcmp(c, "qmpfake") && strcmp(c, "qmpcheck")) DIE("%s needs a vfio-user connection", c);
 #define ARG(k) need(argc, argv, i + (k), c)
         if (!strcmp(c, "info")) cmd_info();
         else if (!strcmp(c, "cfg")) cmd_cfg();
@@ -552,7 +555,8 @@ int main(int argc, char **argv)
         else if (!strcmp(c, "remap")) { int n = atoi(ARG(1)); unsigned hz = atoi(ARG(2)); i += 2; cmd_remap(n, hz); }
         else if (!strcmp(c, "reset")) check(xfer(VFIO_USER_DEVICE_RESET, NULL, 0, NULL, 0, NULL, 0, NULL) == 0, "DEVICE_RESET");
         else if (!strcmp(c, "sleep")) { usleep(atoi(ARG(1)) * 1000); i++; }
-        else if (!strcmp(c, "ctl")) { cmd_ctl(ARG(1), ARG(2), ARG(3)); i += 3; }
+        else if (!strcmp(c, "ctl")) { cmd_ctl(ARG(1), ARG(2), ARG(3), false); i += 3; }
+        else if (!strcmp(c, "ctlhc")) { cmd_ctl(ARG(1), ARG(2), ARG(3), true); i += 3; }
         else if (!strcmp(c, "r32max")) {
             int reg = region_arg(ARG(1)); uint64_t off = strtoull(ARG(2), NULL, 0); unsigned ms = atoi(ARG(3)); i += 3;
             cmd_r32max(reg, off, ms);

@@ -618,7 +618,10 @@ static int host_ui_info(uint32_t w, uint32_t h, uint16_t wmm, uint16_t hmm, cons
  *                    shows the size once the guest presents at it
  * Errors: "err <reason>". A client's commands are answered in order: while its
  * screendump waits, its later lines stay queued. */
-typedef struct { int fd; guint watch; GString *in; char *shot; guint shot_timer; bool busy; } ctl_t;
+/* busy: a reload with the guest's vCPUs stopped is answering later (reload_job_t); eof: the client
+ * half-closed (as `echo CMD | socat - UNIX-CONNECT:SOCK` does) while a reply was still owed: it is
+ * kept until that reply is sent. */
+typedef struct { int fd; guint watch; GString *in; char *shot; guint shot_timer; bool busy, eof; } ctl_t;
 static GPtrArray *ctls;
 static double last_present_t;
 
@@ -637,6 +640,13 @@ static bool ctl_shots_pending(void)
     return false;
 }
 static void ctl_process(ctl_t *c);
+static void ctl_free(ctl_t *c);
+/* after a deferred reply: run the queued lines; a half-closed client goes once nothing is owed */
+static void ctl_resume(ctl_t *c)
+{
+    ctl_process(c);
+    if (c->eof && !c->shot && !c->busy) ctl_free(c);
+}
 static void ctl_shot_done(ctl_t *c)
 {
     const qdp_scanout *s = &disp.cur;
@@ -645,7 +655,7 @@ static void ctl_shot_done(ctl_t *c)
     else ctl_reply(c, "ok %" PRIu64 " %ux%u", disp.seq, s->width, s->height);
     g_clear_pointer(&c->shot, g_free);
     if (c->shot_timer) { g_source_remove(c->shot_timer); c->shot_timer = 0; }
-    ctl_process(c);
+    ctl_resume(c);
 }
 static gboolean ctl_shot_timeout(gpointer data)
 {
@@ -819,7 +829,7 @@ static gboolean reload_job_done(gpointer data)
         reload_reply(j->c, j->r, j->path, j->flags, note);
     }
     if (j->fd >= 0) close(j->fd);
-    if (j->c) { j->c->busy = false; ctl_process(j->c); }
+    if (j->c) { j->c->busy = false; ctl_resume(j->c); }
     reload_job = NULL;
     g_free(j->path); g_free(j);
     return G_SOURCE_REMOVE;
@@ -1027,6 +1037,7 @@ static gboolean ctl_read(gint fd, GIOCondition cond, gpointer data)
     ctl_t *c = data; char buf[4096];
     ssize_t n = read(fd, buf, sizeof(buf));
     if (n < 0 && (errno == EINTR || errno == EAGAIN)) return G_SOURCE_CONTINUE;
+    if (n == 0 && (c->shot || c->busy)) { c->eof = true; c->watch = 0; return G_SOURCE_REMOVE; }   /* reply still owed */
     if (n <= 0 || c->in->len + n > 65536) { DBG("control client gone"); c->watch = 0; ctl_free(c); return G_SOURCE_REMOVE; }
     g_string_append_len(c->in, buf, n);
     ctl_process(c);

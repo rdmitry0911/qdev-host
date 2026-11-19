@@ -39,8 +39,8 @@ timeout 60 $CL "$RUN/dev.sock" info qmpfake "$Q" 300 sleep 150 r32max bar0 0x0 1
     sleep $((MS + 1500)) qmpcheck "$C" 1 r32max bar0 0x0 1000 > "$OUT/A-guest.client.log" 2>&1 &
 G=$!
 sleep 0.1
-timeout 60 $CL - ctl "$C" "ok reloaded /x/vp-1.so" "reload /x/vp-1.so" > "$OUT/A-ctl.client.log" 2>&1
-result $? "A: reload accepted and completed"
+timeout 60 $CL - ctlhc "$C" "ok reloaded /x/vp-1.so" "reload /x/vp-1.so" > "$OUT/A-ctl.client.log" 2>&1
+result $? "A: reload accepted and completed; the deferred reply reaches a half-closed control client"
 wait $G
 result $? "A: in-flight BAR0 read answered within 1 s; reload ran inside QMP stop..cont; VM running after"
 kill -TERM "$PID" 2>/dev/null; wait "$PID" 2>/dev/null
