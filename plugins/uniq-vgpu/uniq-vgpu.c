@@ -48,6 +48,7 @@
 #include "pvg.h"
 #include <dlfcn.h>
 #include <elf.h>
+#include <link.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <sys/mman.h>
@@ -140,6 +141,7 @@ bool pvg_qmu_vt_bind(struct pvg_qmu_vt *vt, void *handle, long lmid, const char 
         { "qmu_suspend_state_validate",                       (void **)&vt->suspend_state_validate },
         { "qmu_suspend_state_free",                           (void **)&vt->suspend_state_free },
         { "qmu_suspend_state_capabilities",                   (void **)&vt->suspend_state_capabilities },
+        { "qmu_library_retire",                               (void **)&vt->library_retire },
     };
 
     (void)dlerror();
@@ -2410,6 +2412,51 @@ static void pvg_pin_libraries(void)
     }
 }
 
+/* D-RELOAD-VKCTX: pin every loaded object that uses the static TLS model
+ * (DT_FLAGS DF_STATIC_TLS: initial-exec TLS of its own or of a dependency).
+ * Each Session owns a VkInstance; destroying the last one lets the Vulkan loader
+ * dlclose the ICD, and the next vkCreateInstance dlopens it again.  glibc returns
+ * a module's static TLS block only when it is the last one allocated, so an ICD
+ * with initial-exec TLS (NVIDIA: libnvidia-tls 0x38 bytes) leaks a block per
+ * reload until the surplus is gone: the v9 gate's reload #26 on warm-4080 and the
+ * selftest's cycle 26 failed with the loader's "libnvidia-tls.so.590.48.01:
+ * cannot allocate memory in static TLS block" -> "Found no drivers!" ->
+ * vkCreateInstance VK_ERROR_INCOMPATIBLE_DRIVER.  Keeping such objects loaded
+ * for the life of the process makes the next dlopen a reference count bump.
+ * libmlapi itself uses dynamic TLS (no DF_STATIC_TLS) and is not pinned here. */
+static int pvg_pin_static_tls_object(struct dl_phdr_info *info, size_t size, void *opaque)
+{
+    const ElfW(Dyn) *dyn = NULL;
+    unsigned *pinned = opaque;
+
+    (void)size;
+    if (!info->dlpi_name || !info->dlpi_name[0]) {
+        return 0;   /* the executable (always resident) */
+    }
+    for (ElfW(Half) i = 0; i < info->dlpi_phnum; i++) {
+        if (info->dlpi_phdr[i].p_type == PT_DYNAMIC) {
+            dyn = (const ElfW(Dyn) *)(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
+        }
+    }
+    for (; dyn && dyn->d_tag != DT_NULL; dyn++) {
+        if (dyn->d_tag == DT_FLAGS && (dyn->d_un.d_val & DF_STATIC_TLS)) {
+            if (dlopen(info->dlpi_name, RTLD_NOW | RTLD_NOLOAD | RTLD_NODELETE)) {
+                (*pinned)++;   /* the extra reference is never dropped: process lifetime */
+            }
+            break;
+        }
+    }
+    return 0;
+}
+
+static void pvg_pin_static_tls_objects(PvgState *s)
+{
+    unsigned pinned = 0;
+
+    dl_iterate_phdr(pvg_pin_static_tls_object, &pinned);
+    pvg_log(s, "[uniq-vgpu-ml] pinned %u static-TLS objects for the life of the process\n", pinned);
+}
+
 /* Config space ids: the firmware identity while armed, else the device ids. */
 static void pvg_apply_pci_ids(PvgState *s, vfu_ctx_t *ctx)
 {
@@ -2627,6 +2674,8 @@ static int pvg_create_session(PvgState *s)
         pvg_log(s, "[uniq-vgpu-ml] [ERROR] realize: Failed to create qmetal device\n");
         return -ENODEV;
     }
+    /* The Session's VkInstance has the ICD loaded now. */
+    pvg_pin_static_tls_objects(s);
     switch (pvg_install_ordinary_physical(s)) {
     case PVG_INSTALLED:
         break;
@@ -3371,6 +3420,24 @@ static void pvg_reload_teardown(PvgState *s)
     qmu_destroy(s->qmu_dev);
     s->qmu_dev = NULL;
 
+    /* D-RELOAD-RESIDUE: the destroyed instance keeps nothing running.  A reload
+     * copy (not the base instance the plugin links) that retired cleanly is
+     * unloaded once the next instance's vtable is live (pvg_reload_load_and_create);
+     * until then pvg_qvt still points into it.  An instance without the retire
+     * entry stays resident, as before. */
+    if (pvg_qvt && pvg_qvt->library_retire) {
+        int rr = pvg_qvt->library_retire();
+
+        pvg_log(s, "[uniq-vgpu-ml][reload] destroyed instance retired (rc=%d, %s)\n", rr,
+                s->qmu_ns ? "reload copy: unloaded after the next instance is live" : "base instance: stays mapped");
+        if (rr == 0 && s->qmu_ns && pvg_qvt->handle == s->qmu_ns && !s->qmu_retired_ns) {
+            s->qmu_retired_ns = s->qmu_ns;
+        } else if (rr != 0) {
+            pvg_log(s, "[uniq-vgpu-ml][reload][ERROR] retire of the destroyed instance failed (%d): "
+                    "it stays resident\n", rr);
+        }
+    }
+
     /* leak-reset the host-side owners + session-scoped handles (the old instance
      * stays mapped forever; its qmu_* struct layouts belong to the old build) */
     s->ordinary_physical_context = NULL;
@@ -3666,9 +3733,11 @@ static int pvg_reload_load_and_create(PvgState *s, const char *new_path)
     if (r) {
         return r;   /* old instance already destroyed: caller rolls back */
     }
-    ns = dlopen(uniq_path, RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE | RTLD_DEEPBIND);
+    /* No RTLD_NODELETE: a copy that retires cleanly is unloaded after the next
+     * reload (qmu_retired_ns); one without the retire entry is never dlclosed. */
+    ns = dlopen(uniq_path, RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
     /* The mapping survives unlink on Linux; drop the on-disk copy so reloads do
-     * not accumulate files (RTLD_NODELETE keeps it resident). */
+     * not accumulate files. */
     unlink(uniq_path);
     if (!ns) {
         pvg_log(s, "[uniq-vgpu-ml][reload][ERROR] dlopen %s (unique-soname copy of %s): %s\n",
@@ -3689,6 +3758,21 @@ static int pvg_reload_load_and_create(PvgState *s, const char *new_path)
     pvg_qvt = &s->qvt_storage;
     s->qmu_ns = ns;
     s->qmu_lmid = lmid;
+
+    /* Nothing refers to the retired copy any more: its Session is destroyed, its
+     * threads joined (library_retire) and the vtable points at the new instance.
+     * Unload it (D-RELOAD-RESIDUE: +1 thread, +5 mappings and its resident code
+     * per reload before). */
+    if (s->qmu_retired_ns) {
+        void *retired = s->qmu_retired_ns;
+
+        s->qmu_retired_ns = NULL;
+        if (dlclose(retired) != 0) {
+            pvg_log(s, "[uniq-vgpu-ml][reload][ERROR] dlclose of the retired instance: %s\n", dlerror());
+        } else {
+            pvg_log(s, "[uniq-vgpu-ml][reload] retired instance %p closed\n", retired);
+        }
+    }
 
     pvg_log(s, "[uniq-vgpu-ml][reload] loaded %s lmid=%ld; re-creating Session...\n",
             new_path, lmid);

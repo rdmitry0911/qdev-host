@@ -109,6 +109,10 @@ struct pvg_qmu_vt {
     /* bit0: finishSuspend flushes every GPU-written resource to its guest backing
      * (reference flushResources).  Absent = no flush. */
     uint32_t (*suspend_state_capabilities)(void);
+    /* D-RELOAD-RESIDUE: joins the instance's process-lifetime threads after its
+     * last Session was destroyed.  Absent on an older build -> the retired
+     * instance stays resident (RTLD_NODELETE semantics, as before). */
+    int (*library_retire)(void);
     /* identity of the instance this vtable was bound from */
     void       *handle;        /* dlopen/dlmopen handle (base = the LM_ID_BASE copy) */
     long        lmid;          /* link-map namespace id (LM_ID_BASE for the base)    */
@@ -394,6 +398,8 @@ typedef struct PvgState {
      * Session from the parked state.  All under backing_lock. */
     struct pvg_qmu_vt qvt_storage; /* storage the global pvg_qvt points at          */
     void  *qmu_ns;                 /* current reload instance handle (NULL = base)   */
+    void  *qmu_retired_ns;         /* destroyed + retired copy, unloaded once the next
+                                    * instance's vtable is live (NULL = none pending) */
     long    qmu_lmid;              /* its link-map namespace id                      */
     char   *qmu_path;             /* path the active instance was loaded from (g_strdup) */
     uint64_t reload_count;         /* successful in-process reloads so far           */
