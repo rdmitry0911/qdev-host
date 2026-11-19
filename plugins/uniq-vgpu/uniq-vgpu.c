@@ -3439,9 +3439,41 @@ static int pvg_stop_phase_reversible(PvgState *s)
     return 0;
 }
 
+/* D-R7-PRESENT, hand-over: the display continues at the geometry and format it
+ * presented last (s->fb_*).  A new mode target on the new Session; the scanout
+ * keeps its front buffer (the guest's last frame), no black replace.  The
+ * reference's display client is the same PGDisplay across didResume: setNub:
+ * (7ffb1405b4ef) only drops its current frame, and finishRestore re-presents
+ * the page's surface (7ffb14040035 -> _presentSurface 7ffb1403d901), which
+ * reaches this target through the render workers already running. */
+static void pvg_handover_mode_call(void *opaque)
+{
+    PvgState *s = ((PvgModeCall *)opaque)->state;
+    struct qmu_display_target *next = NULL;
+    struct qmu_display_target *outgoing;
+    qmu_status status = QMU_OK;
+
+    if (s->qmu_dev) {
+        status = qmu_display_publish_mode_target(qmu_session_get_vulkan(s->qmu_dev), s->fb_width,
+                                                 s->fb_height, &next);
+        g_assert(status == QMU_OK || next == NULL);
+    }
+    outgoing = s->display_target;
+    s->display_target = next;
+    s->display_published = true;
+    qmu_display_target_release(outgoing);
+    s->rendering_frame_width = s->fb_width;
+    s->rendering_frame_height = s->fb_height;
+    pvg_log(s, "[apple-gfx-ml][reload]%s hand-over display: mode target %ux%u on the new Session "
+            "(status %d), scanout front kept\n", status != QMU_OK ? "[ERROR]" : "", s->fb_width,
+            s->fb_height, (int)status);
+}
+
 /* Reset the worker state parked by the reversible stop and start fresh present
- * + render workers on the re-created Session. */
-static int pvg_restart_workers(PvgState *s)
+ * + render workers on the re-created Session.  `handover`: re-publish the
+ * display at its current geometry before the resume (pvg_handover_mode_call);
+ * otherwise at the configured mode, as a fresh device. */
+static int pvg_restart_workers_ex(PvgState *s, bool handover)
 {
     PvgModeCall mode = { .state = s };
     int r;
@@ -3476,8 +3508,17 @@ static int pvg_restart_workers(PvgState *s)
     s->present_started = true;
 
     /* re-publish the parked display mode on the device loop */
-    pvg_loop_run_sync(s, pvg_initial_mode_call, &mode);
+    if (handover && s->fb_width && s->fb_height) {
+        pvg_loop_run_sync(s, pvg_handover_mode_call, &mode);
+    } else {
+        pvg_loop_run_sync(s, pvg_initial_mode_call, &mode);
+    }
     return 0;
+}
+
+static int pvg_restart_workers(PvgState *s)
+{
+    return pvg_restart_workers_ex(s, false);
 }
 
 /* Driver-agnostic co-residency: stamp a UNIQUE DT_SONAME into a sibling copy of
@@ -3705,6 +3746,15 @@ static int pvg_resume_from_blob(PvgState *s, const void *blob, size_t len, const
         pvg_log(s, "[apple-gfx-ml][reload][ERROR] %s refused the suspend state (willResume code %u)\n", who, code);
         return -EPROTO;
     }
+    /* The display client is attached and its frame handler live when didResume's
+     * finishRestore re-presents the current surface (D-R7-PRESENT): start the
+     * workers and publish the current geometry first. */
+    q = pvg_restart_workers_ex(s, true);
+    if (q != 0) {
+        pvg_log(s, "[apple-gfx-ml][reload][ERROR] %s: restart workers before didResume failed: %s\n",
+                who, strerror(-q));
+        return q;
+    }
     q = pvg_qvt->session_did_resume(s->qmu_dev);
     if (q != 0) {
         pvg_log(s, "[apple-gfx-ml][reload][ERROR] %s didResume failed (%d)\n", who, q);
@@ -3773,16 +3823,19 @@ static int pvg_backend_reload_body(PvgState *s, const char *new_path, int reset)
 
     r = pvg_reload_load_and_create(s, new_path);
     if (!r && blob) {
-        r = pvg_resume_from_blob(s, blob, blob_len, new_path);
+        r = pvg_resume_from_blob(s, blob, blob_len, new_path);   /* starts the workers itself */
         if (r && old_path) {
             /* Rollback (plan section 3 step 5): B refused the state; re-create A and
              * resume it from the SAME blob.  The reload itself still fails. */
             int rb;
             pvg_log(s, "[apple-gfx-ml][reload] rolling back to %s with the same suspend state\n", old_path);
+            if (s->qmu_dev && (s->present_started || s->render_started)) {
+                (void)pvg_stop_phase_reversible(s);   /* B's workers, if didResume failed */
+            }
             pvg_reload_teardown(s);
             rb = pvg_reload_load_and_create(s, old_path);
             if (!rb) rb = pvg_resume_from_blob(s, blob, blob_len, old_path);
-            if (!rb && pvg_restart_workers(s) == 0) {
+            if (!rb) {
                 g_free(s->qmu_path);
                 s->qmu_path = g_strdup(old_path);
                 pvg_log(s, "[apple-gfx-ml][reload] ROLLBACK OK: %s resumed, reload of %s refused\n",
@@ -3802,9 +3855,10 @@ static int pvg_backend_reload_body(PvgState *s, const char *new_path, int reset)
         g_free(old_path);
         return r;   /* device dead; caller rolls back */
     }
+    /* a hand-over started the workers before didResume (pvg_resume_from_blob) */
+    r = blob ? 0 : pvg_restart_workers(s);
     g_free(blob);
     g_free(old_path);
-    r = pvg_restart_workers(s);
     if (r) {
         pvg_log(s, "[apple-gfx-ml][reload][ERROR] restart workers failed: %s\n", strerror(-r));
         pthread_mutex_unlock(&s->backing_lock);

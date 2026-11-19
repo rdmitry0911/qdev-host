@@ -1469,11 +1469,53 @@ int main(int argc, char **argv)
                           "state %u, flags 0x%x)", r, txn0, txn1, st, flags);
                     PAGE_ACK();
                     errs_before = get_int(&qmetal_errors);
+                    /* D-R7-PRESENT, host side: the scanout keeps the guest's last frame across
+                     * a hand-over (the display client survives didResume; finishRestore
+                     * re-presents the page's surface, 7ffb14040035).  This page never presented
+                     * (+0xf98 = 0), so no present follows here: the front buffer, its geometry
+                     * and the frame count must stay as they were (red: the reload published a
+                     * black buffer at the configured mode).  The test writes a marker into the
+                     * front buffer as the stand-in for that last frame. */
+                    qdp_scanout so0, so1;
+                    int fc0;
+                    bool marker_ok = false;
+                    uint8_t *fmap = MAP_FAILED;
+                    size_t fmap_len = 0;
+                    CHECK(ops->get_scanout(priv, &so0) && so0.enabled, "ui_info hand-over: scanout %ux%u offset %u "
+                          "before the reload", so0.width, so0.height, so0.offset);
+                    {
+                        struct stat fst;
+                        if (fstat(so0.fd, &fst) == 0) {
+                            fmap_len = (size_t)fst.st_size;
+                            fmap = mmap(NULL, fmap_len, PROT_READ | PROT_WRITE, MAP_SHARED, so0.fd, 0);
+                        }
+                        if (fmap != MAP_FAILED) {
+                            for (size_t i = 0; i < (size_t)so0.stride * so0.height; i += 4096) {
+                                fmap[so0.offset + i] = 0x5a;
+                            }
+                        }
+                    }
+                    fc0 = get_int(&frame_calls);
                     /* hand-over 2: the client's list is unchanged across the reload */
                     r = ops->quiesce(priv);
                     rr = ops->reload(priv, b2, 0);
                     ops->resume(priv);
                     usleep(50 * 1000);
+                    CHECK(ops->get_scanout(priv, &so1) && so1.enabled && so1.width == so0.width &&
+                          so1.height == so0.height && so1.offset == so0.offset && get_int(&frame_calls) == fc0,
+                          "ui_info hand-over: the scanout keeps its front buffer (%ux%u offset %u -> %ux%u offset %u, "
+                          "frame_ready %d -> %d)", so0.width, so0.height, so0.offset, so1.width, so1.height,
+                          so1.offset, fc0, get_int(&frame_calls));
+                    if (fmap != MAP_FAILED) {
+                        marker_ok = true;
+                        for (size_t i = 0; i < (size_t)so1.stride * so1.height; i += 4096) {
+                            marker_ok = marker_ok && fmap[so1.offset + i] == 0x5a;
+                        }
+                        CHECK(marker_ok, "ui_info hand-over: the front buffer keeps the last frame (marker intact)");
+                        munmap(fmap, fmap_len);
+                    } else {
+                        printf("INFO ui_info hand-over: scanout memfd not writable here, marker check skipped\n");
+                    }
                     {
                         char banner[256];
                         get_live_banner(banner, sizeof(banner));
