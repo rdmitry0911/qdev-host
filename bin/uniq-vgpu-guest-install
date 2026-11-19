@@ -26,13 +26,20 @@
 # vGPU, then --rollback).
 set -u
 
+# Test seam ONLY: UNIQVGPU_GUEST_TEST_ROOT prefixes every absolute macOS tool and
+# filesystem path so tests/uniq-vgpu/test_guest_gl_bundle.py can run this script
+# off-guest against doubles. Unset in the guest (sudo also resets the environment):
+# ROOT is empty and every path is the real one.
+ROOT="${UNIQVGPU_GUEST_TEST_ROOT:-}"
+[ -n "$ROOT" ] && echo "guest-install: TEST ROOT $ROOT (doubles, not a guest)"
+
 KEXT_ID_DEFAULT="dev.uniqvgpu.driver"
-BOOT=/System/Library/KernelCollections/BootKernelExtensions.kc
-SYS=/System/Library/KernelCollections/SystemKernelExtensions.kc
-AUX=/Library/KernelCollections/AuxiliaryKernelExtensions.kc
-BACKUP_DIR=/var/db/uniqvgpu-kext-backups
+BOOT="$ROOT"/System/Library/KernelCollections/BootKernelExtensions.kc
+SYS="$ROOT"/System/Library/KernelCollections/SystemKernelExtensions.kc
+AUX="$ROOT"/Library/KernelCollections/AuxiliaryKernelExtensions.kc
+BACKUP_DIR="$ROOT"/var/db/uniqvgpu-kext-backups
 ROLLBACK_STATE="$BACKUP_DIR/rollback-state.sh"
-DEST_DIR=/Library/Extensions
+DEST_DIR="$ROOT"/Library/Extensions
 
 say()  { echo "guest-install: $*"; }
 stop() { echo "guest-install: STOP-IF: $*" >&2; exit 2; }
@@ -74,7 +81,7 @@ if [ "$DO_ROLLBACK" = "1" ]; then
   # 1) restore /Library/Extensions to its prior state
   if [ "${PRIOR_EXISTED:-0}" = "1" ] && [ -e "${PRIOR_BACKUP:-/nonexistent}" ]; then
     rm -rf "$DEST"
-    /usr/bin/ditto "$PRIOR_BACKUP" "$DEST" && /usr/sbin/chown -R 0:0 "$DEST"
+    "$ROOT"/usr/bin/ditto "$PRIOR_BACKUP" "$DEST" && "$ROOT"/usr/sbin/chown -R 0:0 "$DEST"
     ok "restored prior kext from $PRIOR_BACKUP"
   else
     rm -rf "$DEST"
@@ -85,17 +92,17 @@ if [ "$DO_ROLLBACK" = "1" ]; then
   # where `kmutil create -n aux` with nothing to add errors and would leave the
   # stale collection in place.
   if [ -n "${PRIOR_AUXKC:-}" ] && [ -e "${PRIOR_AUXKC:-/nonexistent}" ]; then
-    /bin/cp -p "$PRIOR_AUXKC" "$AUX" && /usr/sbin/chown 0:0 "$AUX"
-    ok "restored pre-install AuxKC ($(/usr/bin/shasum -a 256 "$AUX" | awk '{print $1}'))"
+    "$ROOT"/bin/cp -p "$PRIOR_AUXKC" "$AUX" && "$ROOT"/usr/sbin/chown 0:0 "$AUX"
+    ok "restored pre-install AuxKC ($("$ROOT"/usr/bin/shasum -a 256 "$AUX" | awk '{print $1}'))"
   elif [ "${PRIOR_AUXKC_EXISTED:-1}" = "0" ]; then
     rm -f "$AUX"
     ok "removed AuxKC (there was none before install)"
   else
-    /usr/bin/kmutil clear-staging >/dev/null 2>&1
+    "$ROOT"/usr/bin/kmutil clear-staging >/dev/null 2>&1
     PKR=()
     for k in "$DEST_DIR"/*.kext; do [ -d "$k" ] && PKR+=(-p "$k"); done
     if [ "${#PKR[@]}" -gt 0 ]; then
-      /usr/bin/kmutil create -n aux -L -x "${PKR[@]}" -B "$BOOT" -S "$SYS" -A "$AUX" ${PRIOR_KDK_FLAG:-} \
+      "$ROOT"/usr/bin/kmutil create -n aux -L -x "${PKR[@]}" -B "$BOOT" -S "$SYS" -A "$AUX" ${PRIOR_KDK_FLAG:-} \
         || stop "kmutil create (rollback) failed"
       ok "rebuilt AuxKC from $(( ${#PKR[@]} / 2 )) remaining kext(s) in $DEST_DIR"
     else
@@ -106,7 +113,7 @@ if [ "$DO_ROLLBACK" = "1" ]; then
   rm -f "$ROLLBACK_STATE"
   say "rollback complete. Reboot the guest to load the restored collection."
   [ "$NO_REBOOT" = "1" ] && exit 0
-  [ "$ASSUME_YES" = "1" ] && { say "rebooting..."; /sbin/reboot; }
+  [ "$ASSUME_YES" = "1" ] && { say "rebooting..."; "$ROOT"/sbin/reboot; }
   say "run: sudo reboot"
   exit 0
 fi
@@ -115,7 +122,7 @@ fi
 [ -n "$SRC" ] || stop "need a <KEXT> (a .kext, a .tar, or a uniq-vgpu bundle dir)"
 [ -e "$SRC" ] || stop "kext source not found: $SRC"
 
-WORK="$(/usr/bin/mktemp -d /tmp/uniqvgpu-install.XXXXXX)"
+WORK="$("$ROOT"/usr/bin/mktemp -d "$ROOT"/tmp/uniqvgpu-install.XXXXXX)"
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 
@@ -148,24 +155,24 @@ fi
 # a .tar (or .kext.tar) -> extract
 case "$KEXTDIR" in
   *.tar) say "unpacking $(basename "$KEXTDIR")"
-         /usr/bin/tar xf "$KEXTDIR" -C "$WORK" || stop "tar extract failed"
-         KEXTDIR="$(/usr/bin/find "$WORK" -maxdepth 2 -name '*.kext' -type d | head -1)"
+         "$ROOT"/usr/bin/tar xf "$KEXTDIR" -C "$WORK" || stop "tar extract failed"
+         KEXTDIR="$("$ROOT"/usr/bin/find "$WORK" -maxdepth 2 -name '*.kext' -type d | head -1)"
          [ -n "$KEXTDIR" ] || stop "no .kext found inside the tar" ;;
 esac
 [ -d "$KEXTDIR" ] || stop "kext bundle is not a directory: $KEXTDIR"
 DEST="$DEST_DIR/$(basename "$KEXTDIR")"
-BIN="$KEXTDIR/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$KEXTDIR/Contents/Info.plist" 2>/dev/null)"
+BIN="$KEXTDIR/Contents/MacOS/$("$ROOT"/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$KEXTDIR/Contents/Info.plist" 2>/dev/null)"
 [ -f "$BIN" ] || stop "kext has no Mach-O at $BIN"
 
 say "target kext: $KEXTDIR -> $DEST"
 
 # -- STOP-IF 1: identifier
-GOT_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$KEXTDIR/Contents/Info.plist" 2>/dev/null)"
+GOT_ID="$("$ROOT"/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$KEXTDIR/Contents/Info.plist" 2>/dev/null)"
 [ "$GOT_ID" = "$KEXT_ID" ] || stop "CFBundleIdentifier '$GOT_ID' != expected '$KEXT_ID'"
 ok "identifier $GOT_ID"
 
 # -- STOP-IF 2: binary sha (if expected)
-GOT_SHA="$(/usr/bin/shasum -a 256 "$BIN" | awk '{print $1}')"
+GOT_SHA="$("$ROOT"/usr/bin/shasum -a 256 "$BIN" | awk '{print $1}')"
 if [ -n "$EXPECT_SHA" ]; then
   [ "$GOT_SHA" = "$EXPECT_SHA" ] || stop "binary sha256 $GOT_SHA != expected $EXPECT_SHA"
   ok "binary sha256 $GOT_SHA"
@@ -174,7 +181,7 @@ else
 fi
 
 # -- STOP-IF 3: binary UUID (if expected)
-GOT_UUID="$(/usr/bin/dwarfdump --uuid "$BIN" 2>/dev/null | awk '{print $2}' | head -1)"
+GOT_UUID="$("$ROOT"/usr/bin/dwarfdump --uuid "$BIN" 2>/dev/null | awk '{print $2}' | head -1)"
 if [ -n "$EXPECT_UUID" ]; then
   [ "$GOT_UUID" = "$EXPECT_UUID" ] || stop "LC_UUID $GOT_UUID != expected $EXPECT_UUID"
   ok "binary uuid $GOT_UUID"
@@ -183,8 +190,8 @@ else
 fi
 
 # -- STOP-IF 4: macOS build in the validated set; decide the KDK flag
-BUILD="$(/usr/bin/sw_vers -buildVersion)"
-PRODVER="$(/usr/bin/sw_vers -productVersion)"
+BUILD="$("$ROOT"/usr/bin/sw_vers -buildVersion)"
+PRODVER="$("$ROOT"/usr/bin/sw_vers -productVersion)"
 say "macOS $PRODVER build $BUILD"
 if [ -n "$VALIDATED_BUILDS" ] && [ "$FORCE_BUILD" != "1" ]; then
   echo " $VALIDATED_BUILDS " | grep -q " $BUILD " \
@@ -193,7 +200,7 @@ if [ -n "$VALIDATED_BUILDS" ] && [ "$FORCE_BUILD" != "1" ]; then
 fi
 # KDK present for this build? -> build with it; else aux-only --allow-missing-kdk
 KDK_FLAG=""
-if ls "/Library/Developer/KDKs/" 2>/dev/null | grep -q "_${BUILD}\.kdk$"; then
+if ls "$ROOT/Library/Developer/KDKs/" 2>/dev/null | grep -q "_${BUILD}\.kdk$"; then
   ok "KDK present for $BUILD (building with it)"
 else
   KDK_FLAG="--allow-missing-kdk"
@@ -203,7 +210,7 @@ fi
 # -- STOP-IF 5: SIP posture (unsigned kext needs KEXT SIGNING disabled to LOAD).
 # Look specifically at the Kext Signing line (NOT a blanket "enabled" grep -- other
 # protections like "NVRAM Protections: enabled" are irrelevant to loading a kext).
-SIP="$(/usr/bin/csrutil status 2>/dev/null)"
+SIP="$("$ROOT"/usr/bin/csrutil status 2>/dev/null)"
 say "SIP: $(printf '%s' "$SIP" | tr '\n' ' ')"
 SIP_BLOCK=0
 if printf '%s' "$SIP" | grep -qi "Kext Signing: enabled"; then
@@ -230,7 +237,7 @@ if [ "$DRY_RUN" = "1" ]; then
   say "         kmutil clear-staging, kmutil create -n aux $KDK_FLAG, kmutil inspect verify"
   # show the CURRENT resident state (read-only)
   say "current AuxKC uniqvgpu entries:"
-  /usr/bin/kmutil inspect --show-kext-uuids -A "$AUX" 2>/dev/null | grep -i uniqvgpu || say "  (none in AuxKC)"
+  "$ROOT"/usr/bin/kmutil inspect --show-kext-uuids -A "$AUX" 2>/dev/null | grep -i uniqvgpu || say "  (none in AuxKC)"
   exit 0
 fi
 
@@ -239,9 +246,9 @@ mkdir -p "$BACKUP_DIR"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 PRIOR_EXISTED=0; PRIOR_BACKUP=""; PRIOR_SUMMARY="no prior kext at $DEST"
 if [ -e "$DEST" ]; then
-  PRIOR_UUID="$(/usr/bin/dwarfdump --uuid "$DEST/Contents/MacOS/"* 2>/dev/null | awk '{print $2}' | head -1)"
+  PRIOR_UUID="$("$ROOT"/usr/bin/dwarfdump --uuid "$DEST/Contents/MacOS/"* 2>/dev/null | awk '{print $2}' | head -1)"
   PRIOR_BACKUP="$BACKUP_DIR/$(basename "$DEST").${PRIOR_UUID:-prior}.$TS"
-  /bin/mv "$DEST" "$PRIOR_BACKUP" || stop "could not back up existing kext"
+  "$ROOT"/bin/mv "$DEST" "$PRIOR_BACKUP" || stop "could not back up existing kext"
   PRIOR_EXISTED=1
   PRIOR_SUMMARY="prior kext $(basename "$DEST") uuid=${PRIOR_UUID:-?} backed up to $PRIOR_BACKUP"
   ok "backed up existing kext -> $PRIOR_BACKUP"
@@ -251,9 +258,9 @@ fi
 PRIOR_AUXKC=""; PRIOR_AUXKC_EXISTED=0
 if [ -e "$AUX" ]; then
   PRIOR_AUXKC="$BACKUP_DIR/AuxiliaryKernelExtensions.kc.$TS"
-  /bin/cp -p "$AUX" "$PRIOR_AUXKC" || stop "could not back up the AuxKC"
+  "$ROOT"/bin/cp -p "$AUX" "$PRIOR_AUXKC" || stop "could not back up the AuxKC"
   PRIOR_AUXKC_EXISTED=1
-  ok "backed up pre-install AuxKC -> $PRIOR_AUXKC ($(/usr/bin/shasum -a 256 "$AUX" | awk '{print $1}'))"
+  ok "backed up pre-install AuxKC -> $PRIOR_AUXKC ($("$ROOT"/usr/bin/shasum -a 256 "$AUX" | awk '{print $1}'))"
 fi
 cat > "$ROLLBACK_STATE" <<EOF
 # uniq-vgpu-guest-install rollback state ($TS)
@@ -269,10 +276,10 @@ INSTALLED_SHA="$GOT_SHA"
 EOF
 
 # -- 2) install + fix ownership (kexts must be root:wheel)
-/usr/bin/ditto "$KEXTDIR" "$DEST" || stop "ditto install failed"
-/usr/sbin/chown -R 0:0 "$DEST"    || stop "chown root:wheel failed"
+"$ROOT"/usr/bin/ditto "$KEXTDIR" "$DEST" || stop "ditto install failed"
+"$ROOT"/usr/sbin/chown -R 0:0 "$DEST"    || stop "chown root:wheel failed"
 # verify the destination is byte-identical
-DST_SHA="$(/usr/bin/shasum -a 256 "$DEST/Contents/MacOS/"* | awk '{print $1}' | head -1)"
+DST_SHA="$("$ROOT"/usr/bin/shasum -a 256 "$DEST/Contents/MacOS/"* | awk '{print $1}' | head -1)"
 [ "$DST_SHA" = "$GOT_SHA" ] || stop "installed binary sha $DST_SHA != source $GOT_SHA"
 ok "installed to $DEST (sha $DST_SHA)"
 
@@ -281,7 +288,7 @@ ok "installed to $DEST (sha $DST_SHA)"
 # lists every imported symbol WITH its resolving "....kc:" target; an UNRESOLVED
 # one is a mangled line lacking a ".kc:" target (we do NOT grep symbol names for
 # 'error'/'undefined' -- names like setSubmissionError contain those substrings).
-LIBOUT="$(/usr/bin/kmutil libraries -p "$DEST" --undef-symbols 2>&1)"; LRC=$?
+LIBOUT="$("$ROOT"/usr/bin/kmutil libraries -p "$DEST" --undef-symbols 2>&1)"; LRC=$?
 UNRES="$(printf '%s\n' "$LIBOUT" | grep -E '^[[:space:]]*__Z' | grep -vE '\.kc:' || true)"
 if [ "$LRC" -ne 0 ] \
    || printf '%s' "$LIBOUT" | grep -qE 'could not be resolved|symbol(s)? not found|not found in any'; then
@@ -298,20 +305,20 @@ ok "external symbols all resolve in the on-disk .kc collections"
 # kext in /Library/Extensions (the new one is now among them), so existing aux
 # kexts (Wi-Fi, storage, the prior display driver) are PRESERVED -- `-p $DEST`
 # alone would build an AuxKC with ONLY our kext and silently drop the rest.
-/usr/bin/kmutil clear-staging >/dev/null 2>&1
+"$ROOT"/usr/bin/kmutil clear-staging >/dev/null 2>&1
 PK=()
 for k in "$DEST_DIR"/*.kext; do [ -d "$k" ] && PK+=(-p "$k"); done
 say "kmutil create -n aux ($(( ${#PK[@]} / 2 )) kext(s) in $DEST_DIR, incl. $(basename "$DEST")) $KDK_FLAG"
-/usr/bin/kmutil create -n aux -L -x "${PK[@]}" -B "$BOOT" -S "$SYS" -A "$AUX" $KDK_FLAG \
+"$ROOT"/usr/bin/kmutil create -n aux -L -x "${PK[@]}" -B "$BOOT" -S "$SYS" -A "$AUX" $KDK_FLAG \
   || stop "kmutil create -n aux FAILED (no reboot; restore with --rollback)"
 ok "AuxKC rebuilt ($(( ${#PK[@]} / 2 )) aux kext(s) preserved + the new resident)"
 
 # -- 5) verify it is in the AuxKC
-INSPECT="$(/usr/bin/kmutil inspect --show-kext-uuids -A "$AUX" 2>/dev/null | grep -i "$KEXT_ID")"
+INSPECT="$("$ROOT"/usr/bin/kmutil inspect --show-kext-uuids -A "$AUX" 2>/dev/null | grep -i "$KEXT_ID")"
 [ -n "$INSPECT" ] || stop "kmutil inspect does NOT show $KEXT_ID in the AuxKC (restore with --rollback)"
 say "AuxKC now carries:"
 echo "    $INSPECT"
-AUXSHA="$(/usr/bin/shasum -a 256 "$AUX" | awk '{print $1}')"
+AUXSHA="$("$ROOT"/usr/bin/shasum -a 256 "$AUX" | awk '{print $1}')"
 ok "verified: $KEXT_ID present in AuxKC (AuxKC sha $AUXSHA)"
 
 say "INSTALL COMPLETE. Rollback anytime: sudo uniq-vgpu-guest-install --rollback"
@@ -321,10 +328,10 @@ if [ "$NO_REBOOT" = "1" ]; then
 fi
 if [ "$ASSUME_YES" = "1" ]; then
   say "rebooting to load the kext..."
-  /sbin/reboot
+  "$ROOT"/sbin/reboot
 else
   printf 'guest-install: reboot now to load the kext? [y/N] '
   read -r ans
-  case "$ans" in y|Y|yes) /sbin/reboot ;; *) say "not rebooting; run: sudo reboot" ;; esac
+  case "$ans" in y|Y|yes) "$ROOT"/sbin/reboot ;; *) say "not rebooting; run: sudo reboot" ;; esac
 fi
 exit 0
