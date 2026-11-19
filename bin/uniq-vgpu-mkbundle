@@ -9,15 +9,29 @@ compares against the running resident.
 
   uniq-vgpu-mkbundle OUTDIR --name NAME --version VER --envelope ENV \
       [--kind host-backend] [--backing PATH.so]
+      [--kext KEXT [--kext-manifest OLD.json] ...]
+      [--gl-bundle UniqVGPUGL.bundle --gl-sha SHA --gl-installer install-gpu-bundle.sh]
+
+A GUEST-ONLY bundle (no --envelope, no --backing: a kext and/or the GL bundle)
+carries no envelope/kind; only `uniq-vgpu-guest-install` consumes it.
+
+The optional guest GL bundle (UniqVGPUGL.bundle, H-SANDBOX-GPUBUNDLES option A)
+is shipped as gl/UniqVGPUGL.bundle.tar + gl/install-gpu-bundle.sh (the apple-virgl
+tools/guest/install-gpu-bundle.sh, verbatim); the guest installer runs it after
+the kext/AuxKC steps.
 
 Example (VT host-backend warm bundle from increment 1's backing):
   uniq-vgpu-mkbundle /tmp/vt-hevc --name vt-hevc --version 0.3-warmswapB \
       --envelope vtpv-envelope-1 --backing .../build/backing_B.so
 """
-import argparse, hashlib, json, os, shutil, sys
+import argparse, hashlib, json, os, shutil, sys, tarfile
 
 MANIFEST = "uniq-vgpu-bundle.json"
 SCHEMA = "uniq-vgpu-bundle/1"
+GL_NAME = "UniqVGPUGL"                      # the only name the kext publishes (avgl_gl_bundle.h)
+GL_EXE = f"{GL_NAME}.bundle/Contents/MacOS/{GL_NAME}"
+GL_TAR = f"gl/{GL_NAME}.bundle.tar"
+GL_INSTALLER = "gl/install-gpu-bundle.sh"
 
 
 def sha256_file(path):
@@ -28,13 +42,58 @@ def sha256_file(path):
     return h.hexdigest()
 
 
+def sha256_bytes(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def _tar_owner_root(ti):
+    ti.uid = ti.gid = 0
+    ti.uname, ti.gname = "root", "wheel"
+    ti.mode &= 0o777             # no build-host setuid/setgid/sticky bits (e.g. a setgid group dir)
+    return ti
+
+
+def add_gl(out, src, want_sha):
+    """Write gl/UniqVGPUGL.bundle.tar from a UniqVGPUGL.bundle dir (deterministic:
+    sorted entries, root:wheel, source rwx modes/mtimes) or copy a .tar of one; refuse
+    unless its Contents/MacOS/UniqVGPUGL sha256 equals want_sha. Returns the sha."""
+    src = os.path.abspath(src)
+    os.makedirs(os.path.join(out, "gl"), exist_ok=True)
+    dst = os.path.join(out, GL_TAR)
+    if os.path.isdir(src):
+        if os.path.basename(src.rstrip("/")) != f"{GL_NAME}.bundle":
+            sys.exit(f"--gl-bundle must be a {GL_NAME}.bundle directory: {src}")
+        exe = os.path.join(src, "Contents", "MacOS", GL_NAME)
+        if not os.path.isfile(exe):
+            sys.exit(f"--gl-bundle has no Contents/MacOS/{GL_NAME}: {src}")
+        got = sha256_file(exe)
+        if got != want_sha:
+            sys.exit(f"--gl-sha mismatch: {exe} sha256 {got} != {want_sha}")
+        with tarfile.open(dst, "w", format=tarfile.USTAR_FORMAT) as t:
+            t.add(src, arcname=f"{GL_NAME}.bundle", filter=_tar_owner_root)
+    else:
+        try:
+            with tarfile.open(src) as t:
+                m = next((m for m in t.getmembers() if m.name in (GL_EXE, "./" + GL_EXE)), None)
+                if m is None or not m.isfile():
+                    sys.exit(f"--gl-bundle tar has no {GL_EXE}: {src}")
+                got = sha256_bytes(t.extractfile(m).read())
+        except tarfile.TarError as e:
+            sys.exit(f"--gl-bundle is neither a {GL_NAME}.bundle dir nor a readable tar: {src}: {e}")
+        if got != want_sha:
+            sys.exit(f"--gl-sha mismatch: {src}:{GL_EXE} sha256 {got} != {want_sha}")
+        shutil.copyfile(src, dst)
+    return got
+
+
 def main():
     ap = argparse.ArgumentParser(prog="uniq-vgpu-mkbundle", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("outdir")
     ap.add_argument("--name", required=True)
     ap.add_argument("--version", required=True)
-    ap.add_argument("--envelope", required=True, help="ENVELOPE tag (the ABI-gate key)")
+    ap.add_argument("--envelope", help="ENVELOPE tag (the ABI-gate key); required unless the bundle is "
+                    "guest-only (no --backing, only --kext and/or --gl-bundle)")
     ap.add_argument("--kind", default="host-backend")
     ap.add_argument("--backing", help="path to the VARIABLE backing .so (host-backend)")
     ap.add_argument("--backend-reload", choices=["device-swap", "backend-process"],
@@ -46,20 +105,44 @@ def main():
                          "qdev-host backend process on the same vfio-user socket (device-swap alone only "
                          "updates the identity string; the renderer is RTLD_NODELETE-pinned).")
     ap.add_argument("--kext", help="path to the FIXED resident guest kext (.kext dir or .tar) for `apply`")
-    ap.add_argument("--kext-id", default="dev.uniqvgpu.driver", help="guest kext CFBundleIdentifier")
+    ap.add_argument("--kext-id", help="guest kext CFBundleIdentifier (default dev.uniqvgpu.driver)")
+    ap.add_argument("--kext-manifest",
+                    help="an earlier bundle manifest whose kext block (id/sha/uuid/validated_builds/origin/"
+                         "validation/...) is carried over verbatim; only its 'bundle' path is re-derived. "
+                         "An explicit --kext-* value that differs from it is refused.")
     ap.add_argument("--kext-sha", help="expected kext binary sha256 (STOP-IF gate in the guest)")
     ap.add_argument("--kext-uuid", help="expected kext LC_UUID (guest install verify + apply skip-if-current)")
     ap.add_argument("--kext-build", action="append", default=[],
                     help="a macOS BuildVersion this kext is validated on (repeatable, e.g. 25G342 25C56)")
+    ap.add_argument("--gl-bundle", help="guest GL bundle: a UniqVGPUGL.bundle dir or a .tar of one")
+    ap.add_argument("--gl-sha", help="sha256 of UniqVGPUGL.bundle/Contents/MacOS/UniqVGPUGL "
+                                     "(required with --gl-bundle; STOP-IF gate here and in the guest)")
+    ap.add_argument("--gl-installer", help="install-gpu-bundle.sh (apple-virgl tools/guest; "
+                                           "required with --gl-bundle)")
+    ap.add_argument("--gl-origin", help="free-text provenance of the GL bundle (recorded in the manifest)")
     ap.add_argument("--extra", action="append", default=[],
                     help="extra file to include as RELPATH=SRCPATH (repeatable)")
     a = ap.parse_args()
 
+    if a.gl_bundle:
+        if not a.gl_sha or not a.gl_installer:
+            ap.error("--gl-bundle requires --gl-sha and --gl-installer")
+        if not os.path.isfile(a.gl_installer):
+            ap.error(f"--gl-installer not a file: {a.gl_installer}")
+    elif a.gl_sha or a.gl_installer or a.gl_origin:
+        ap.error("--gl-sha/--gl-installer/--gl-origin need --gl-bundle")
+    if a.kext_manifest and not a.kext:
+        ap.error("--kext-manifest needs --kext")
+    if not a.envelope and (a.backing or not (a.kext or a.gl_bundle)):
+        ap.error("--envelope is required (only a guest-only bundle: --kext/--gl-bundle without "
+                 "--backing, may omit it)")
+
     out = os.path.abspath(a.outdir)
     os.makedirs(out, exist_ok=True)
-    manifest = {"schema": SCHEMA, "name": a.name, "version": a.version,
-                "envelope": a.envelope, "kind": a.kind,
-                "backend_reload": a.backend_reload}
+    manifest = {"schema": SCHEMA, "name": a.name, "version": a.version}
+    if a.envelope:
+        manifest.update({"envelope": a.envelope, "kind": a.kind,
+                         "backend_reload": a.backend_reload})
 
     if a.backing:
         os.makedirs(os.path.join(out, "backing"), exist_ok=True)
@@ -75,14 +158,42 @@ def main():
             shutil.copytree(src, os.path.join(out, rel), dirs_exist_ok=True)
         else:
             shutil.copyfile(src, os.path.join(out, rel))
-        kmeta = {"bundle": rel, "id": a.kext_id}
-        if a.kext_sha:
-            kmeta["binary_sha256"] = a.kext_sha
-        if a.kext_uuid:
-            kmeta["uuid"] = a.kext_uuid.upper()
-        if a.kext_build:
-            kmeta["validated_builds"] = a.kext_build
+        if a.kext_manifest:
+            with open(a.kext_manifest) as f:
+                inherited = json.load(f).get("kext")
+            if not isinstance(inherited, dict):
+                sys.exit(f"--kext-manifest has no kext block: {a.kext_manifest}")
+            kmeta = dict(inherited)          # key order + every field kept verbatim
+            kmeta["bundle"] = rel
+            for key, val in (("id", a.kext_id), ("binary_sha256", a.kext_sha),
+                             ("uuid", a.kext_uuid.upper() if a.kext_uuid else None),
+                             ("validated_builds", a.kext_build or None)):
+                if val is None:
+                    continue
+                if key in kmeta and kmeta[key] != val:
+                    sys.exit(f"--kext-manifest {key}={kmeta[key]!r} conflicts with the explicit {val!r}")
+                kmeta[key] = val
+            kmeta.setdefault("id", "dev.uniqvgpu.driver")
+        else:
+            kmeta = {"bundle": rel, "id": a.kext_id or "dev.uniqvgpu.driver"}
+            if a.kext_sha:
+                kmeta["binary_sha256"] = a.kext_sha
+            if a.kext_uuid:
+                kmeta["uuid"] = a.kext_uuid.upper()
+            if a.kext_build:
+                kmeta["validated_builds"] = a.kext_build
         manifest["kext"] = kmeta
+
+    if a.gl_bundle:
+        want = a.gl_sha.lower()
+        add_gl(out, a.gl_bundle, want)
+        shutil.copyfile(a.gl_installer, os.path.join(out, GL_INSTALLER))
+        os.chmod(os.path.join(out, GL_INSTALLER), 0o755)
+        gmeta = {"name": GL_NAME, "bundle": GL_TAR, "installer": GL_INSTALLER,
+                 "binary_sha256": want}
+        if a.gl_origin:
+            gmeta["origin"] = a.gl_origin
+        manifest["gl"] = gmeta
 
     for spec in a.extra:
         rel, _, src = spec.partition("=")
@@ -110,12 +221,16 @@ def main():
         f.write("\n".join(lines) + "\n")
 
     print(f"bundle written: {out}")
-    print(f"  name={a.name} version={a.version} envelope={a.envelope} kind={a.kind}")
+    print(f"  name={a.name} version={a.version} "
+          + (f"envelope={a.envelope} kind={a.kind}" if a.envelope else "guest-only (no envelope)"))
     if a.backing:
         print(f"  backing={manifest['backing']}")
     if a.kext:
         print(f"  kext={manifest['kext']['bundle']} id={manifest['kext']['id']}"
               + (f" uuid={manifest['kext'].get('uuid')}" if manifest['kext'].get('uuid') else ""))
+    if a.gl_bundle:
+        print(f"  gl={manifest['gl']['bundle']} installer={manifest['gl']['installer']} "
+              f"sha={manifest['gl']['binary_sha256']}")
     print(f"  {len(lines)} file(s) in SHA256SUMS")
 
 

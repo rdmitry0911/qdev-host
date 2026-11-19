@@ -12,9 +12,21 @@
 #   sudo uniq-vgpu-guest-install <KEXT> --no-reboot --yes   install, don't reboot
 #   sudo uniq-vgpu-guest-install <KEXT> --dry-run          STOP-IF checks only, no change
 #   sudo uniq-vgpu-guest-install --rollback               restore the prior kext + rebuild AuxKC
+#   sudo uniq-vgpu-guest-install <BUNDLE-DIR> --no-gl     kext only: skip the bundle's GL step
 #
 # <KEXT> is a .kext directory, a .tar of one, OR a `uniq-vgpu` bundle directory
 # (the manifest's kext block supplies id / expected sha / uuid / validated builds).
+#
+# Guest GL bundle: when the bundle manifest has a "gl" block (uniq-vgpu-mkbundle
+# --gl-bundle), gl/UniqVGPUGL.bundle.tar + gl/install-gpu-bundle.sh are STOP-IF
+# checked with the kext (SHA256SUMS, Contents/MacOS/UniqVGPUGL sha256) before any
+# change, and installed AFTER the kext/AuxKC steps, before the reboot, with
+# `install-gpu-bundle.sh install UniqVGPUGL <bundle> <sha>` (H-SANDBOX-GPUBUNDLES
+# option A: the real bundle in /Library/Apple/System/Library/PrivateFrameworks,
+# an absolute link /Library/GPUBundles/UniqVGPUGL.bundle -> it; a leftover former
+# AppleVirglGL is retired). The kext publishes IOGLBundleName only when that path
+# is a directory at accelerator start, hence the same reboot. --rollback also puts
+# the prior GL layout back. A manifest without "gl" installs the kext only.
 #
 # It performs EXACTLY the sequence validated end-to-end on a 25G342 clone
 # (evidence/runs/pvg-warmswap-25g342-*): verify binary sha+uuid -> back up any
@@ -40,14 +52,49 @@ AUX="$ROOT"/Library/KernelCollections/AuxiliaryKernelExtensions.kc
 BACKUP_DIR="$ROOT"/var/db/uniqvgpu-kext-backups
 ROLLBACK_STATE="$BACKUP_DIR/rollback-state.sh"
 DEST_DIR="$ROOT"/Library/Extensions
+# guest GL bundle layout = apple-virgl tools/guest/install-gpu-bundle.sh (option A)
+GL_NAME=UniqVGPUGL
+GL_REAL_DIR="$ROOT"/Library/Apple/System/Library/PrivateFrameworks
+GL_LINK_DIR="$ROOT"/Library/GPUBundles
+GL_REAL="$GL_REAL_DIR/$GL_NAME.bundle"
+GL_LINK="$GL_LINK_DIR/$GL_NAME.bundle"
+GL_OLD_NAMES="AppleVirglGL"   # former name; retired by the installer if still present
 
 say()  { echo "guest-install: $*"; }
 stop() { echo "guest-install: STOP-IF: $*" >&2; exit 2; }
 ok()   { echo "guest-install:   OK  $*"; }
 
+# put a GL path back in the form recorded before install: none | link TARGET | dir BACKUP
+gl_restore() { # PATH KIND TARGET BACKUP
+  if [ -L "$1" ]; then rm -f "$1"; else rm -rf "$1"; fi
+  case "$2" in
+    none) ok "GL: removed $1 (absent before install)" ;;
+    link) ln -s "$3" "$1" || stop "could not restore link $1 -> $3"
+          ok "GL: restored link $1 -> $3" ;;
+    dir)  [ -d "$4" ] || stop "GL backup $4 missing; cannot restore $1"
+          "$ROOT"/usr/bin/ditto "$4" "$1" && "$ROOT"/usr/sbin/chown -R 0:0 "$1" \
+            || stop "could not restore $1 from $4"
+          ok "GL: restored $1 from $4" ;;
+    *)    stop "rollback state has no prior form for $1" ;;
+  esac
+}
+# record a GL path's prior form in the rollback state (a directory is copied to the backup dir)
+gl_snapshot() { # TAG PATH
+  if [ -L "$2" ]; then
+    printf 'GL_PRIOR_%s_KIND=link\nGL_PRIOR_%s_TARGET="%s"\n' "$1" "$1" "$(readlink "$2")" >> "$ROLLBACK_STATE"
+  elif [ -d "$2" ]; then
+    _bk="$BACKUP_DIR/$(basename "$2").$1.$TS"
+    "$ROOT"/usr/bin/ditto "$2" "$_bk" || stop "could not back up existing $2 (restore the kext with --rollback)"
+    printf 'GL_PRIOR_%s_KIND=dir\nGL_PRIOR_%s_BACKUP="%s"\n' "$1" "$1" "$_bk" >> "$ROLLBACK_STATE"
+    ok "backed up existing $2 -> $_bk"
+  else
+    printf 'GL_PRIOR_%s_KIND=none\n' "$1" >> "$ROLLBACK_STATE"
+  fi
+}
+
 # ------------------------------------------------------------------ args
 SRC=""
-DO_ROLLBACK=0; DRY_RUN=0; NO_REBOOT=0; ASSUME_YES=0; FORCE_BUILD=0
+DO_ROLLBACK=0; DRY_RUN=0; NO_REBOOT=0; ASSUME_YES=0; FORCE_BUILD=0; NO_GL=0
 EXPECT_SHA=""; EXPECT_UUID=""; KEXT_ID="$KEXT_ID_DEFAULT"; VALIDATED_BUILDS=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -59,7 +106,8 @@ while [ $# -gt 0 ]; do
     --expect-sha)  EXPECT_SHA="$2"; shift ;;
     --expect-uuid) EXPECT_UUID="$2"; shift ;;
     --id)          KEXT_ID="$2"; shift ;;
-    -h|--help)     sed -n '3,30p' "$0"; exit 0 ;;
+    --no-gl)       NO_GL=1 ;;
+    -h|--help)     sed -n '3,38p' "$0"; exit 0 ;;
     -*)            stop "unknown option: $1" ;;
     *)             SRC="$1" ;;
   esac
@@ -86,6 +134,12 @@ if [ "$DO_ROLLBACK" = "1" ]; then
   else
     rm -rf "$DEST"
     ok "removed installed kext (there was no prior kext to restore)"
+  fi
+  # 1b) the guest GL bundle, only if this install managed it (state from older installs has no GL_MANAGED)
+  if [ "${GL_MANAGED:-0}" = "1" ]; then
+    gl_restore "$GL_REAL" "${GL_PRIOR_REAL_KIND:-}" "${GL_PRIOR_REAL_TARGET:-}" "${GL_PRIOR_REAL_BACKUP:-}"
+    gl_restore "$GL_LINK" "${GL_PRIOR_LINK_KIND:-}" "${GL_PRIOR_LINK_TARGET:-}" "${GL_PRIOR_LINK_BACKUP:-}"
+    [ -n "${GL_RETIRED:-}" ] && say "  GL: former $GL_RETIRED stays retired in /var/db/uniqvgpu-retired (the kext publishes only $GL_NAME)"
   fi
   # 2) restore the AuxKC. Preferred: put back the exact pre-install collection file
   # (byte-for-byte PRE==POST). This also correctly handles "no aux kexts remain",
@@ -128,18 +182,19 @@ trap cleanup EXIT
 
 # -- resolve the .kext bundle + expected metadata (bundle manifest / .tar / dir)
 KEXTDIR=""
+GL_PRESENT=0; GL_DO=0
 if [ -d "$SRC" ] && [ -f "$SRC/uniq-vgpu-bundle.json" ]; then
   say "reading uniq-vgpu bundle manifest"
   MF="$SRC/uniq-vgpu-bundle.json"
-  read_json() { # key -> value from the flat kext block (python3 if present, else grep)
+  read_json() { # key [block=kext] -> value from that flat block (python3 if present, else grep: kext only)
     if command -v python3 >/dev/null 2>&1; then
-      python3 - "$MF" "$1" <<'PY' 2>/dev/null
+      python3 - "$MF" "$1" "${2:-kext}" <<'PY' 2>/dev/null
 import json,sys
-m=json.load(open(sys.argv[1])); k=m.get("kext",{}) or {}
+m=json.load(open(sys.argv[1])); k=m.get(sys.argv[3],{}) or {}
 v=k.get(sys.argv[2])
 print(" ".join(v) if isinstance(v,list) else (v if v is not None else ""))
 PY
-    else
+    elif [ "${2:-kext}" = "kext" ]; then
       grep -o "\"$1\"[^,}]*" "$MF" | head -1 | sed 's/.*: *//; s/^"//; s/"$//'
     fi
   }
@@ -148,6 +203,12 @@ PY
   [ -z "$EXPECT_UUID" ] && EXPECT_UUID="$(read_json uuid)"
   VALIDATED_BUILDS="$(read_json validated_builds)"
   _id="$(read_json id)"; [ -n "$_id" ] && KEXT_ID="$_id"
+  # the guest GL bundle block (detected without python3, so an unreadable block fails closed below)
+  if grep -q '"gl"[[:space:]]*:' "$MF"; then
+    GL_PRESENT=1
+    GL_MNAME="$(read_json name gl)";      GL_SHA="$(read_json binary_sha256 gl)"
+    GL_TAR_REL="$(read_json bundle gl)";  GL_INST_REL="$(read_json installer gl)"
+  fi
 else
   KEXTDIR="$SRC"
 fi
@@ -228,8 +289,53 @@ else
   ok "SIP posture permits an unsigned aux kext to load (Kext Signing not enforced)"
 fi
 
+# -- STOP-IF 6: the guest GL bundle (manifest "gl" block), checked before ANY change
+if [ "$GL_PRESENT" = "1" ] && [ "$NO_GL" = "1" ]; then
+  say "GL: the bundle ships $GL_NAME but --no-gl was given -> GL step SKIPPED (kext only)"
+elif [ "$GL_PRESENT" = "1" ]; then
+  [ -n "$GL_MNAME" ] && [ -n "$GL_SHA" ] && [ -n "$GL_TAR_REL" ] && [ -n "$GL_INST_REL" ] \
+    || stop "manifest gl block lacks name/binary_sha256/bundle/installer (or python3 cannot read it); --no-gl installs the kext only"
+  [ "$GL_MNAME" = "$GL_NAME" ] \
+    || stop "manifest gl.name '$GL_MNAME' != $GL_NAME (the GL bundle name the kext publishes); --no-gl installs the kext only"
+  GL_TAR="$SRC/$GL_TAR_REL"; GL_INST="$SRC/$GL_INST_REL"
+  [ -f "$GL_TAR" ]  || stop "GL bundle tar missing: $GL_TAR"
+  [ -f "$GL_INST" ] || stop "GL installer missing: $GL_INST"
+  # the installer runs as root: it and the tar must match the bundle's SHA256SUMS
+  if [ -f "$SRC/SHA256SUMS" ]; then
+    for _rel in "$GL_TAR_REL" "$GL_INST_REL"; do
+      _want="$(awk -v p="./$_rel" '$2 == p {print $1}' "$SRC/SHA256SUMS")"
+      _got="$("$ROOT"/usr/bin/shasum -a 256 "$SRC/$_rel" | awk '{print $1}')"
+      [ -n "$_want" ] || stop "SHA256SUMS has no entry for ./$_rel"
+      [ "$_got" = "$_want" ] || stop "$_rel sha256 $_got != SHA256SUMS $_want"
+    done
+    ok "GL tar + installer match SHA256SUMS"
+  else
+    say "  (bundle has no SHA256SUMS: GL tar/installer not sum-checked)"
+  fi
+  mkdir -p "$WORK/gl"
+  "$ROOT"/usr/bin/tar xf "$GL_TAR" -C "$WORK/gl" || stop "GL tar extract failed: $GL_TAR_REL"
+  GL_SRC="$WORK/gl/$GL_NAME.bundle"
+  [ -d "$GL_SRC" ] || stop "no $GL_NAME.bundle inside $GL_TAR_REL"
+  GL_GOT="$("$ROOT"/usr/bin/shasum -a 256 "$GL_SRC/Contents/MacOS/$GL_NAME" 2>/dev/null | awk '{print $1}')"
+  [ "$GL_GOT" = "$GL_SHA" ] || stop "GL binary sha256 ${GL_GOT:-<no Contents/MacOS/$GL_NAME>} != expected $GL_SHA"
+  ok "GL bundle $GL_NAME sha256 $GL_GOT (installer $GL_INST_REL)"
+  for _p in "$GL_REAL" "$GL_LINK"; do
+    if [ -e "$_p" ] && [ ! -L "$_p" ] && [ ! -d "$_p" ]; then
+      stop "$_p exists but is neither a link nor a directory; resolve it by hand or pass --no-gl"
+    fi
+  done
+  GL_DO=1
+fi
+
 if [ "$DRY_RUN" = "1" ]; then
   say "DRY-RUN: pre-install STOP-IF checks passed (id, sha, uuid, build, SIP); no changes made."
+  if [ "$GL_DO" = "1" ]; then
+    say "  GL: STOP-IF checks passed (SHA256SUMS, $GL_NAME sha256); after the AuxKC steps it would run:"
+    say "         bash $GL_INST_REL install $GL_NAME <extracted bundle> $GL_SHA (+ retire $GL_OLD_NAMES if present)"
+    if [ -L "$GL_LINK" ]; then say "  current GL: $GL_LINK -> $(readlink "$GL_LINK")"
+    elif [ -d "$GL_LINK" ]; then say "  current GL: $GL_LINK (a real directory)"
+    else say "  current GL: $GL_LINK absent"; fi
+  fi
   say "  (external-symbol resolution is checked during the real install -- kmutil libraries"
   say "   needs the kext installed root:wheel under /Library/Extensions; it is fail-closed +"
   say "   reversible: an unresolved symbol aborts before the AuxKC rebuild, undo with --rollback)"
@@ -274,6 +380,13 @@ PRIOR_SUMMARY="$PRIOR_SUMMARY"
 INSTALLED_UUID="$GOT_UUID"
 INSTALLED_SHA="$GOT_SHA"
 EOF
+# the guest GL bundle's prior layout (both paths), recorded before anything changes;
+# GL_MANAGED=1 is written last, so --rollback touches GL only if the record is complete
+if [ "$GL_DO" = "1" ]; then
+  gl_snapshot REAL "$GL_REAL"
+  gl_snapshot LINK "$GL_LINK"
+  echo "GL_MANAGED=1" >> "$ROLLBACK_STATE"
+fi
 
 # -- 2) install + fix ownership (kexts must be root:wheel)
 "$ROOT"/usr/bin/ditto "$KEXTDIR" "$DEST" || stop "ditto install failed"
@@ -320,6 +433,27 @@ say "AuxKC now carries:"
 echo "    $INSPECT"
 AUXSHA="$("$ROOT"/usr/bin/shasum -a 256 "$AUX" | awk '{print $1}')"
 ok "verified: $KEXT_ID present in AuxKC (AuxKC sha $AUXSHA)"
+
+# -- 6) the guest GL bundle (manifest "gl" block): after the kext + AuxKC steps, before the reboot
+if [ "$GL_DO" = "1" ]; then
+  say "installing GL bundle: bash $GL_INST_REL install $GL_NAME <extracted bundle> $GL_SHA"
+  GLOUT="$("$ROOT"/bin/bash "$GL_INST" install "$GL_NAME" "$GL_SRC" "$GL_SHA" 2>&1)"; GRC=$?
+  printf '%s\n' "$GLOUT" | sed 's/^/    gl| /'
+  { [ "$GRC" -eq 0 ] && printf '%s\n' "$GLOUT" | grep -qx "GPU_BUNDLE_OK $GL_NAME $GL_SHA"; } \
+    || stop "GL install did not report 'GPU_BUNDLE_OK $GL_NAME $GL_SHA' (rc=$GRC); kext + AuxKC are installed, no reboot (undo both with --rollback)"
+  ok "GL bundle $GL_NAME installed: $GL_LINK -> $GL_REAL (sha $GL_SHA)"
+  for _old in $GL_OLD_NAMES; do
+    if [ -e "$GL_LINK_DIR/$_old.bundle" ] || [ -L "$GL_LINK_DIR/$_old.bundle" ] || [ -e "$GL_REAL_DIR/$_old.bundle" ]; then
+      ROUT="$("$ROOT"/bin/bash "$GL_INST" retire "$_old" 2>&1)"; RRC=$?
+      printf '%s\n' "$ROUT" | sed 's/^/    gl| /'
+      { [ "$RRC" -eq 0 ] && printf '%s\n' "$ROUT" | grep -qx "GPU_BUNDLE_RETIRED $_old"; } \
+        || stop "retire $_old did not report 'GPU_BUNDLE_RETIRED $_old' (rc=$RRC); kext + AuxKC + $GL_NAME are installed, no reboot (undo with --rollback)"
+      echo "GL_RETIRED=\"$_old\"" >> "$ROLLBACK_STATE"
+      ok "retired the former GL bundle name $_old (moved to /var/db/uniqvgpu-retired)"
+    fi
+  done
+  say "GL: the kext publishes IOGLBundleName $GL_NAME only if $GL_LINK is a directory at accelerator start -> needs the reboot"
+fi
 
 say "INSTALL COMPLETE. Rollback anytime: sudo uniq-vgpu-guest-install --rollback"
 if [ "$NO_REBOOT" = "1" ]; then
