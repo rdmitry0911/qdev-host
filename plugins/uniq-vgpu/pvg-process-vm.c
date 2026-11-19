@@ -505,7 +505,7 @@ static int agfx_eeee_task_allocate(void *ctx, uint64_t *address,
 
 /* A refused remap is fatal in QMetal (ProviderFatal::remap): say why. */
 #define PVM_REMAP_FAIL(why, err) \
-    fprintf(stderr, "[apple-gfx-ml][pvm][ERROR] remap refused: %s errno=%d target=0x%" PRIx64 \
+    fprintf(stderr, "[uniq-vgpu-ml][pvm][ERROR] remap refused: %s errno=%d target=0x%" PRIx64 \
             " len=0x%" PRIx64 " source=0x%" PRIx64 "\n", (why), (err), \
             address ? *address : 0, length, source)
 
@@ -825,7 +825,7 @@ static void agfx_eeee_task_fatal(void *ctx, uint32_t reason)
     case QMU_EEEE_TASK_FATAL_ALLOCATION:
     case QMU_EEEE_TASK_FATAL_REMAP:
     case QMU_EEEE_TASK_FATAL_UNMAP:
-        fprintf(stderr, "apple-gfx-ml: EEEE process-VM provider fatal reason %u\n", reason);
+        fprintf(stderr, "uniq-vgpu-ml: EEEE process-VM provider fatal reason %u\n", reason);
         fflush(stderr);
         abort();
     default:
@@ -1260,7 +1260,7 @@ static void agfx_ordinary_physical_capture(void *opaque,
         span->complete = span->dma_export &&
             agfx_eeee_source_dmabuf_fd(span->dma_export) >= 0;
         if (!span->complete) {
-            pvg_log(s, "[apple-gfx-ml][memory][ERROR] udmabuf export failed stage=%d "
+            pvg_log(s, "[uniq-vgpu-ml][memory][ERROR] udmabuf export failed stage=%d "
                     "errno=%d interval=%u task=%u resource=%u length=0x%" PRIx64 "\n",
                     (int)span->export_failure.stage, span->export_failure.error_no,
                     span->export_failure.interval, span->task_id, span->resource_id,

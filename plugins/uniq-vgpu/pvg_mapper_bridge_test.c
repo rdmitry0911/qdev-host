@@ -1,7 +1,7 @@
 /* pvg_mapper_bridge_test.c — off-VM unit test for the uniq-vgpu<->apple-videotoolbox bridge.
  *
  * Operates on a plain heap buffer standing in for the shared-memory region: publishes a surface as
- * apple-pvg's mapper ring would, then resolves it as apple-videotoolbox's resolve_buffer would,
+ * uniq-vgpu's mapper ring would, then resolves it as apple-videotoolbox's resolve_buffer would,
  * checking the authoritative layout and the gpa pages survive the round trip (contiguous +
  * scattered), plus retract and miss.
  *

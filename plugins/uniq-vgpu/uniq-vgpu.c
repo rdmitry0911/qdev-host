@@ -33,8 +33,8 @@
  *                                 106b:eeee) while the OS sees the device ids;
  *                                 that driver's Start() makes the first BAR0
  *                                 access and reads no ids after it.
- *   log=stderr|host               device log sink (default stderr, the fork's
- *                                 "[apple-gfx-ml]" lines unchanged)
+ *   log=stderr|host               device log sink (default stderr, the device's
+ *                                 "[uniq-vgpu-ml]" lines)
  *   exit-on-disconnect=on         after the client is gone: stop the device
  *                                 and exit the process (default on)
  *   display-modes=follow          follow: a UI size request (qdp v3 ui_info:
@@ -66,10 +66,10 @@
  * stored NULL when the instance does not export them, so the NULL-tests at the
  * call sites route through the vtable instead (and follow a reload). */
 
-#define APPLE_GFX_ML_VENDOR_ID          0x106b
-#define APPLE_GFX_ML_DEVICE_ID          0xeeee
-#define APPLE_GFX_ML_MMIO_SIZE          (16 * 1024)
-#define APPLE_GFX_ML_DEFAULT_VRAM_MB    512
+#define UNIQ_VGPU_ML_VENDOR_ID          0x106b
+#define UNIQ_VGPU_ML_DEVICE_ID          0xeeee
+#define UNIQ_VGPU_ML_MMIO_SIZE          (16 * 1024)
+#define UNIQ_VGPU_ML_DEFAULT_VRAM_MB    512
 
 /* Log throttling: first N events, then every Mth (fork values) */
 #define AGFX_LOG_INITIAL_COUNT  10
@@ -237,7 +237,7 @@ static void *pvg_log_thread(void *opaque)
         if (dropped) {
             char line[96];
 
-            snprintf(line, sizeof(line), "[apple-gfx-ml][logger] dropped %" PRIu64
+            snprintf(line, sizeof(line), "[uniq-vgpu-ml][logger] dropped %" PRIu64
                      " log lines\n", dropped);
             pvg_log_sink(s, line);
         }
@@ -365,7 +365,7 @@ static void pvg_qmu_log_callback(void *ctx, qmu_log_level level,
             s->qmu_gpu_restart_count++;
         }
     }
-    full = g_strdup_printf("[apple-gfx-ml][qmetal][%s][%s] %s:%d %s: %s\n",
+    full = g_strdup_printf("[uniq-vgpu-ml][qmetal][%s][%s] %s:%d %s: %s\n",
                            qmu_log_level_name(level),
                            qmu_log_category_name(category),
                            base ? base : "?", line, func ? func : "?",
@@ -538,10 +538,10 @@ static void pvg_raise_irq(void *ctx, uint32_t vector)
     n = pvg_atomic_fetch_inc(&s->irq_count) + 1;
     if (n <= AGFX_LOG_INITIAL_COUNT || (n % AGFX_LOG_INTERVAL) == 0) {
         if (gate == PVG_IRQ_OPEN) {
-            pvg_log(s, "[apple-gfx-ml] raise_irq #%lu: msi_enabled=%d\n",
+            pvg_log(s, "[uniq-vgpu-ml] raise_irq #%lu: msi_enabled=%d\n",
                     (unsigned long)n, rc == 0);
         } else {
-            pvg_log(s, "[apple-gfx-ml] raise_irq #%lu: %s\n", (unsigned long)n,
+            pvg_log(s, "[uniq-vgpu-ml] raise_irq #%lu: %s\n", (unsigned long)n,
                     gate == PVG_IRQ_HELD ? "held over a guest memory map change"
                                          : "dropped, device stopped");
         }
@@ -619,13 +619,13 @@ static bool pvg_scanout_ensure(PvgState *s, size_t frame_size)
         return true;
     }
     if (ftruncate(sc->fd, (off_t)(slot * sc->nslots)) < 0) {
-        pvg_log(s, "[apple-gfx-ml][display][ERROR] scanout grow to %zu: %s\n",
+        pvg_log(s, "[uniq-vgpu-ml][display][ERROR] scanout grow to %zu: %s\n",
                 slot * sc->nslots, strerror(errno));
         return false;
     }
     map = mmap(NULL, slot * sc->nslots, PROT_READ | PROT_WRITE, MAP_SHARED, sc->fd, 0);
     if (map == MAP_FAILED) {
-        pvg_log(s, "[apple-gfx-ml][display][ERROR] scanout map: %s\n", strerror(errno));
+        pvg_log(s, "[uniq-vgpu-ml][display][ERROR] scanout map: %s\n", strerror(errno));
         return false;
     }
     pthread_mutex_lock(&sc->lock);
@@ -635,7 +635,7 @@ static bool pvg_scanout_ensure(PvgState *s, size_t frame_size)
     sc->front = -1;          /* offsets moved: the host refetches */
     sc->held = -1;
     pthread_mutex_unlock(&sc->lock);
-    pvg_log(s, "[apple-gfx-ml][display] scanout buffers grown to %zu bytes\n", slot);
+    pvg_log(s, "[uniq-vgpu-ml][display] scanout buffers grown to %zu bytes\n", slot);
     return true;
 }
 
@@ -727,7 +727,7 @@ static void pvg_apply_mode_change(PvgState *s, uint32_t width, uint32_t height,
                                  protection_requirements);
         return;
     }
-    pvg_log(s, "[apple-gfx-ml] mode_change: %ux%u iosurface_pf=0x%08x protection=0x%016"
+    pvg_log(s, "[uniq-vgpu-ml] mode_change: %ux%u iosurface_pf=0x%08x protection=0x%016"
             PRIx64 "\n", width, height, iosurface_pixel_format, protection_requirements);
     if (s->qmu_dev) {
         struct qmu_vulkan_ctx *vk = qmu_session_get_vulkan(s->qmu_dev);
@@ -741,7 +741,7 @@ static void pvg_apply_mode_change(PvgState *s, uint32_t width, uint32_t height,
                              protection_requirements);
     qmu_display_target_release(outgoing);
     if (status != QMU_OK) {
-        pvg_log(s, "[apple-gfx-ml] mode_change: native target unavailable status=%d\n",
+        pvg_log(s, "[uniq-vgpu-ml] mode_change: native target unavailable status=%d\n",
                 status);
     }
 }
@@ -843,13 +843,13 @@ static void pvg_render_submit_call(void *opaque)
     }
     if (rc > 0) {
         if (pvg_log_should_emit(&s->render_worker_log_count)) {
-            pvg_log(s, "[apple-gfx-ml] render_worker: submit_owned_output pending_frames=%d"
+            pvg_log(s, "[uniq-vgpu-ml] render_worker: submit_owned_output pending_frames=%d"
                     " mmio_wait=%d\n", pvg_atomic_read(&s->pending_frames), 0);
         }
         return;
     }
     if (pvg_log_should_emit(&s->render_worker_log_count)) {
-        pvg_log(s, "[apple-gfx-ml] render_worker: submit_owned_output rc=%d pending_frames=%d\n",
+        pvg_log(s, "[uniq-vgpu-ml] render_worker: submit_owned_output rc=%d pending_frames=%d\n",
                 rc, pvg_atomic_read(&s->pending_frames));
     }
     pvg_frame_completed(s, 0);
@@ -924,14 +924,14 @@ static void pvg_kick_display_render(PvgState *s, struct qmu_vulkan_ctx *vk)
                                             job->completion, &job->prepared_frame);
     if (rc > 0) {
         if (pvg_log_should_emit(&s->render_worker_log_count)) {
-            pvg_log(s, "[apple-gfx-ml] kick_display_render: prepared_output pending_frames=%d"
+            pvg_log(s, "[uniq-vgpu-ml] kick_display_render: prepared_output pending_frames=%d"
                     " mmio_wait=%d\n", pvg_atomic_read(&s->pending_frames), 0);
         }
         pvg_render_submit(s, job);
         return;
     }
     if (pvg_log_should_emit(&s->render_worker_log_count)) {
-        pvg_log(s, "[apple-gfx-ml] kick_display_render: prepare_output rc=%d pending_frames=%d\n",
+        pvg_log(s, "[uniq-vgpu-ml] kick_display_render: prepare_output rc=%d pending_frames=%d\n",
                 rc, pvg_atomic_read(&s->pending_frames));
     }
     /* a returned rejection is definitely unsubmitted and owes no callback */
@@ -983,7 +983,7 @@ static void pvg_frame_diagnostics(PvgState *s, const uint8_t *fb, uint32_t width
                 total++;
             }
         }
-        pvg_log(s, "[apple-gfx-ml] FRAME_CONTENT: #%lu hash=0x%08x nonblack=%d%%\n",
+        pvg_log(s, "[uniq-vgpu-ml] FRAME_CONTENT: #%lu hash=0x%08x nonblack=%d%%\n",
                 (unsigned long)pc, (unsigned)(h ^ (h >> 32)),
                 (int)(total ? (nonblack * 100 / total) : 0));
     }
@@ -1000,10 +1000,10 @@ static void pvg_frame_diagnostics(PvgState *s, const uint8_t *fb, uint32_t width
             cap_dir = env;
             if (mkdir(env, 0755) == 0 || errno == EEXIST) {
                 cap_ok = 1;
-                pvg_log(s, "[apple-gfx-ml] AGFX_FRAME_CAPTURE_DIR_ALL=%s "
+                pvg_log(s, "[uniq-vgpu-ml] AGFX_FRAME_CAPTURE_DIR_ALL=%s "
                         "(per-present PPM capture enabled)\n", env);
             } else {
-                pvg_log(s, "[apple-gfx-ml] AGFX_FRAME_CAPTURE_DIR_ALL=%s "
+                pvg_log(s, "[uniq-vgpu-ml] AGFX_FRAME_CAPTURE_DIR_ALL=%s "
                         "mkdir failed errno=%d\n", env, errno);
             }
         }
@@ -1167,11 +1167,11 @@ static bool pvg_apply_staged_frame(PvgState *s, PvgFrameJob *job)
                               stride, pc);
     }
     if (pc <= AGFX_LOG_INITIAL_COUNT || (pc % AGFX_LOG_INTERVAL) == 0) {
-        pvg_log(s, "[apple-gfx-ml] present_frame #%lu: %ux%u stride=%u (owner payload)\n",
+        pvg_log(s, "[uniq-vgpu-ml] present_frame #%lu: %ux%u stride=%u (owner payload)\n",
                 (unsigned long)pc, width, height, stride);
     }
     if (s->frame_count <= AGFX_LOG_INITIAL_COUNT || (s->frame_count % AGFX_LOG_INTERVAL) == 0) {
-        pvg_log(s, "[apple-gfx-ml] frame_completed_bh: present #%lu %ux%u stride=%u\n",
+        pvg_log(s, "[uniq-vgpu-ml] frame_completed_bh: present #%lu %ux%u stride=%u\n",
                 (unsigned long)s->frame_count, width, height, stride);
     }
     return true;
@@ -1196,7 +1196,7 @@ static void pvg_frame_completed_bh(void *opaque)
     job->chain_needed = pending > 0;
     frame_applied = job->frame_expected ? pvg_apply_staged_frame(s, job) : false;
     if (pvg_log_should_emit(&s->frame_completed_log_count)) {
-        pvg_log(s, "[apple-gfx-ml] frame_completed_bh: pending_frames=%d frame_applied=%d"
+        pvg_log(s, "[uniq-vgpu-ml] frame_completed_bh: pending_frames=%d frame_applied=%d"
                 " mmio_wait=%d\n", pvg_atomic_read(&s->pending_frames),
                 frame_applied ? 1 : 0, 0);
     }
@@ -1204,7 +1204,7 @@ static void pvg_frame_completed_bh(void *opaque)
         struct qmu_vulkan_ctx *vk = qmu_session_get_vulkan(s->qmu_dev);
 
         if (!vk) {
-            pvg_log(s, "[apple-gfx-ml] frame_completed_bh: vk=NULL\n");
+            pvg_log(s, "[uniq-vgpu-ml] frame_completed_bh: vk=NULL\n");
         } else {
             PvgHostWork owner = s->deferred_frame_owner;
             PvgRenderKickoff kick = { .state = s, .vk = vk };
@@ -1267,18 +1267,18 @@ static void pvg_new_frame_handler_bh(void *opaque)
     }
     vk = qmu_session_get_vulkan(s->qmu_dev);
     if (!vk) {
-        pvg_log(s, "[apple-gfx-ml] new_frame_handler_bh: vk=NULL\n");
+        pvg_log(s, "[uniq-vgpu-ml] new_frame_handler_bh: vk=NULL\n");
         return;
     }
     if (pvg_log_should_emit(&s->new_frame_handler_log_count)) {
-        pvg_log(s, "[apple-gfx-ml] new_frame_handler_bh: pending_frames=%d mmio_wait=%d\n",
+        pvg_log(s, "[uniq-vgpu-ml] new_frame_handler_bh: pending_frames=%d mmio_wait=%d\n",
                 pvg_atomic_read(&s->pending_frames), 0);
     }
     /* reference throttle: pending_frames >= 2 drops (apple-gfx.m:2672) */
     pending = pvg_atomic_read(&s->pending_frames);
     if (pending >= 2) {
         if (pvg_log_should_emit(&s->new_frame_handler_log_count)) {
-            pvg_log(s, "[apple-gfx-ml] new_frame_handler_bh: drop pending_frames=%d\n",
+            pvg_log(s, "[uniq-vgpu-ml] new_frame_handler_bh: drop pending_frames=%d\n",
                     pending);
         }
         return;
@@ -1289,13 +1289,13 @@ static void pvg_new_frame_handler_bh(void *opaque)
         g_assert(!s->deferred_frame_owner.state);
         s->deferred_frame_owner = pvg_host_work_ref(s, false);
         if (pvg_log_should_emit(&s->new_frame_handler_log_count)) {
-            pvg_log(s, "[apple-gfx-ml] new_frame_handler_bh: chain-only pending_frames=%d\n",
+            pvg_log(s, "[uniq-vgpu-ml] new_frame_handler_bh: chain-only pending_frames=%d\n",
                     pending);
         }
         return;
     }
     if (pvg_log_should_emit(&s->new_frame_handler_log_count)) {
-        pvg_log(s, "[apple-gfx-ml] new_frame_handler_bh: queue_render pending_frames=%d\n",
+        pvg_log(s, "[uniq-vgpu-ml] new_frame_handler_bh: queue_render pending_frames=%d\n",
                 pending);
     }
     pvg_kick_display_render(s, vk);
@@ -1318,7 +1318,7 @@ static void pvg_new_frame_signal(void *ctx)
         qmu_vk_consume_current_frame_signal(vk);
     }
     if (pvg_log_should_emit(&s->new_frame_signal_log_count)) {
-        pvg_log(s, "[apple-gfx-ml] new_frame_signal: enqueue pending_frames=%d mmio_wait=%d\n",
+        pvg_log(s, "[uniq-vgpu-ml] new_frame_signal: enqueue pending_frames=%d mmio_wait=%d\n",
                 pvg_atomic_read(&s->pending_frames), 0);
     }
     pvg_schedule_host_bh(s, pvg_new_frame_handler_bh, s);
@@ -1338,7 +1338,7 @@ static void pvg_schedule_display_completion(void *ctx, void (*fn)(void *), void 
     job->owner = pvg_host_work_ref(s, false);
     job->fn = fn;
     job->opaque = comp_ctx;
-    pvg_log(s, "[apple-gfx-ml] schedule_display_completion: enqueue mmio_wait=%d\n", 0);
+    pvg_log(s, "[uniq-vgpu-ml] schedule_display_completion: enqueue mmio_wait=%d\n", 0);
     pvg_loop_enqueue(s, job);
 }
 
@@ -1410,7 +1410,7 @@ static void pvg_present_on_queue(void *opaque)
         return;
     }
     if (pvg_log_should_emit(&s->bootstrap_present_log_count)) {
-        pvg_log(s, "[apple-gfx-ml] bootstrap_present_queue: iosfc_present_tick mmio_wait=%d"
+        pvg_log(s, "[uniq-vgpu-ml] bootstrap_present_queue: iosfc_present_tick mmio_wait=%d"
                 " pending_frames=%d\n", 0, pvg_atomic_read(&s->pending_frames));
     }
     (void)qmu_iosfc_present_tick(s->qmu_dev);
@@ -1434,7 +1434,7 @@ static void pvg_present_command_call(void *opaque)
             s->present_timer_active = true;
             s->present_next_fire_us = pvg_now_us();
             pthread_cond_signal(&s->present_cond);
-            pvg_log(s, "[apple-gfx-ml] display frame timer started (%dms interval, present queue)\n",
+            pvg_log(s, "[uniq-vgpu-ml] display frame timer started (%dms interval, present queue)\n",
                     AGFX_DISPLAY_FRAME_INTERVAL_MS);
         } else {
             pvg_present_merge_source_locked(s, false);
@@ -1531,7 +1531,7 @@ static void pvg_display_live_takeover(void *ctx)
     PvgState *s = ctx;
 
     if (s && pvg_atomic_read(&s->iosfc_bootstrap_active)) {
-        pvg_log(s, "[apple-gfx-ml] display_live_takeover: cancel bootstrap presents\n");
+        pvg_log(s, "[uniq-vgpu-ml] display_live_takeover: cancel bootstrap presents\n");
         pvg_present_command(s, PVG_PRESENT_CANCEL);
     }
 }
@@ -1590,7 +1590,7 @@ static void pvg_cursor_glyph_bh(void *opaque)
             src += 4;
         }
     }
-    pvg_log(s, "[apple-gfx-ml] cursor_glyph: %ux%u stride=%" PRIu64 " hot=%u,%u sum=0x%08x\n",
+    pvg_log(s, "[uniq-vgpu-ml] cursor_glyph: %ux%u stride=%" PRIu64 " hot=%u,%u sum=0x%08x\n",
             job->width, job->height, job->stride, job->hot_x, job->hot_y, job->sum);
     pthread_mutex_lock(&s->cursor.lock);
     g_free(s->cursor.data);
@@ -1613,7 +1613,7 @@ static void pvg_cursor_show_bh(void *opaque)
     PvgState *s = job->state;
 
     s->cursor_display_id = job->display_id;
-    pvg_log(s, "[apple-gfx-ml] cursor_show: display=%u visible=%d\n", job->display_id,
+    pvg_log(s, "[uniq-vgpu-ml] cursor_show: display=%u visible=%d\n", job->display_id,
             job->visible ? 1 : 0);
     pvg_update_cursor(s, job->display_id);
     g_free(job);
@@ -1625,7 +1625,7 @@ static void pvg_cursor_move_bh(void *opaque)
     PvgState *s = job->state;
 
     s->cursor_display_id = job->display_id;
-    pvg_log(s, "[apple-gfx-ml] cursor_move: display=%u\n", job->display_id);
+    pvg_log(s, "[uniq-vgpu-ml] cursor_move: display=%u\n", job->display_id);
     pvg_update_cursor(s, job->display_id);
     g_free(job);
 }
@@ -1746,7 +1746,7 @@ static void pvg_log_mmio_roundtrip(PvgState *s, const char *where, uint64_t offs
             return;
         }
     }
-    pvg_log(s, "[apple-gfx-ml] DIAG_MMIO_ROUNDTRIP where=%s ts_ns=%llu tid=0x%lx job=%p "
+    pvg_log(s, "[uniq-vgpu-ml] DIAG_MMIO_ROUNDTRIP where=%s ts_ns=%llu tid=0x%lx job=%p "
             "off=0x%llx reg=%s value=0x%llx size=%u mmio_wait=%d\n", where,
             (unsigned long long)pvg_now_us() * 1000ULL, (unsigned long)pthread_self(),
             NULL, (unsigned long long)offset, pvg_mmio_offset_name(offset),
@@ -1802,7 +1802,7 @@ static bool pvg_mmio_admit(PvgState *s, PvgHostWork *owner)
     }
     if (!reported) {
         reported = true;
-        pvg_log(s, "[apple-gfx-ml][mmio][ERROR] access after the device stopped; "
+        pvg_log(s, "[uniq-vgpu-ml][mmio][ERROR] access after the device stopped; "
                 "reads return all-ones, writes are dropped\n");
     }
     return false;
@@ -1848,12 +1848,12 @@ static ssize_t pvg_bar0_access(vfu_ctx_t *ctx, char *buf, size_t count, loff_t o
     (void)ctx;
     pvg_fw_identity_bar0(s, off, is_write);
     if (off < 0 || (count != 4 && count != 8) || ((uint64_t)off & (count - 1)) ||
-        (uint64_t)off + count > APPLE_GFX_ML_MMIO_SIZE) {
+        (uint64_t)off + count > UNIQ_VGPU_ML_MMIO_SIZE) {
         if (!is_write) {
             memset(buf, 0, count);
         }
         if (++invalid <= AGFX_LOG_INITIAL_COUNT || invalid % AGFX_LOG_INTERVAL == 0) {
-            pvg_log(s, "[apple-gfx-ml][mmio][WARN] invalid %s off=0x%llx size=%zu (#%" PRIu64 ")\n",
+            pvg_log(s, "[uniq-vgpu-ml][mmio][WARN] invalid %s off=0x%llx size=%zu (#%" PRIu64 ")\n",
                     is_write ? "write" : "read", (unsigned long long)off, count, invalid);
         }
         return (ssize_t)count;
@@ -1903,7 +1903,7 @@ static int pvg_negotiate_peers(PvgState *s)
     if (!physical || physical->version != QMU_PRIVATE_ORDINARY_PHYSICAL_CAPTURE_V2_VERSION ||
         physical->struct_size != sizeof(*physical) || !physical->prepare ||
         !physical->install || !physical->dispose_returned || !physical->destroy_returned) {
-        pvg_log(s, "[apple-gfx-ml] [ERROR] realize: Missing exact private ordinary physical "
+        pvg_log(s, "[uniq-vgpu-ml] [ERROR] realize: Missing exact private ordinary physical "
                 "capture peer\n");
         return -ENOTSUP;
     }
@@ -1915,7 +1915,7 @@ static int pvg_negotiate_peers(PvgState *s)
         if (!peer || peer->version != QMU_PRIVATE_ORDINARY_TASK_MEMORY_V1_VERSION ||
             peer->struct_size != sizeof(*peer) || !peer->prepare || !peer->install ||
             !peer->dispose_returned) {
-            pvg_log(s, "[apple-gfx-ml] [ERROR] realize: Mismatched private ordinary "
+            pvg_log(s, "[uniq-vgpu-ml] [ERROR] realize: Mismatched private ordinary "
                     "task-memory peer\n");
             return -ENOTSUP;
         }
@@ -1927,7 +1927,7 @@ static int pvg_negotiate_peers(PvgState *s)
 
         if (!api || api->version != QMU_PRIVATE_MAPPED_TRANSPORT_V1_VERSION ||
             api->struct_size != sizeof(*api) || !api->install) {
-            pvg_log(s, "[apple-gfx-ml] [ERROR] realize: Mismatched private mapped-transport "
+            pvg_log(s, "[uniq-vgpu-ml] [ERROR] realize: Mismatched private mapped-transport "
                     "peer\n");
             return -ENOTSUP;
         }
@@ -1955,13 +1955,13 @@ static enum PvgInstallOutcome pvg_install_ordinary_physical(PvgState *s)
 
     if (!agfx_ordinary_physical_context_create(s) ||
         !agfx_ordinary_physical_context_acquire(s->ordinary_physical_context, &handoff)) {
-        pvg_log(s, "[apple-gfx-ml] [ERROR] realize: Cannot acquire ordinary physical context\n");
+        pvg_log(s, "[uniq-vgpu-ml] [ERROR] realize: Cannot acquire ordinary physical context\n");
         return PVG_RETURNED_FAILURE;
     }
     s->ordinary_physical_receipt = peer->prepare(s->qmu_dev, &handoff);
     if (!s->ordinary_physical_receipt) {
         agfx_ordinary_physical_context_release(handoff.acquired_context);
-        pvg_log(s, "[apple-gfx-ml] [ERROR] realize: Ordinary physical prepare returned no "
+        pvg_log(s, "[uniq-vgpu-ml] [ERROR] realize: Ordinary physical prepare returned no "
                 "receipt\n");
         return PVG_RETURNED_FAILURE;
     }
@@ -1978,7 +1978,7 @@ static enum PvgInstallOutcome pvg_install_ordinary_physical(PvgState *s)
         return PVG_RETAINED;
     }
     s->ordinary_physical_receipt = NULL;
-    pvg_log(s, "[apple-gfx-ml] [ERROR] realize: Ordinary physical install returned rejection\n");
+    pvg_log(s, "[uniq-vgpu-ml] [ERROR] realize: Ordinary physical install returned rejection\n");
     return PVG_RETURNED_FAILURE;
 }
 
@@ -2000,7 +2000,7 @@ static bool pvg_install_ordinary_physical_comparison(PvgState *s)
     if (!peer || peer->version != QMU_PRIVATE_ORDINARY_PHYSICAL_COMPARISON_V1_VERSION ||
         peer->struct_size != sizeof(*peer) || !peer->install ||
         !peer->install(s->qmu_dev, &handoff)) {
-        pvg_log(s, "[apple-gfx-ml] [ERROR] realize: Cannot install exact optional physical "
+        pvg_log(s, "[uniq-vgpu-ml] [ERROR] realize: Cannot install exact optional physical "
                 "comparison peer\n");
         return false;
     }
@@ -2044,12 +2044,12 @@ static enum PvgInstallOutcome pvg_install_ordinary_task_memory(PvgState *s)
     }
     s->ordinary_task_memory_context = agfx_eeee_native_context_create(s);
     if (!s->ordinary_task_memory_context) {
-        pvg_log(s, "[apple-gfx-ml] [ERROR] realize: Cannot create ordinary CPU facilities "
+        pvg_log(s, "[uniq-vgpu-ml] [ERROR] realize: Cannot create ordinary CPU facilities "
                 "context\n");
         return PVG_RETURNED_FAILURE;
     }
     if (!agfx_eeee_native_context_acquire(s->ordinary_task_memory_context, &handoff.facilities)) {
-        pvg_log(s, "[apple-gfx-ml] [ERROR] realize: Cannot acquire ordinary CPU facilities "
+        pvg_log(s, "[uniq-vgpu-ml] [ERROR] realize: Cannot acquire ordinary CPU facilities "
                 "context\n");
         return PVG_RETURNED_FAILURE;
     }
@@ -2059,14 +2059,14 @@ static enum PvgInstallOutcome pvg_install_ordinary_task_memory(PvgState *s)
     handoff.memory_ctx_identity = s;
     if (!pvg_task_memory_callbacks_complete(s, &handoff.facilities)) {
         agfx_eeee_native_context_release(handoff.acquired_context);
-        pvg_log(s, "[apple-gfx-ml] [ERROR] realize: Incomplete ordinary CPU facilities "
+        pvg_log(s, "[uniq-vgpu-ml] [ERROR] realize: Incomplete ordinary CPU facilities "
                 "acquisition\n");
         return PVG_RETURNED_FAILURE;
     }
     s->ordinary_task_memory_receipt = peer->prepare(s->qmu_dev, &handoff);
     if (!s->ordinary_task_memory_receipt) {
         agfx_eeee_native_context_release(handoff.acquired_context);
-        pvg_log(s, "[apple-gfx-ml] [ERROR] realize: Ordinary task-memory prepare returned no "
+        pvg_log(s, "[uniq-vgpu-ml] [ERROR] realize: Ordinary task-memory prepare returned no "
                 "receipt\n");
         return PVG_RETURNED_FAILURE;
     }
@@ -2078,7 +2078,7 @@ static enum PvgInstallOutcome pvg_install_ordinary_task_memory(PvgState *s)
     if (s->ordinary_task_memory_install_result != QMU_ORDINARY_TASK_MEMORY_REJECTED) {
         return PVG_RETAINED;
     }
-    pvg_log(s, "[apple-gfx-ml] [ERROR] realize: Ordinary task-memory install returned "
+    pvg_log(s, "[uniq-vgpu-ml] [ERROR] realize: Ordinary task-memory install returned "
             "rejection\n");
     return PVG_RETURNED_FAILURE;
 }
@@ -2120,7 +2120,7 @@ static void pvg_install_mapped_transport(PvgState *s)
     s->mapped_transport_installed =
         s->mapped_transport_peer->install(s->qmu_dev, &provider) == QMU_MAPPED_TRANSPORT_INSTALLED;
     if (!s->mapped_transport_installed) {
-        pvg_log(s, "[apple-gfx-ml][WARN] apple-gfx-ml: mapped transport rejected; callback path\n");
+        pvg_log(s, "[uniq-vgpu-ml][WARN] uniq-vgpu-ml: mapped transport rejected; callback path\n");
     }
 }
 
@@ -2168,7 +2168,7 @@ static void pvg_stop_phase(PvgState *s)
     qmu_session_rethrow_quiesce(s->qmu_dev);
     if (status != QMU_OK) {
         /* never authorizes teardown: owners stay; the watchdog decides */
-        fprintf(stderr, "[apple-gfx-ml] [ERROR] stop phase: Session quiesce status=%d\n",
+        fprintf(stderr, "[uniq-vgpu-ml] [ERROR] stop phase: Session quiesce status=%d\n",
                 (int)status);
         fflush(stderr);
         for (;;) {
@@ -2210,7 +2210,7 @@ static void *pvg_quit_notice_thread(void *opaque)
 {
     bool *delivered = opaque;
 
-    fprintf(stderr, "[apple-gfx-ml] [ERROR] quit stop phase did not finish in %d ms, "
+    fprintf(stderr, "[uniq-vgpu-ml] [ERROR] quit stop phase did not finish in %d ms, "
             "exit without finalizers\n", AGFX_QUIT_STOP_LIMIT_MS);
     fflush(stderr);
     pvg_atomic_set(delivered, true);
@@ -2262,15 +2262,15 @@ static void pvg_quit_stop(PvgState *s)
     if (pthread_create(&thread, NULL, pvg_quit_watchdog_thread, watchdog) != 0) {
         _exit(EXIT_FAILURE);
     }
-    fprintf(stderr, "[apple-gfx-ml] quit stop phase begin\n");
+    fprintf(stderr, "[uniq-vgpu-ml] quit stop phase begin\n");
     pvg_stop_phase(s);
     status = qmu_session_finish_retirement_for_exit(s->qmu_dev);
     if (status != QMU_OK) {
-        fprintf(stderr, "[apple-gfx-ml] [ERROR] retirement worker not finished "
+        fprintf(stderr, "[uniq-vgpu-ml] [ERROR] retirement worker not finished "
                 "after stop, status=%d, exit without finalizers\n", (int)status);
         _exit(EXIT_FAILURE);
     }
-    fprintf(stderr, "[apple-gfx-ml] quit stop phase done ms=%lld\n",
+    fprintf(stderr, "[uniq-vgpu-ml] quit stop phase done ms=%lld\n",
             (long long)((pvg_now_us() - begin) / 1000));
     pvg_atomic_set(&watchdog->done, true);
     pthread_join(thread, NULL);
@@ -2318,7 +2318,7 @@ static int pvg_parse_args(PvgState *s, const char *args)
         bool ok;
 
         if (!val) {
-            fprintf(stderr, "[apple-gfx-ml] [ERROR] arg '%s' has no value\n", tok);
+            fprintf(stderr, "[uniq-vgpu-ml] [ERROR] arg '%s' has no value\n", tok);
             r = -EINVAL;
             break;
         }
@@ -2359,12 +2359,12 @@ static int pvg_parse_args(PvgState *s, const char *args)
             ok = !strcmp(val, "follow") || !strcmp(val, "fixed");
             s->display_modes_follow = !strcmp(val, "follow");
         } else {
-            fprintf(stderr, "[apple-gfx-ml] [ERROR] unknown arg '%s'\n", tok);
+            fprintf(stderr, "[uniq-vgpu-ml] [ERROR] unknown arg '%s'\n", tok);
             r = -EINVAL;
             break;
         }
         if (!ok) {
-            fprintf(stderr, "[apple-gfx-ml] [ERROR] bad value '%s' for arg '%s'\n", val, tok);
+            fprintf(stderr, "[uniq-vgpu-ml] [ERROR] bad value '%s' for arg '%s'\n", val, tok);
             r = -EINVAL;
             break;
         }
@@ -2372,7 +2372,7 @@ static int pvg_parse_args(PvgState *s, const char *args)
     g_free(copy);
     if (!r && (!s->display_width || !s->display_height || s->display_width > 0xffff ||
                s->display_height > 0xffff || !s->vram_size_mb)) {
-        fprintf(stderr, "[apple-gfx-ml] [ERROR] bad mode %ux%u or VRAM %u MiB\n",
+        fprintf(stderr, "[uniq-vgpu-ml] [ERROR] bad mode %ux%u or VRAM %u MiB\n",
                 s->display_width, s->display_height, s->vram_size_mb);
         r = -EINVAL;
     }
@@ -2430,7 +2430,7 @@ static void pvg_fw_identity_rearm(PvgState *s, const char *why)
         s->fw_identity_armed = true;
         pvg_apply_pci_ids(s, s->vfu);
     }
-    pvg_log(s, "[apple-gfx-ml] firmware PCI identity %04x:%04x armed (%s)\n",
+    pvg_log(s, "[uniq-vgpu-ml] firmware PCI identity %04x:%04x armed (%s)\n",
             s->fw_vendor_id, s->fw_device_id, why);
 }
 
@@ -2443,7 +2443,7 @@ static inline void pvg_fw_identity_bar0(PvgState *s, loff_t off, bool is_write)
     s->fw_identity_armed = false;
     s->fw_identity_switches++;
     pvg_apply_pci_ids(s, s->vfu);
-    pvg_log(s, "[apple-gfx-ml] firmware PCI identity %04x:%04x ended by the first BAR0 %s "
+    pvg_log(s, "[uniq-vgpu-ml] firmware PCI identity %04x:%04x ended by the first BAR0 %s "
             "off=0x%llx: config space now %04x:%04x (switch #%" PRIu64 ")\n",
             s->fw_vendor_id, s->fw_device_id, is_write ? "write" : "read", (unsigned long long)off,
             s->pci_vendor_id, s->pci_device_id, s->fw_identity_switches);
@@ -2466,25 +2466,25 @@ static int pvg_pci_setup(PvgState *s, vfu_ctx_t *ctx)
     pvg_apply_pci_ids(s, ctx);
     vfu_pci_set_class(ctx, 0x03, 0x80, 0x00);
     if (s->fw_identity) {
-        pvg_log(s, "[apple-gfx-ml] firmware PCI identity %04x:%04x until the first BAR0 access "
+        pvg_log(s, "[uniq-vgpu-ml] firmware PCI identity %04x:%04x until the first BAR0 access "
                 "after each reset, then %04x:%04x\n", s->fw_vendor_id, s->fw_device_id,
                 s->pci_vendor_id, s->pci_device_id);
     }
-    if (s->pci_vendor_id != APPLE_GFX_ML_VENDOR_ID) {
-        pvg_log(s, "[apple-gfx-ml] PCI vendor id overridden to 0x%04x\n", s->pci_vendor_id);
+    if (s->pci_vendor_id != UNIQ_VGPU_ML_VENDOR_ID) {
+        pvg_log(s, "[uniq-vgpu-ml] PCI vendor id overridden to 0x%04x\n", s->pci_vendor_id);
     }
-    if (s->pci_device_id != APPLE_GFX_ML_DEVICE_ID) {
-        pvg_log(s, "[apple-gfx-ml] PCI device id overridden to 0x%04x\n", s->pci_device_id);
+    if (s->pci_device_id != UNIQ_VGPU_ML_DEVICE_ID) {
+        pvg_log(s, "[uniq-vgpu-ml] PCI device id overridden to 0x%04x\n", s->pci_device_id);
     }
     pos = vfu_pci_add_capability(ctx, 0, 0, &msi);
     if (pos < 0 || vfu_setup_device_nr_irqs(ctx, VFU_DEV_MSI_IRQ, 1) < 0) {
         int err = errno;
 
-        pvg_log(s, "[apple-gfx-ml] msi_init FAILED: %d\n", -err);
+        pvg_log(s, "[uniq-vgpu-ml] msi_init FAILED: %d\n", -err);
         return -err;
     }
-    pvg_log(s, "[apple-gfx-ml] msi_init OK, 1 vector\n");
-    if (vfu_setup_region(ctx, VFU_PCI_DEV_BAR0_REGION_IDX, APPLE_GFX_ML_MMIO_SIZE,
+    pvg_log(s, "[uniq-vgpu-ml] msi_init OK, 1 vector\n");
+    if (vfu_setup_region(ctx, VFU_PCI_DEV_BAR0_REGION_IDX, UNIQ_VGPU_ML_MMIO_SIZE,
                          pvg_bar0_access, VFU_REGION_FLAG_RW | VFU_REGION_FLAG_MEM,
                          NULL, 0, -1, 0) < 0) {
         return -errno;
@@ -2497,7 +2497,7 @@ static int pvg_pci_setup(PvgState *s, vfu_ctx_t *ctx)
  * here we create/open a shared-memory region (name agreed with the video process via the
  * launcher-set PVG_MAPPER_BRIDGE_SHM env) and write the mapping_id -> {gpa pages + NV12 layout}
  * registry that apple-videotoolbox's vt_resolve_buffer reads. One region per device/process.
- * Ported from the live-proven apple-pvg writer (qdev-host 128ad8f, GVA seam r4). */
+ * Ported from the live-proven uniq-vgpu writer (qdev-host 128ad8f, GVA seam r4). */
 #include "pvg_mapper_bridge.h"
 
 static pvg_mapper_bridge *g_pvg_bridge = NULL;
@@ -2624,7 +2624,7 @@ static int pvg_create_session(PvgState *s)
     }
     s->qmu_dev = qmu_create_extended(&config, &callbacks);
     if (!s->qmu_dev) {
-        pvg_log(s, "[apple-gfx-ml] [ERROR] realize: Failed to create qmetal device\n");
+        pvg_log(s, "[uniq-vgpu-ml] [ERROR] realize: Failed to create qmetal device\n");
         return -ENODEV;
     }
     switch (pvg_install_ordinary_physical(s)) {
@@ -2633,7 +2633,7 @@ static int pvg_create_session(PvgState *s)
     case PVG_RETAINED:
         /* marker printed; the SAME receipt, Session and context stay owned
          * (fork: realize returns its error without any finalization) */
-        pvg_log(s, "[apple-gfx-ml] [ERROR] realize: Ordinary physical install retained "
+        pvg_log(s, "[uniq-vgpu-ml] [ERROR] realize: Ordinary physical install retained "
                 "original unknown receipt\n");
         return -ENODEV;
     case PVG_RETURNED_FAILURE:
@@ -2692,22 +2692,22 @@ static int pvg_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env, 
     int r;
 
     if (g) {
-        fprintf(stderr, "[apple-gfx-ml] [ERROR] one device per process\n");
+        fprintf(stderr, "[uniq-vgpu-ml] [ERROR] one device per process\n");
         return -EBUSY;
     }
     s = g_new0(PvgState, 1);
-    s->vram_size_mb = APPLE_GFX_ML_DEFAULT_VRAM_MB;
+    s->vram_size_mb = UNIQ_VGPU_ML_DEFAULT_VRAM_MB;
     s->display_width = 1920;
     s->display_height = 1080;
-    s->pci_vendor_id = APPLE_GFX_ML_VENDOR_ID;
-    s->pci_device_id = APPLE_GFX_ML_DEVICE_ID;
+    s->pci_vendor_id = UNIQ_VGPU_ML_VENDOR_ID;
+    s->pci_device_id = UNIQ_VGPU_ML_DEVICE_ID;
     s->vsync_enabled = true;
     s->exit_on_disconnect = true;
     s->display_modes_follow = true;
     s->fw_vendor_id = s->fw_device_id = UINT32_MAX;   /* "not given" */
     r = pvg_parse_args(s, args);
     if (!r && s->fw_identity && (s->fw_vendor_id == UINT32_MAX || s->fw_device_id == UINT32_MAX)) {
-        fprintf(stderr, "[apple-gfx-ml] [ERROR] fw-vendor-id and fw-device-id go together\n");
+        fprintf(stderr, "[uniq-vgpu-ml] [ERROR] fw-vendor-id and fw-device-id go together\n");
         r = -EINVAL;
     }
     if (r) {
@@ -2718,7 +2718,7 @@ static int pvg_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env, 
         !env->host_ops || env->host_ops->size < sizeof(qdp_host_ops) ||
         !env->host_ops->irq_trigger || !env->host_ops->frame_ready ||
         !env->host_ops->cursor_changed || !env->host_ops->log) {
-        fprintf(stderr, "[apple-gfx-ml] [ERROR] the host provides no qdp v2 host services "
+        fprintf(stderr, "[uniq-vgpu-ml] [ERROR] the host provides no qdp v2 host services "
                 "(irq_trigger, frame_ready, cursor_changed, log)\n");
         g_free(s);
         return -ENOTSUP;
@@ -2734,7 +2734,7 @@ static int pvg_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env, 
     }
 
     pvg_log_init(s);
-    pvg_log(s, "[apple-gfx-ml] Realizing device: %ux%u, VRAM=%uMB\n",
+    pvg_log(s, "[uniq-vgpu-ml] Realizing device: %ux%u, VRAM=%uMB\n",
             s->display_width, s->display_height, s->vram_size_mb);
 
     r = pvg_pci_setup(s, ctx);
@@ -2781,19 +2781,19 @@ static int pvg_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env, 
 
     /* Bind the backend vtable to the BASE libmlapi before the first qmu_* call.
      * dlopen by SONAME (RUNPATH-resolved) returns the already-mapped base copy
-     * (apple-pvg.so links it) or loads it into the base namespace; every
+     * (uniq-vgpu.so links it) or loads it into the base namespace; every
      * routed qmu_* call then goes through this instance until a reload. */
     {
         void *base = dlopen("libmlapi.so", RTLD_NOW | RTLD_GLOBAL);
         const char *miss = NULL;
         if (!base) {
-            pvg_log(s, "[apple-gfx-ml] [ERROR] realize: cannot dlopen base libmlapi.so: %s\n",
+            pvg_log(s, "[uniq-vgpu-ml] [ERROR] realize: cannot dlopen base libmlapi.so: %s\n",
                     dlerror());
             r = -ELIBACC;
             goto fail;
         }
         if (!pvg_qmu_vt_bind(&s->qvt_storage, base, LM_ID_BASE, &miss)) {
-            pvg_log(s, "[apple-gfx-ml] [ERROR] realize: base libmlapi missing %s\n",
+            pvg_log(s, "[uniq-vgpu-ml] [ERROR] realize: base libmlapi missing %s\n",
                     miss ? miss : "(unknown)");
             r = -ENOSYS;
             goto fail;
@@ -2827,7 +2827,7 @@ static int pvg_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env, 
     pvg_loop_run_sync(s, pvg_initial_mode_call, &mode);
     pvg_pin_libraries();
     s->realized = true;
-    pvg_log(s, "[apple-gfx-ml] Device realized successfully\n");
+    pvg_log(s, "[uniq-vgpu-ml] Device realized successfully\n");
     /* No guest access is possible before setup returns: open the window. */
     pthread_mutex_lock(&s->irq_lock);
     s->irq_gate = PVG_IRQ_OPEN;
@@ -2839,7 +2839,7 @@ static int pvg_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env, 
 fail:
     /* A failed setup ends the host process (qdev-host exits); threads and
      * the Session are left to process exit rather than torn down here. */
-    pvg_log(s, "[apple-gfx-ml] [ERROR] realize failed: %s\n", strerror(-r));
+    pvg_log(s, "[uniq-vgpu-ml] [ERROR] realize failed: %s\n", strerror(-r));
     pvg_log_stop(s);
     return r;
 }
@@ -2950,13 +2950,13 @@ static void pvg_qmetal_device_reset(PvgState *s, vfu_reset_type_t type)
     PvgHostWork owner;
 
     if (!qmu_session_reset_for_device_reset) {
-        pvg_log(s, "[apple-gfx-ml][reset][ERROR] type=%d: this libmlapi has no "
+        pvg_log(s, "[uniq-vgpu-ml][reset][ERROR] type=%d: this libmlapi has no "
                 "qmu_session_reset_for_device_reset; the PGDevice reset is NOT applied and the "
                 "guest's next boot sequence will stall\n", (int)type);
         return;
     }
     if (!pvg_mmio_admit(s, &owner)) {
-        pvg_log(s, "[apple-gfx-ml][reset][ERROR] type=%d: device stopped, QMetal reset not applied\n",
+        pvg_log(s, "[uniq-vgpu-ml][reset][ERROR] type=%d: device stopped, QMetal reset not applied\n",
                 (int)type);
         return;
     }
@@ -2986,15 +2986,15 @@ static void pvg_qmetal_device_reset(PvgState *s, vfu_reset_type_t type)
     }
     pvg_host_work_unref(&owner);
     if (display_running) {
-        pvg_log(s, "[apple-gfx-ml]%s DEVICE_RESET_LIFECYCLE type=%d phase=display_republished "
+        pvg_log(s, "[uniq-vgpu-ml]%s DEVICE_RESET_LIFECYCLE type=%d phase=display_republished "
                 "target=%d restart=%d %ux%u\n", display_restart || !s->display_target ? "[reset][ERROR]" : "",
                 (int)type, s->display_target ? 1 : 0, display_restart, s->fb_width, s->fb_height);
     }
     if (call.status == QMU_OK) {
-        pvg_log(s, "[apple-gfx-ml] DEVICE_RESET_LIFECYCLE type=%d qmu_status=%d "
+        pvg_log(s, "[uniq-vgpu-ml] DEVICE_RESET_LIFECYCLE type=%d qmu_status=%d "
                 "phase=qmu_reset_complete\n", (int)type, (int)call.status);
     } else {
-        pvg_log(s, "[apple-gfx-ml][reset][ERROR] DEVICE_RESET_LIFECYCLE type=%d qmu_status=%d "
+        pvg_log(s, "[uniq-vgpu-ml][reset][ERROR] DEVICE_RESET_LIFECYCLE type=%d qmu_status=%d "
                 "phase=qmu_reset_failed%s\n", (int)type, (int)call.status,
                 call.status == QMU_NOT_SUPPORTED ? " (native_eeee_source session: reset unqualified)" : "");
     }
@@ -3005,16 +3005,16 @@ static int pvg_reset(void *priv, vfu_reset_type_t type)
     PvgState *s = priv;
 
     if (type == VFU_RESET_LOST_CONN) {
-        pvg_log(s, "[apple-gfx-ml] client connection lost: stopping the device\n");
+        pvg_log(s, "[uniq-vgpu-ml] client connection lost: stopping the device\n");
         pvg_irq_drop(s);
         pvg_memory_reopen_after_lost_conn(s);
         pvg_quit_stop(s);
         if (s->exit_on_disconnect) {
             /* The host calls teardown() (idempotent stop, log flush) and exits 0. */
-            pvg_log(s, "[apple-gfx-ml] exit after the lost connection (exit-on-disconnect)\n");
+            pvg_log(s, "[uniq-vgpu-ml] exit after the lost connection (exit-on-disconnect)\n");
             return QDP_RESET_EXIT;
         }
-        pvg_log(s, "[apple-gfx-ml][WARN] device stopped; a new client gets a dead device\n");
+        pvg_log(s, "[uniq-vgpu-ml][WARN] device stopped; a new client gets a dead device\n");
         return 0;
     }
     /* Reference: QEMU apple-gfx-pci.m apple_gfx_pci_reset() is [pgdev reset] on
@@ -3029,7 +3029,7 @@ static int pvg_reset(void *priv, vfu_reset_type_t type)
      * Only the guest-visible device resets (DEVICE / FLR) reach it: renderer
      * reload and warm swap are plugin ops (pvg_backend_reload, pvg_swap) that
      * never enter pvg_reset, and LOST_CONN returned above. */
-    pvg_log(s, "[apple-gfx-ml] device reset type=%d\n", (int)type);
+    pvg_log(s, "[uniq-vgpu-ml] device reset type=%d\n", (int)type);
     if (type == VFU_RESET_DEVICE || type == VFU_RESET_PCI_FLR) {
         pvg_qmetal_device_reset(s, type);
         pvg_fw_identity_rearm(s, type == VFU_RESET_DEVICE ? "device reset" : "FLR");
@@ -3249,7 +3249,7 @@ static int pvg_reinstall_ui_info_mode_list(PvgState *s, const char *who)
         return 0;
     }
     if (!qmu_display_set_mode_list || !s->qmu_dev) {
-        pvg_log(s, "[apple-gfx-ml][reload][ERROR] %s has no qmu_display_set_mode_list: the accepted "
+        pvg_log(s, "[uniq-vgpu-ml][reload][ERROR] %s has no qmu_display_set_mode_list: the accepted "
                 "ui_info mode list %ux%u is not re-installed\n", who, s->ui_info_last.width,
                 s->ui_info_last.height);
         return -ENOSYS;
@@ -3259,11 +3259,11 @@ static int pvg_reinstall_ui_info_mode_list(PvgState *s, const char *who)
     pvg_host_work_invoke(&owner, pvg_mode_list_call, &call);
     pvg_host_work_unref(&owner);
     if (call.status != QMU_OK) {
-        pvg_log(s, "[apple-gfx-ml][reload][ERROR] %s: re-install of the ui_info mode list %ux%u: "
+        pvg_log(s, "[uniq-vgpu-ml][reload][ERROR] %s: re-install of the ui_info mode list %ux%u: "
                 "status %d\n", who, s->ui_info_last.width, s->ui_info_last.height, (int)call.status);
         return -EIO;
     }
-    pvg_log(s, "[apple-gfx-ml][reload] %s: ui_info mode list [%ux%u @ %u mHz] re-installed\n", who,
+    pvg_log(s, "[uniq-vgpu-ml][reload] %s: ui_info mode list [%ux%u @ %u mHz] re-installed\n", who,
             s->ui_info_last.width, s->ui_info_last.height, s->ui_info_last.refresh_mhz);
     return 0;
 }
@@ -3290,13 +3290,13 @@ static int pvg_ui_info(void *priv, const qdp_ui_info *info)
     req.refresh_mhz = info->refresh_mhz ? info->refresh_mhz : 60000;
     req.flags = info->flags;
     if (!s->display_modes_follow) {
-        pvg_log(s, "[apple-gfx-ml][display] ui_info %ux%u not followed (display-modes=fixed)\n",
+        pvg_log(s, "[uniq-vgpu-ml][display] ui_info %ux%u not followed (display-modes=fixed)\n",
                 req.width, req.height);
         return -ENOTSUP;
     }
     reason = pvg_ui_info_refusal(&req);
     if (reason) {
-        pvg_log(s, "[apple-gfx-ml][display][WARN] ui_info %ux%u %ux%umm %u mHz refused: %s\n",
+        pvg_log(s, "[uniq-vgpu-ml][display][WARN] ui_info %ux%u %ux%umm %u mHz refused: %s\n",
                 req.width, req.height, req.width_mm, req.height_mm, req.refresh_mhz, reason);
         return -EINVAL;
     }
@@ -3304,7 +3304,7 @@ static int pvg_ui_info(void *priv, const qdp_ui_info *info)
         return QDP_UI_INFO_UNCHANGED;
     }
     if (!qmu_display_set_mode_list) {
-        pvg_log(s, "[apple-gfx-ml][display][WARN] ui_info %ux%u refused: this libmlapi has "
+        pvg_log(s, "[uniq-vgpu-ml][display][WARN] ui_info %ux%u refused: this libmlapi has "
                 "no qmu_display_set_mode_list\n", req.width, req.height);
         return -ENOTSUP;
     }
@@ -3319,13 +3319,13 @@ static int pvg_ui_info(void *priv, const qdp_ui_info *info)
     pvg_host_work_invoke(&owner, pvg_mode_list_call, &call);
     pvg_host_work_unref(&owner);
     if (call.status != QMU_OK) {
-        pvg_log(s, "[apple-gfx-ml][display][ERROR] qmu_display_set_mode_list %ux%u: status %d\n",
+        pvg_log(s, "[uniq-vgpu-ml][display][ERROR] qmu_display_set_mode_list %ux%u: status %d\n",
                 req.width, req.height, (int)call.status);
         return -EIO;
     }
     s->ui_info_last = req;
     s->ui_info_accepted = true;
-    pvg_log(s, "[apple-gfx-ml][display] ui_info: mode list [%ux%u @ %u mHz], %.1fx%.1f mm%s\n",
+    pvg_log(s, "[uniq-vgpu-ml][display] ui_info: mode list [%ux%u @ %u mHz], %.1fx%.1f mm%s\n",
             req.width, req.height, req.refresh_mhz, (double)call.settings.size_mm_width,
             (double)call.settings.size_mm_height, mm_given ? "" : " (4.8 px/mm policy)");
     return 0;
@@ -3337,7 +3337,7 @@ static int pvg_ui_info(void *priv, const qdp_ui_info *info)
  * vfio-user BOUND throughout.  The device stays realized; the Session is torn
  * down in-process, a new co-resident libmlapi build is dlmopen()-ed, and the
  * Session is re-created from the PARKED PvgState (memory tables, FIFO GPA,
- * display mode, fw identity -- all apple-pvg-side, reached by QMetal only via
+ * display mode, fw identity -- all uniq-vgpu-side, reached by QMetal only via
  * our callbacks, so re-create re-adopts them).  Runs under the host's quiesce
  * (memory write-lock + IRQ hold), so there is no concurrent guest MMIO. */
 
@@ -3349,7 +3349,7 @@ static int pvg_ui_info(void *priv, const qdp_ui_info *info)
  * (destroy_returned/dispose_returned) are the NORMAL-EXIT protocol and
  * legitimately RETAIN (return false -> endless owned hold) when driven outside
  * it; for a reload we instead qmu_destroy the Session directly and LEAK-RESET
- * the apple-pvg-side owner bookkeeping.  The leak is within the accepted trade
+ * the uniq-vgpu-side owner bookkeeping.  The leak is within the accepted trade
  * (the old instance and its host owners stay mapped for the life of the
  * process); pvg_create_session rebuilds fresh owners on the new instance. */
 static void pvg_reload_teardown(PvgState *s)
@@ -3390,7 +3390,7 @@ static void pvg_reload_teardown(PvgState *s)
     memset(&s->deferred_frame_owner, 0, sizeof(s->deferred_frame_owner));
 }
 
-/* Reversible mirror of pvg_stop_phase: stop apple-pvg's present/render workers
+/* Reversible mirror of pvg_stop_phase: stop uniq-vgpu's present/render workers
  * and quiesce the Session's host-callback producers, but DO NOT set the
  * terminal retired/exiting/stop_phase_done flags -- the device is coming back
  * on a new instance.  Returns 0 or -errno. */
@@ -3410,7 +3410,7 @@ static int pvg_stop_phase_reversible(PvgState *s)
     status = qmu_session_quiesce_host_callback_producers_deferred(s->qmu_dev);
     qmu_session_rethrow_quiesce(s->qmu_dev);
     if (status != QMU_OK) {
-        pvg_log(s, "[apple-gfx-ml][reload][ERROR] quiesce producers status=%d\n", (int)status);
+        pvg_log(s, "[uniq-vgpu-ml][reload][ERROR] quiesce producers status=%d\n", (int)status);
         return -EIO;
     }
 
@@ -3464,7 +3464,7 @@ static void pvg_handover_mode_call(void *opaque)
     qmu_display_target_release(outgoing);
     s->rendering_frame_width = s->fb_width;
     s->rendering_frame_height = s->fb_height;
-    pvg_log(s, "[apple-gfx-ml][reload]%s hand-over display: mode target %ux%u on the new Session "
+    pvg_log(s, "[uniq-vgpu-ml][reload]%s hand-over display: mode target %ux%u on the new Session "
             "(status %d), scanout front kept\n", status != QMU_OK ? "[ERROR]" : "", s->fb_width,
             s->fb_height, (int)status);
 }
@@ -3644,7 +3644,7 @@ out:
     if (fd >= 0) close(fd);
     if (ofd >= 0) close(ofd);
     if (rc) {
-        pvg_log(s, "[apple-gfx-ml][reload][ERROR] stamp unique SONAME on %s: %s\n",
+        pvg_log(s, "[uniq-vgpu-ml][reload][ERROR] stamp unique SONAME on %s: %s\n",
                 src, strerror(-rc));
     }
     return rc;
@@ -3671,7 +3671,7 @@ static int pvg_reload_load_and_create(PvgState *s, const char *new_path)
      * not accumulate files (RTLD_NODELETE keeps it resident). */
     unlink(uniq_path);
     if (!ns) {
-        pvg_log(s, "[apple-gfx-ml][reload][ERROR] dlopen %s (unique-soname copy of %s): %s\n",
+        pvg_log(s, "[uniq-vgpu-ml][reload][ERROR] dlopen %s (unique-soname copy of %s): %s\n",
                 uniq_path, new_path, dlerror());
         return -ENOENT;
     }
@@ -3679,7 +3679,7 @@ static int pvg_reload_load_and_create(PvgState *s, const char *new_path)
     dlinfo(ns, RTLD_DI_LMID, &lmid);   /* LM_ID_BASE: base-namespace co-residency */
     memset(&nvt, 0, sizeof(nvt));
     if (!pvg_qmu_vt_bind(&nvt, ns, lmid, &miss)) {
-        pvg_log(s, "[apple-gfx-ml][reload][ERROR] %s missing %s (not a libmlapi?)\n",
+        pvg_log(s, "[uniq-vgpu-ml][reload][ERROR] %s missing %s (not a libmlapi?)\n",
                 new_path, miss ? miss : "(unknown)");
         /* old instance already destroyed: caller must roll back to a good one */
         return -ENOSYS;
@@ -3690,7 +3690,7 @@ static int pvg_reload_load_and_create(PvgState *s, const char *new_path)
     s->qmu_ns = ns;
     s->qmu_lmid = lmid;
 
-    pvg_log(s, "[apple-gfx-ml][reload] loaded %s lmid=%ld; re-creating Session...\n",
+    pvg_log(s, "[uniq-vgpu-ml][reload] loaded %s lmid=%ld; re-creating Session...\n",
             new_path, lmid);
 
     /* Register the host log callback on the NEW instance BEFORE qmu_create_extended
@@ -3703,7 +3703,7 @@ static int pvg_reload_load_and_create(PvgState *s, const char *new_path)
      * re-adopting the parked PvgState (same config built from s). */
     r = pvg_create_session(s);
     if (r) {
-        pvg_log(s, "[apple-gfx-ml][reload][ERROR] re-create Session on %s failed: %s\n",
+        pvg_log(s, "[uniq-vgpu-ml][reload][ERROR] re-create Session on %s failed: %s\n",
                 new_path, strerror(-r));
         return r;   /* device dead; caller rolls back */
     }
@@ -3738,12 +3738,12 @@ static int pvg_resume_from_blob(PvgState *s, const void *blob, size_t len, const
     int q;
 
     if (!pvg_vt_can_resume(pvg_qvt)) {
-        pvg_log(s, "[apple-gfx-ml][reload][ERROR] %s has no suspend/resume API: state hand-over refused\n", who);
+        pvg_log(s, "[uniq-vgpu-ml][reload][ERROR] %s has no suspend/resume API: state hand-over refused\n", who);
         return -ENOSYS;
     }
     q = pvg_qvt->session_will_resume(s->qmu_dev, blob, len, &code);
     if (q != 0) {
-        pvg_log(s, "[apple-gfx-ml][reload][ERROR] %s refused the suspend state (willResume code %u)\n", who, code);
+        pvg_log(s, "[uniq-vgpu-ml][reload][ERROR] %s refused the suspend state (willResume code %u)\n", who, code);
         return -EPROTO;
     }
     /* The display client is attached and its frame handler live when didResume's
@@ -3751,16 +3751,16 @@ static int pvg_resume_from_blob(PvgState *s, const void *blob, size_t len, const
      * workers and publish the current geometry first. */
     q = pvg_restart_workers_ex(s, true);
     if (q != 0) {
-        pvg_log(s, "[apple-gfx-ml][reload][ERROR] %s: restart workers before didResume failed: %s\n",
+        pvg_log(s, "[uniq-vgpu-ml][reload][ERROR] %s: restart workers before didResume failed: %s\n",
                 who, strerror(-q));
         return q;
     }
     q = pvg_qvt->session_did_resume(s->qmu_dev);
     if (q != 0) {
-        pvg_log(s, "[apple-gfx-ml][reload][ERROR] %s didResume failed (%d)\n", who, q);
+        pvg_log(s, "[uniq-vgpu-ml][reload][ERROR] %s didResume failed (%d)\n", who, q);
         return -EIO;
     }
-    pvg_log(s, "[apple-gfx-ml][reload] state hand-over: %s resumed from the %zu-byte suspend state\n", who, len);
+    pvg_log(s, "[uniq-vgpu-ml][reload] state hand-over: %s resumed from the %zu-byte suspend state\n", who, len);
     return 0;
 }
 
@@ -3791,14 +3791,14 @@ static int pvg_backend_reload_body(PvgState *s, const char *new_path, int reset)
             /* QMetal refuses e.g. with live iosfc_mapper mappings (D-MAPPER) or a
              * drain timeout; the readers may already be quiesced, so the old
              * Session cannot simply continue: fall back to the legacy re-create. */
-            pvg_log(s, "[apple-gfx-ml][reload][ERROR] suspend refused (%d): reload: guest GPU state lost\n", q);
+            pvg_log(s, "[uniq-vgpu-ml][reload][ERROR] suspend refused (%d): reload: guest GPU state lost\n", q);
             g_free(blob);
             blob = NULL;
         } else {
-            pvg_log(s, "[apple-gfx-ml][reload] suspend state captured: %zu bytes\n", blob_len);
+            pvg_log(s, "[uniq-vgpu-ml][reload] suspend state captured: %zu bytes\n", blob_len);
         }
     } else if (s->qmu_dev && !reset) {
-        pvg_log(s, "[apple-gfx-ml][reload] current libmlapi has no suspend API: legacy reload "
+        pvg_log(s, "[uniq-vgpu-ml][reload] current libmlapi has no suspend API: legacy reload "
                 "(guest GPU state lost)\n");
     }
     old_path = s->qmu_path ? g_strdup(s->qmu_path) : NULL;
@@ -3828,7 +3828,7 @@ static int pvg_backend_reload_body(PvgState *s, const char *new_path, int reset)
             /* Rollback (plan section 3 step 5): B refused the state; re-create A and
              * resume it from the SAME blob.  The reload itself still fails. */
             int rb;
-            pvg_log(s, "[apple-gfx-ml][reload] rolling back to %s with the same suspend state\n", old_path);
+            pvg_log(s, "[uniq-vgpu-ml][reload] rolling back to %s with the same suspend state\n", old_path);
             if (s->qmu_dev && (s->present_started || s->render_started)) {
                 (void)pvg_stop_phase_reversible(s);   /* B's workers, if didResume failed */
             }
@@ -3838,10 +3838,10 @@ static int pvg_backend_reload_body(PvgState *s, const char *new_path, int reset)
             if (!rb) {
                 g_free(s->qmu_path);
                 s->qmu_path = g_strdup(old_path);
-                pvg_log(s, "[apple-gfx-ml][reload] ROLLBACK OK: %s resumed, reload of %s refused\n",
+                pvg_log(s, "[uniq-vgpu-ml][reload] ROLLBACK OK: %s resumed, reload of %s refused\n",
                         old_path, new_path);
             } else {
-                pvg_log(s, "[apple-gfx-ml][reload][ERROR] rollback failed: reload: guest GPU state lost\n");
+                pvg_log(s, "[uniq-vgpu-ml][reload][ERROR] rollback failed: reload: guest GPU state lost\n");
             }
             pthread_mutex_unlock(&s->backing_lock);
             g_free(blob);
@@ -3860,7 +3860,7 @@ static int pvg_backend_reload_body(PvgState *s, const char *new_path, int reset)
     g_free(blob);
     g_free(old_path);
     if (r) {
-        pvg_log(s, "[apple-gfx-ml][reload][ERROR] restart workers failed: %s\n", strerror(-r));
+        pvg_log(s, "[uniq-vgpu-ml][reload][ERROR] restart workers failed: %s\n", strerror(-r));
         pthread_mutex_unlock(&s->backing_lock);
         return r;
     }
@@ -3876,7 +3876,7 @@ static int pvg_backend_reload_body(PvgState *s, const char *new_path, int reset)
     g_free(s->qmu_path);
     s->qmu_path = g_strdup(new_path);
 
-    pvg_log(s, "[apple-gfx-ml][reload] RELOAD #%" PRIu64 " OK -> %s lmid=%ld "
+    pvg_log(s, "[uniq-vgpu-ml][reload] RELOAD #%" PRIu64 " OK -> %s lmid=%ld "
             "handshake_gen=%" PRIu64 " qmu_errors=%" PRIu64 " banner='%s'\n",
             s->reload_count, new_path, s->qmu_lmid, s->handshake_generation,
             s->qmu_error_count, s->backend_banner);
@@ -3969,19 +3969,19 @@ static int pvg_swap(void *priv, const char *arg)
     } else {
         newh = dlopen(a, RTLD_NOW | RTLD_LOCAL);
         if (!newh) {
-            pvg_log(s, "[apple-gfx-ml][warmswap][ERROR] swap: dlopen %s: %s\n", a, dlerror());
+            pvg_log(s, "[uniq-vgpu-ml][warmswap][ERROR] swap: dlopen %s: %s\n", a, dlerror());
             return -ENOENT;
         }
         pvg_backing_fn fn = (pvg_backing_fn)dlsym(newh, PVG_BACKING_SYMBOL);
         if (!fn) {
-            pvg_log(s, "[apple-gfx-ml][warmswap][ERROR] swap: %s: no %s symbol\n",
+            pvg_log(s, "[uniq-vgpu-ml][warmswap][ERROR] swap: %s: no %s symbol\n",
                     a, PVG_BACKING_SYMBOL);
             dlclose(newh);
             return -ENOEXEC;
         }
         b = fn();
         if (!b || b->abi != PVG_BACKING_ABI) {
-            pvg_log(s, "[apple-gfx-ml][warmswap][ERROR] swap: %s: bad backing ABI\n", a);
+            pvg_log(s, "[uniq-vgpu-ml][warmswap][ERROR] swap: %s: bad backing ABI\n", a);
             dlclose(newh);
             return -ENOEXEC;
         }
@@ -3995,7 +3995,7 @@ static int pvg_swap(void *priv, const char *arg)
     pthread_mutex_unlock(&s->backing_lock);
     if (oldh) dlclose(oldh);
 
-    pvg_log(s, "[apple-gfx-ml][warmswap] WARM-SWAP backend -> tag '%s' version '%s' "
+    pvg_log(s, "[uniq-vgpu-ml][warmswap] WARM-SWAP backend -> tag '%s' version '%s' "
             "hold_ms=%u %s%s (envelope %s frozen)\n",
             b->tag ? b->tag : "?", b->backend_version ? b->backend_version : "",
             hold_ms, newh ? "from " : "(builtin)", newh ? a : "", PVG_ENVELOPE_VERSION);

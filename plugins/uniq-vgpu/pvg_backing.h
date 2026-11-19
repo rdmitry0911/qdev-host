@@ -1,5 +1,5 @@
 /*
- * pvg_backing.h - the apple-pvg (display GPU) plugin's VARIABLE backing ABI.
+ * pvg_backing.h - the uniq-vgpu (display GPU) plugin's VARIABLE backing ABI.
  *
  * "fixed resident kext / variable host backend", increment 2 (DISPLAY GPU).
  * The guest-side UniqVGPU kext (dev.uniqvgpu, the FIXED resident) freezes the

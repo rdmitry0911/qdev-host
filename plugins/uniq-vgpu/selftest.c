@@ -143,12 +143,12 @@ static void host_log(void *host, int level, const char *fmt, ...)
     if (strstr(line, "QMU_DEVICE_RESET_LIFECYCLE phase=complete status=0")) {
         qmu_reset_done++;
     }
-    if (strstr(line, "[apple-gfx-ml] DEVICE_RESET_LIFECYCLE type=") &&
+    if (strstr(line, "[uniq-vgpu-ml] DEVICE_RESET_LIFECYCLE type=") &&
         strstr(line, "phase=qmu_reset_complete")) {
         plugin_reset_ok++;
         ord_plugin_reset = line_seq;
     }
-    if (strstr(line, "[apple-gfx-ml][reset][ERROR]")) {
+    if (strstr(line, "[uniq-vgpu-ml][reset][ERROR]")) {
         plugin_reset_err++;
     }
     if (strstr(line, "DEVICE_RESET_LIFECYCLE") &&
@@ -158,14 +158,14 @@ static void host_log(void *host, int level, const char *fmt, ...)
     if (strstr(line, "firmware PCI identity") && strstr(line, "armed (")) {
         ord_rearm = line_seq;
     }
-    if (strstr(line, "[apple-gfx-ml][display][WARN] ui_info ") && strstr(line, " refused: ")) {
+    if (strstr(line, "[uniq-vgpu-ml][display][WARN] ui_info ") && strstr(line, " refused: ")) {
         ui_info_refusals++;
         snprintf(last_ui_info_refusal, sizeof(last_ui_info_refusal), "%s", line);
     }
-    if (strstr(line, "[apple-gfx-ml][memory][ERROR]")) {
+    if (strstr(line, "[uniq-vgpu-ml][memory][ERROR]")) {
         refusals++;
         snprintf(last_refusal, sizeof(last_refusal), "%s", line);
-    } else if (strstr(line, "[apple-gfx-ml][qmetal][ERROR]")) {
+    } else if (strstr(line, "[uniq-vgpu-ml][qmetal][ERROR]")) {
         qmetal_errors++;
     } else if (strstr(line, "[ERROR]")) {
         plugin_errors++;
@@ -1078,7 +1078,7 @@ int main(int argc, char **argv)
             unsigned long prev_instance = 0;
             int ok_cycles = 0;
             int errs_before_all = get_int(&qmetal_errors);
-            snprintf(root, sizeof(root), "/tmp/apple-pvg-reload-%d", getpid());
+            snprintf(root, sizeof(root), "/tmp/uniq-vgpu-reload-%d", getpid());
             mkdir(root, 0700);
             snprintf(sib, sizeof(sib), "%.*s", slash ? (int)(slash - reload_golden) : 1,
                      slash ? reload_golden : ".");

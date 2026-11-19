@@ -18,7 +18,7 @@
 #   tests/uniq-vgpu/e2e-apply-pvg-warmswap.sh
 #
 # Env (all have 4080-stand defaults):
-#   WARM_DIR   the standing-guest package dir (has pkg/qdev/{tools/qdevctl,plugins/apple-pvg/backing_*.so})
+#   WARM_DIR   the standing-guest package dir (has pkg/qdev/{tools/qdevctl,plugins/uniq-vgpu/backing_*.so})
 #   CTL        the qdev-host --control socket of the standing guest
 #   GUEST_SSH  ssh args to reach the guest's macOS (for WindowServer-pid / optional remote install)
 #   KEXT_TAR   the resident UniqVGPU.kext (.tar); binary sha 43118cc0..., uuid AACD3BB1...
@@ -34,8 +34,8 @@ GUEST_SSH=${GUEST_SSH:--p 3342 devops@127.0.0.1}
 KEXT_TAR=${KEXT_TAR:-$HOME/uniqvgpu-apply-test/UniqVGPU.kext.tar}
 DO_GUEST=${DO_GUEST:-1}
 QDEVCTL="$WARM_DIR/pkg/qdev/tools/qdevctl"
-BACKING_B="$WARM_DIR/pkg/qdev/plugins/apple-pvg/backing_B.so"
-BACKING_A="$WARM_DIR/pkg/qdev/plugins/apple-pvg/backing_A.so"
+BACKING_B="$WARM_DIR/pkg/qdev/plugins/uniq-vgpu/backing_B.so"
+BACKING_A="$WARM_DIR/pkg/qdev/plugins/uniq-vgpu/backing_A.so"
 OUT=${OUT:-/tmp/uniq-vgpu-apply-e2e-$$}; mkdir -p "$OUT"
 KSHA=43118cc09d51951e5c28c04c518a59f655234d2c99b0f4332ae6fbc3852c1c93
 KUUID=AACD3BB1-145E-3246-81CD-C70B581D32E5

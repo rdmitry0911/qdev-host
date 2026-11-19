@@ -25,18 +25,16 @@ Plugin args (`--plugin-args`; the fork's property names are accepted):
 | `vsync=`, `direct_scanout=` | on, off | passed to QMetal |
 | `spirv_cache_dir=` | none | SPIR-V / VkPipelineCache directory |
 | `device-id=` (`x-pci-device-id=`), `vendor-id=` (`x-pci-vendor-id=`) | 0xeeee, 0x106b | personality, e.g. `device-id=0xeee1` |
-| `log=` | `stderr` | device log sink: `stderr` keeps the fork's `[apple-gfx-ml]` lines unchanged; `host` routes them through `qdp_host_ops.log` |
+| `log=` | `stderr` | device log sink: `stderr` writes the device's `[uniq-vgpu-ml]` lines (the fork's `[apple-gfx-ml]` tag until 2026-11-19, HOST-LOG-TAG-01); `host` routes them through `qdp_host_ops.log` |
 | `exit-on-disconnect=` | on | when the client goes away: run the quit stop phase, then exit the process (GPU state refers to the lost guest's memory) |
 
 Build (QMetal headers and the libmlapi to link against):
 
     make QMETAL_INCLUDE=<qmetal>/include QMETAL_LIBDIR=<dir of libmlapi.so> plugins/uniq-vgpu/uniq-vgpu.so
 
-The plugin was called `apple-pvg` before. For one release `make` also creates
-`plugins/uniq-vgpu/apple-pvg.so`, a symlink to `uniq-vgpu.so`; install it next
-to `uniq-vgpu.so` (as a symlink, or the same file under the old name) so that
-device definitions and scripts that load `apple-pvg.so` keep working. Loaded
-under either name the plugin reports itself as `uniq-vgpu`.
+The plugin was called `apple-pvg` before. The one-release compatibility alias
+`apple-pvg.so` was removed on 2026-11-19 (RENAME-UNIQ-VGPU): load `uniq-vgpu.so`.
+Old package directories may still hold the symlink; nothing loads it.
 
 The plugin gets `QMETAL_LIBDIR` as rpath (`QMETAL_RPATH=` to override or drop).
 `libmlapi.so` itself needs `libair2spirv.so.1`: start qdev-host with the
@@ -48,7 +46,7 @@ Guest memory: QEMU must give fd-backed RAM (`-object memory-backend-memfd,
 share=on` as machine memory, seal=on default; no vIOMMU). The plugin maps each
 DMA region itself from a dup of its fd, so a mapping QMetal holds stays valid
 after the client unmaps it (the fork's MemoryRegion reference). Targets that
-are not fd-backed RAM fail and are logged as `[apple-gfx-ml][memory][ERROR]`;
+are not fd-backed RAM fail and are logged as `[uniq-vgpu-ml][memory][ERROR]`;
 there is no message-DMA fallback. udmabuf exports (`/dev/udmabuf`) are built
 over the same memfds.
 

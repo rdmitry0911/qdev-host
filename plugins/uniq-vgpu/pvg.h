@@ -55,7 +55,7 @@ void qmu_vk_consume_current_frame_signal(struct qmu_vulkan_ctx *ctx);
  * the vtable is exact and tracks the headers automatically; the call sites are
  * then rewritten to the vtable by the object-like macros at the end of this
  * block.  Because the only remaining references to the qmu_* names are these
- * compile-time __typeof__ uses, apple-pvg.so carries no direct link-time
+ * compile-time __typeof__ uses, uniq-vgpu.so carries no direct link-time
  * dependency on any routed symbol: the base instance is bound explicitly by
  * dlopen("libmlapi.so") at setup, and every reload target by dlmopen(NEWLM). */
 struct pvg_qmu_vt {

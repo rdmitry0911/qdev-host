@@ -137,7 +137,7 @@ void pvg_memory_refuse(PvgState *s, const char *what, uint64_t gpa,
     uint64_t n = pvg_atomic_fetch_inc(&s->mem.refused) + 1;
 
     if (n <= 10 || n % 60 == 0) {
-        pvg_log(s, "[apple-gfx-ml][memory][ERROR] %s gpa=0x%" PRIx64
+        pvg_log(s, "[uniq-vgpu-ml][memory][ERROR] %s gpa=0x%" PRIx64
                 " size=0x%" PRIx64 " refused: %s (refused=%" PRIu64 ")\n",
                 what, gpa, size, why, n);
     }
@@ -206,7 +206,7 @@ void pvg_unmap_gpa(void *ctx, void *hva, size_t size, int dirty)
     if (r) {
         pvg_region_unref(s, r);
     } else if (s->debug_level >= 1) {
-        pvg_log(s, "[apple-gfx-ml][memory] unmap_gpa: hva=%p is no live mapping\n", hva);
+        pvg_log(s, "[uniq-vgpu-ml][memory] unmap_gpa: hva=%p is no live mapping\n", hva);
     }
 }
 
@@ -322,7 +322,7 @@ int pvg_iosfc_unmap_memory(void *ctx, void *hva, uint64_t len)
 
     (void)len;
     if (!r) {
-        pvg_log_direct(s, "[apple-gfx-ml] iosfc_unmap: memory not found\n");
+        pvg_log_direct(s, "[uniq-vgpu-ml] iosfc_unmap: memory not found\n");
         return -1;
     }
     pvg_region_unref(s, r);
@@ -402,7 +402,7 @@ void pvg_memory_dma_register(PvgState *s, const qdp_dma_region *in)
     unsigned i;
 
     if (!in || in->len == 0 || in->iova > UINT64_MAX - in->len) {
-        pvg_log(s, "[apple-gfx-ml][memory][ERROR] dma_register: invalid region\n");
+        pvg_log(s, "[uniq-vgpu-ml][memory][ERROR] dma_register: invalid region\n");
         return;
     }
     r = g_new0(PvgRegion, 1);
@@ -419,13 +419,13 @@ void pvg_memory_dma_register(PvgState *s, const qdp_dma_region *in)
 
         r->fd = fcntl(in->fd, F_DUPFD_CLOEXEC, 0);
         if (r->fd < 0) {
-            pvg_log(s, "[apple-gfx-ml][memory][ERROR] dma_register: dup fd %d: %s\n",
+            pvg_log(s, "[uniq-vgpu-ml][memory][ERROR] dma_register: dup fd %d: %s\n",
                     in->fd, strerror(errno));
         } else {
             map = mmap(NULL, in->len + delta, prot, MAP_SHARED, r->fd,
                        (off_t)(in->fd_offset - delta));
             if (map == MAP_FAILED) {
-                pvg_log(s, "[apple-gfx-ml][memory][ERROR] dma_register: mmap "
+                pvg_log(s, "[uniq-vgpu-ml][memory][ERROR] dma_register: mmap "
                         "iova=0x%" PRIx64 " len=0x%" PRIx64 ": %s\n",
                         in->iova, in->len, strerror(errno));
                 close(r->fd);
@@ -443,7 +443,7 @@ void pvg_memory_dma_register(PvgState *s, const qdp_dma_region *in)
         PvgRegion *o = m->tab[i];
 
         if (o->iova < r->iova + r->len && r->iova < o->iova + o->len) {
-            pvg_log(s, "[apple-gfx-ml][memory][ERROR] dma_register: iova=0x%" PRIx64
+            pvg_log(s, "[uniq-vgpu-ml][memory][ERROR] dma_register: iova=0x%" PRIx64
                     " len=0x%" PRIx64 " overlaps iova=0x%" PRIx64 " len=0x%" PRIx64
                     "; the old region is dropped\n", r->iova, r->len, o->iova, o->len);
             pvg_table_remove_at(s, i);
@@ -464,7 +464,7 @@ void pvg_memory_dma_register(PvgState *s, const qdp_dma_region *in)
     r->in_table = true;
     pvg_topology_write_end(s);
 
-    pvg_log(s, "[apple-gfx-ml][memory] dma_register iova=0x%" PRIx64 " len=0x%" PRIx64
+    pvg_log(s, "[uniq-vgpu-ml][memory] dma_register iova=0x%" PRIx64 " len=0x%" PRIx64
             " fd=%s offset=0x%" PRIx64 " prot=%s%s regions=%u\n",
             r->iova, r->len, r->map ? "yes" : "no", r->fd_offset,
             (r->prot & PROT_READ) ? "r" : "-", (r->prot & PROT_WRITE) ? "w" : "-",
@@ -488,7 +488,7 @@ void pvg_memory_dma_unregister(PvgState *s, const qdp_dma_region *in)
         }
     }
     pvg_topology_write_end(s);
-    pvg_log(s, "[apple-gfx-ml][memory]%s dma_unregister iova=0x%" PRIx64
+    pvg_log(s, "[uniq-vgpu-ml][memory]%s dma_unregister iova=0x%" PRIx64
             " len=0x%" PRIx64 "%s regions=%u\n", found ? "" : "[WARN]",
             in->iova, in->len, found ? "" : " (not registered)", m->ntab);
 }

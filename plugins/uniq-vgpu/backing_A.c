@@ -1,5 +1,5 @@
 /*
- * backing_A.c - apple-pvg VARIABLE backing A (boot default).
+ * backing_A.c - uniq-vgpu VARIABLE backing A (boot default).
  *
  * The backend the device advertises at boot: the current QMetal/libmlapi
  * identity, no swap-window shaping. Warm-swapping to backing_B.so changes the

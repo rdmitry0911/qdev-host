@@ -1,12 +1,12 @@
-/* pvg_mapper_bridge.h — the apple-pvg <-> apple-videotoolbox IOSurface-mapper bridge.
+/* pvg_mapper_bridge.h — the uniq-vgpu <-> apple-videotoolbox IOSurface-mapper bridge.
  *
  * Increment 2, item 3 (the lead's decided architecture). reims co-locates the GPU device, the
  * IOSurface host device (mapper) and the video device in ONE process and resolves a mapping id by
- * an in-process call into the GPU-populated registry. Our stack runs apple-pvg (GPU + the mapper
+ * an in-process call into the GPU-populated registry. Our stack runs uniq-vgpu (GPU + the mapper
  * ring, see QMetal qmu_iosurface_mapper) and apple-videotoolbox (video) as TWO independent
  * vfio-user host processes with no shared address space. This bridge is the cross-process registry
  * that replaces reims's in-process call: a small shared-memory table of mapping_id -> {guest
- * physical pages + authoritative NV12 plane layout}. apple-pvg's mapper ring WRITES it as the guest
+ * physical pages + authoritative NV12 plane layout}. uniq-vgpu's mapper ring WRITES it as the guest
  * registers each decode-output IOSurface; apple-videotoolbox READS it to resolve a Dbuf reply's
  * mapping id, maps those guest pages through its OWN view of the shared guest-RAM memfd (vt_map /
  * the qdp DMA-region table), and lands the decoded NV12 there.
@@ -93,7 +93,7 @@ typedef struct pvg_bridge_resolved {
     uint64_t gpa_pages[PVG_BRIDGE_MAX_PAGES];
 } pvg_bridge_resolved;
 
-/* What the writer (apple-pvg, from the mapper ring's Surface) hands publish. */
+/* What the writer (uniq-vgpu, from the mapper ring's Surface) hands publish. */
 typedef struct pvg_bridge_publish_info {
     uint32_t pixel_format;
     uint32_t width;
@@ -109,7 +109,7 @@ typedef struct pvg_bridge_publish_info {
 
 static inline size_t pvg_mapper_bridge_bytes(void) { return sizeof(pvg_mapper_bridge); }
 
-/* Writer: one-time init of a fresh region (apple-pvg, at device create). */
+/* Writer: one-time init of a fresh region (uniq-vgpu, at device create). */
 static inline void pvg_mapper_bridge_init(pvg_mapper_bridge *b, uint64_t page_size) {
     memset(b, 0, sizeof *b);
     b->magic = PVG_BRIDGE_MAGIC;

@@ -40,7 +40,7 @@ UNIQ_VGPU_HDR := plugins/uniq-vgpu/pvg.h plugins/uniq-vgpu/pvg-process-vm.h \
 GLIB_ONLY_CFLAGS = $(shell pkg-config --cflags glib-2.0)
 GLIB_ONLY_LIBS   = $(shell pkg-config --libs glib-2.0)
 ifneq ($(QMETAL_INCLUDE),)
-PLUGINS += plugins/uniq-vgpu/uniq-vgpu.so plugins/uniq-vgpu/apple-pvg.so
+PLUGINS += plugins/uniq-vgpu/uniq-vgpu.so
 endif
 
 # apple-videotoolbox (Apple paravirt VideoToolbox codec device, PCI 106b:1a03)
@@ -118,11 +118,6 @@ plugins/uniq-vgpu/uniq-vgpu.so: $(UNIQ_VGPU_SRC) $(UNIQ_VGPU_HDR) qdp.h $(VFU_DE
 	    $(if $(QMETAL_RPATH),-Wl$(comma)-rpath$(comma)$(QMETAL_RPATH)) \
 	    $(GLIB_ONLY_LIBS) -ldl
 
-# The plugin's former name, kept for one release so that device definitions
-# and scripts that load apple-pvg.so keep working: a symlink to uniq-vgpu.so.
-plugins/uniq-vgpu/apple-pvg.so: plugins/uniq-vgpu/uniq-vgpu.so
-	ln -sfn uniq-vgpu.so $@
-
 # Warm-swap VARIABLE backings (increment 2): tiny backend-identity .so's the
 # plugin dlopen-swaps under a live guest (quiesce -> swap -> resume). The frozen
 # envelope (PVG MMIO/FIFO contract) is untouched. See pvg_backing.h.
@@ -140,10 +135,9 @@ plugins/uniq-vgpu/selftest: plugins/uniq-vgpu/selftest.c qdp.h $(VFU_DEP)
 	$(CC) $(CFLAGS) -pthread -rdynamic -I. -I$(QMETAL_INCLUDE) $(VFU_CFLAGS) -o $@ $< \
 	    $(VFU_LIBS) -ldl
 
-uniq-vgpu-selftest: plugins/uniq-vgpu/uniq-vgpu.so plugins/uniq-vgpu/apple-pvg.so plugins/uniq-vgpu/selftest
+uniq-vgpu-selftest: plugins/uniq-vgpu/uniq-vgpu.so plugins/uniq-vgpu/selftest
 	plugins/uniq-vgpu/selftest plugins/uniq-vgpu/uniq-vgpu.so
 	plugins/uniq-vgpu/selftest plugins/uniq-vgpu/uniq-vgpu.so --personality 0xeee1
-	plugins/uniq-vgpu/selftest plugins/uniq-vgpu/apple-pvg.so --personality 0xeee1
 
 # apple-videotoolbox: the multi-source codec device + libva backend. Explicit
 # rule (overrides the generic plugins/%.so single-source rule).

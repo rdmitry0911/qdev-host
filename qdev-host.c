@@ -1854,7 +1854,7 @@ static void setup_cpu_affinity(void)
     LOG("cpu affinity %s (%s)", have, why);
 }
 
-/* In-process REAL-renderer reload (apple-pvg: `reload <libmlapi.so> --reset`)
+/* In-process REAL-renderer reload (uniq-vgpu: `reload <libmlapi.so> --reset`)
  * dlmopen(LM_ID_NEWLM)s a new libmlapi into a fresh link-map namespace.  When a
  * drop-in malloc (mimalloc/jemalloc/tcmalloc) is LD_PRELOADed -- as the shipped
  * bundles do -- it interposes malloc ONLY in the base namespace.  The dlmopen

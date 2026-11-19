@@ -353,14 +353,14 @@ static void vt_emit(void *ctx, const uint8_t *msg, size_t len)
  * evidence/runs/applegva-realproto-20261116/H2-QMETAL-SURFACE-MAPPER-ASK.md):
  * Apple resolves the mapping id through a shared IOSurface mapper (reims'
  * retain_io_surface_with_mapping_id / address_ranges_for_virtual_page). That
- * mapper lives inside apple-pvg/qmu (using_iosurface_mapper = 0 today) and is
+ * mapper lives inside uniq-vgpu/qmu (using_iosurface_mapper = 0 today) and is
  * NOT reachable from this plugin. To make the id a true opaque mapper token
  * (not a GPA), the plugin needs a plugin-boundary resolver
  * `map_guest_surface(mapper_ctx, mapping_id) -> {dma-buf fd or host ptr + plane
  * layout}`. Until that lands, the GPA convention above is the bring-up path. */
-/* increment 2: open the apple-pvg<->apple-videotoolbox IOSurface-mapper bridge (shm), once,
+/* increment 2: open the uniq-vgpu<->apple-videotoolbox IOSurface-mapper bridge (shm), once,
  * lazily. The vfio-user launcher sets PVG_MAPPER_BRIDGE_SHM to the VM-scoped shm name that
- * apple-pvg creates. Returns NULL when no bridge is wired (then resolve falls back to the
+ * uniq-vgpu creates. Returns NULL when no bridge is wired (then resolve falls back to the
  * GPA-as-mapping-id bring-up path below). */
 static const pvg_mapper_bridge *vt_bridge(void)
 {
@@ -414,20 +414,20 @@ static int vt_resolve_buffer(void *ctx, const uint8_t uuid[16], uint64_t mapping
      * delivery. A real NONZERO mapping_id is an opaque IOSurface-mapper token
      * (IOSurfaceGetID), not a GPA, whose (possibly scattered udmabuf) pages only
      * resolve through the paravirtual-GPU IOSurface mapper
-     * (apple-pvg/qmu retain_io_surface_with_mapping_id /
+     * (uniq-vgpu/qmu retain_io_surface_with_mapping_id /
      * address_ranges_for_virtual_page, gated by using_iosurface_mapper=0 today).
      * The GPA-as-mapping-id path below is the bring-up shortcut and lands pixels
      * in the guest only once that mapper is exposed to this plugin (the
      * H2-QMETAL-SURFACE-MAPPER-ASK / L-GVA-SURFACE cross-component dependency). */
     if (mapping_id == 0) {
         vt_log(d, 1, "Dbuf reply lent no output surface (mapping_id 0): dropping the "
-               "frame. The decoded surface backing needs the apple-pvg IOSurface "
+               "frame. The decoded surface backing needs the uniq-vgpu IOSurface "
                "mapper (using_iosurface_mapper); see L-GVA-SURFACE.");
         return -1;
     }
 
     /* increment 2: the v10 IOSurface-mapper path. A nonzero mapping_id is an opaque mapper token;
-     * resolve it through the apple-pvg bridge -> {guest-physical pages + AUTHORITATIVE NV12 layout
+     * resolve it through the uniq-vgpu bridge -> {guest-physical pages + AUTHORITATIVE NV12 layout
      * from the guest surface descriptor}. This supersedes the GPA-as-mapping-id bring-up shortcut
      * below AND the align(w,16) stride guess (the L-GVA-STRIDE fix: the rowBytes now comes from the
      * guest surface, not a guess). The honest drop stays for a genuinely-unmapped id (bridge miss

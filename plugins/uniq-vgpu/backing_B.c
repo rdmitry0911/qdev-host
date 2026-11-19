@@ -1,5 +1,5 @@
 /*
- * backing_B.c - apple-pvg VARIABLE backing B (warm-swap target, observable A/B).
+ * backing_B.c - uniq-vgpu VARIABLE backing B (warm-swap target, observable A/B).
  *
  * B advertises a BUMPED backend_version ("qmetal-backend-B [warmswapB]") -- the
  * observable the guest's ioreg triplet re-publishes after the in-place reset

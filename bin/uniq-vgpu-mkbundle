@@ -100,7 +100,7 @@ def main():
                     default="device-swap",
                     help="how a WARM update reloads the backend: 'device-swap' = the backing .so / "
                          "identity descriptor is swapped in-process (apple-videotoolbox plugin-.so, or "
-                         "the apple-pvg identity tag/backend_version); 'backend-process' = the REAL host "
+                         "the uniq-vgpu identity tag/backend_version); 'backend-process' = the REAL host "
                          "renderer (libmlapi/QMetal/air) changed and must be reloaded by restarting the "
                          "qdev-host backend process on the same vfio-user socket (device-swap alone only "
                          "updates the identity string; the renderer is RTLD_NODELETE-pinned).")

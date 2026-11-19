@@ -452,7 +452,7 @@ def run_host_update(args, prim, st, bundle, dry_run):
 
     # REAL-BACKEND RELOAD ROUTING.
     # `device-swap` reloads an in-process plugin-.so backend (apple-videotoolbox)
-    # or swaps the apple-pvg IDENTITY descriptor (tag/backend_version/hold_ms). It
+    # or swaps the uniq-vgpu IDENTITY descriptor (tag/backend_version/hold_ms). It
     # does NOT reload the display-GPU's real renderer (libmlapi/QMetal/air), which
     # is RTLD_NODELETE-pinned for process life. A bundle that changes the real
     # renderer declares backend_reload="backend-process": the renderer reload must
