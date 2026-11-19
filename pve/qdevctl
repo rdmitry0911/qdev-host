@@ -166,7 +166,8 @@ def cmd_device_reload(a):
     for m in Q.device_reload(cp, backing, reset=not a.no_reset,
                              expect_gpurestart=a.expect_gpurestart,
                              rollback=not a.no_rollback,
-                             allow_guest_gpu_loss=a.allow_guest_gpu_loss):
+                             allow_guest_gpu_loss=a.allow_guest_gpu_loss,
+                             allow_unflushed=a.allow_unflushed):
         print(m)
 
 def cmd_hook(a):
@@ -296,6 +297,9 @@ def main():
     s.add_argument("--allow-guest-gpu-loss", action="store_true",
                    help="reload even while a guest is attached (qdev-host refuses otherwise: the re-created "
                         "backend Session does not carry the guest-programmed device state, the guest GPU hangs)")
+    s.add_argument("--allow-unflushed", action="store_true",
+                   help="with a backend state hand-over that does not flush GPU-written resources yet: "
+                        "accept that GPU-private contents written since the guest's last synchronize may be lost")
     s.set_defaults(fn=cmd_device_reload)
     a = p.parse_args()
     try:

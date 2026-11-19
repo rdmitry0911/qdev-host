@@ -51,6 +51,37 @@ timeout 20 $CL - ctl "$C" "ok reloaded /x/backend-5.so" "reload /x/backend-5.so"
 result $? "after the client detached: reload proceeds (reloads=4)"
 
 kill -TERM "$PID" 2>/dev/null; wait "$PID" 2>/dev/null
+
+# State hand-over reported by the backend (T2_HANDOVER, see plugins/test-v2): without the
+# suspend-time flush a plain reload under an attached guest stays refused unless --allow-unflushed;
+# with the flush it proceeds.
+for mode in 1 2; do
+  rm -f "$RUN/dev.sock" "$C"
+  T2_HANDOVER=$mode timeout 60 "$HOST" --plugin plugins/test-v2/test-v2-reload.so --socket "$RUN/dev.sock" --control "$C" -v \
+      > "$OUT/host-handover$mode.log" 2>&1 &
+  PID=$!
+  for _ in $(seq 50); do [ -S "$RUN/dev.sock" ] && [ -S "$C" ] && break; sleep 0.1; done
+  if [ $mode = 1 ]; then
+    step "attached + hand-over WITHOUT flush: plain reload refused, --allow-unflushed proceeds"
+    timeout 30 $CL "$RUN/dev.sock" info dma \
+        ctl "$C" "err reload refused: a vfio-user client (guest) is attached; the backend state hand-over does not flush" "reload /x/h-1.so" \
+        ctl "$C" "ok reloads=0" backend \
+        ctl "$C" "ok reloaded /x/h-2.so" "reload /x/h-2.so --allow-unflushed" \
+        ctl "$C" "ok reloads=1" backend \
+        > "$OUT/handover1.client.log" 2>&1
+    result $? "attached, unflushed hand-over: refused without the flag (never reaches the plugin), --allow-unflushed proceeds"
+    grep -q "reload /x/h-1.so refused: a vfio-user client (guest) is attached and the backend hands the device state over without flushing" "$OUT/host-handover1.log"
+    result $? "host log names the unflushed refusal reason"
+  else
+    step "attached + hand-over WITH flush: plain reload proceeds"
+    timeout 30 $CL "$RUN/dev.sock" info dma \
+        ctl "$C" "ok reloaded /x/h-3.so" "reload /x/h-3.so" \
+        ctl "$C" "ok reloads=1" backend \
+        > "$OUT/handover2.client.log" 2>&1
+    result $? "attached, flushed hand-over: plain reload proceeds"
+  fi
+  kill -TERM "$PID" 2>/dev/null; wait "$PID" 2>/dev/null
+done
 rm -rf "$RUN"
 echo "overall: $([ $rc = 0 ] && echo PASS || echo FAIL)" | tee -a "$OUT/summary.txt"
 exit $rc

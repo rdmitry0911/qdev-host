@@ -740,35 +740,49 @@ static void ctl_command(ctl_t *c, char *line)
          * reset re-handshake.  On failure the device may be left down: the
          * caller (qdevctl) rolls back by reloading the previous backend. */
         uint32_t flags = 0;
-        bool allow_gpu_loss = false, bad = false;
+        bool allow_gpu_loss = false, allow_unflushed = false, bad = false;
         char *arg = NULL, *save = NULL;
         for (char *t = strtok_r(line + 6, " \t", &save); t; t = strtok_r(NULL, " \t", &save)) {
             if (!strcmp(t, "--reset")) flags |= QDP_RELOAD_RESET;
             else if (!strcmp(t, "--allow-guest-gpu-loss")) allow_gpu_loss = true;
+            else if (!strcmp(t, "--allow-unflushed")) allow_unflushed = true;
             else if (t[0] == '-' || arg) bad = true;
             else arg = t;
         }
         if (!(abi >= 4 && v2.reload)) { ctl_reply(c, "err reload unsupported by plugin"); return; }
-        if (bad || !arg) { ctl_reply(c, "err usage: reload PATH [--reset] [--allow-guest-gpu-loss]"); return; }
+        if (bad || !arg) { ctl_reply(c, "err usage: reload PATH [--reset] [--allow-guest-gpu-loss] [--allow-unflushed]"); return; }
         /* Guard (debt RELOAD-LIVE-REINIT): the re-created backend Session does not carry the
          * device state the guest programmed into the old one (protocol, FIFOs, tasks/channels),
          * so a reload under an attached guest leaves the guest GPU hung (IOAccel GPU-restart
          * loop, frozen scanout; apple-virgl evidence/runs/reload-deadlock-20261118T2110Z).
          * Refuse it while a vfio-user client is attached unless the operator accepts that loss
          * explicitly.  Checked before the quiesce: a refused reload touches nothing. */
-        /* The backend reports state_handover=1 when its live Session can be suspended
-         * and a resuming build re-adopts the guest-programmed device state (PGDevice
-         * suspend/resume port, DSGP v2 blob; a refusing new build rolls back to the
-         * old one with the same state).  A transparent reload (no --reset) under an
-         * attached guest then needs no override. */
-        bool handover = false;
+        /* The backend reports state_handover=1 when its live Session can be suspended and
+         * a resuming build re-adopts the guest-programmed device state (PGDevice
+         * suspend/resume port, DSGP v2 blob; a refusing new build rolls back to the old
+         * one with the same state), and handover_flush=1 once that suspend also writes
+         * every GPU-written resource back to its guest backing (reference finishSuspend
+         * flushResources).  Only the full hand-over makes a plain transparent reload
+         * (no --reset) safe under an attached guest.  A hand-over without the flush may
+         * lose GPU-private contents written since the guest's last synchronize: it needs
+         * --allow-unflushed (or --allow-guest-gpu-loss, which accepts more). */
+        bool handover = false, handover_flush = false;
         if (attached && !(flags & QDP_RELOAD_RESET) && abi >= 4 && v2.backend_report) {
             char rep[512];
-            if (v2.backend_report(priv, rep, sizeof(rep)) && strstr(rep, " state_handover=1 "))
-                handover = true;
+            if (v2.backend_report(priv, rep, sizeof(rep))) {
+                handover = strstr(rep, " state_handover=1 ") != NULL;
+                handover_flush = handover && strstr(rep, " handover_flush=1 ") != NULL;
+            }
         }
-        if (attached && handover)
-            LOG("reload %s under an attached guest: backend state hand-over (suspend/resume)", arg);
+        if (attached && handover && !handover_flush && !allow_unflushed && !allow_gpu_loss) {
+            LOG("reload %s refused: a vfio-user client (guest) is attached and the backend hands the "
+                "device state over without flushing GPU-written resources (GPU-private contents written "
+                "since the guest's last synchronize may be lost); --allow-unflushed overrides", arg);
+            ctl_reply(c, "err reload refused: a vfio-user client (guest) is attached; the backend state "
+                      "hand-over does not flush GPU-written resources yet (GPU-private contents written "
+                      "since the last guest synchronize may be lost); add --allow-unflushed to accept that");
+            return;
+        }
         if (attached && !allow_gpu_loss && !handover) {
             LOG("reload %s refused: a vfio-user client (guest) is attached and an in-process reload "
                 "leaves the guest GPU uninitialized (RELOAD-LIVE-REINIT); --allow-guest-gpu-loss overrides", arg);
@@ -776,6 +790,9 @@ static void ctl_command(ctl_t *c, char *line)
                       "leaves the guest GPU uninitialized (RELOAD-LIVE-REINIT); add --allow-guest-gpu-loss to override");
             return;
         }
+        if (attached && handover)
+            LOG("reload %s under an attached guest: backend state hand-over (suspend/resume)%s", arg,
+                handover_flush ? "" : ", UNFLUSHED (--allow-unflushed/--allow-guest-gpu-loss given)");
         if (attached && !handover) LOG("reload %s under an attached guest: --allow-guest-gpu-loss given", arg);
         bool did_q = false;
         if (v2.quiesce) {
@@ -795,7 +812,7 @@ static void ctl_command(ctl_t *c, char *line)
             ctl_reply(c, "err backend report unsupported by plugin");
     } else {
         ctl_reply(c, "err unknown command (screendump FILE | frame | stats | uiinfo W H [WMM HMM] | "
-                  "abi | swap ARG | reload PATH [--reset] [--allow-guest-gpu-loss] | backend)");
+                  "abi | swap ARG | reload PATH [--reset] [--allow-guest-gpu-loss] [--allow-unflushed] | backend)");
     }
 }
 static void ctl_process(ctl_t *c)
@@ -1601,7 +1618,7 @@ static void usage(void)
         "  --qemu-qmp PATH          the VM's QMP socket: forward keyboard/mouse with input-send-event\n"
         "                           (for VMs without a graphic console; --qemu-display wins if both are given)\n"
         "  --control PATH           control socket for automation: screendump FILE | frame | stats |\n"
-        "                           uiinfo W H [WMM HMM] | abi | swap ARG | reload PATH [--reset] [--allow-guest-gpu-loss] | backend\n"
+        "                           uiinfo W H [WMM HMM] | abi | swap ARG | reload PATH [--reset] [--allow-guest-gpu-loss] [--allow-unflushed] | backend\n"
         "  --kms-copy               force the copy path (no udmabuf zero-copy)\n"
         "  --stats-interval S       print stats every S seconds (SIGUSR2 prints them once)\n"
         "  -v                       verbose\n"

@@ -526,7 +526,13 @@ static int t2_reload(void *priv, const char *path, uint32_t flags)
 
 static const char *t2_backend_report(void *priv, char *buf, size_t len)
 {
-    snprintf(buf, len, "reloads=%u", t2_reloads);
+    /* T2_HANDOVER=1: report a state hand-over without the suspend-time flush;
+     * T2_HANDOVER=2: with it (the uniq-vgpu backend's state_handover/handover_flush). */
+    const char *h = getenv("T2_HANDOVER");
+    if (h && (*h == '1' || *h == '2'))
+        snprintf(buf, len, "reloads=%u state_handover=1 handover_flush=%d ", t2_reloads, *h == '2');
+    else
+        snprintf(buf, len, "reloads=%u", t2_reloads);
     return buf;
 }
 #endif

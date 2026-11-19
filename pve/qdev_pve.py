@@ -443,7 +443,8 @@ def device_backend(control_path) -> dict:
 
 def device_reload(control_path, path: str, reset: bool = True,
                   expect_gpurestart: int = 0, rollback: bool = True,
-                  allow_guest_gpu_loss: bool = False) -> list[str]:
+                  allow_guest_gpu_loss: bool = False,
+                  allow_unflushed: bool = False) -> list[str]:
     """In-process REAL-backend reload (v4): destroy the live backend Session and
     re-create it on the freshly loaded backend at `path`, re-adopting device
     state, with the vfio-user process kept alive (stock QEMU, device BOUND).
@@ -471,7 +472,10 @@ def device_reload(control_path, path: str, reset: bool = True,
     # qdev-host refuses a reload while a guest is attached (the re-created backend Session
     # does not carry the guest-programmed device state: RELOAD-LIVE-REINIT) unless the
     # operator accepts the guest GPU loss explicitly.
-    flags = (" --reset" if reset else "") + (" --allow-guest-gpu-loss" if allow_guest_gpu_loss else "")
+    # A backend state hand-over without the suspend-time flush (state_handover=1,
+    # handover_flush=0) additionally needs --allow-unflushed for a transparent reload.
+    flags = ((" --reset" if reset else "") + (" --allow-guest-gpu-loss" if allow_guest_gpu_loss else "")
+             + (" --allow-unflushed" if allow_unflushed else ""))
     arg = f"reload {path}" + flags
     reply = control_cmd(control_path, arg, timeout=60.0)
     if reply.startswith("err reload refused"):

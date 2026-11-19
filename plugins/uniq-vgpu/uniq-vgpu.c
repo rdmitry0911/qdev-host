@@ -139,6 +139,7 @@ bool pvg_qmu_vt_bind(struct pvg_qmu_vt *vt, void *handle, long lmid, const char 
         { "qmu_session_did_resume",                           (void **)&vt->session_did_resume },
         { "qmu_suspend_state_validate",                       (void **)&vt->suspend_state_validate },
         { "qmu_suspend_state_free",                           (void **)&vt->suspend_state_free },
+        { "qmu_suspend_state_capabilities",                   (void **)&vt->suspend_state_capabilities },
     };
 
     (void)dlerror();
@@ -3901,10 +3902,12 @@ static const char *pvg_backend_report(void *priv, char *buf, size_t len)
     g_snprintf(buf, len,
                "envelope=%s reloads=%" PRIu64 " handshake_gen=%" PRIu64
                " qmu_errors=%" PRIu64 " gpu_restarts=%" PRIu64 " lmid=%ld instance=%p"
-               " state_handover=%d path=%s banner='%s'",
+               " state_handover=%d handover_flush=%d path=%s banner='%s'",
                PVG_ENVELOPE_VERSION, s->reload_count, s->handshake_generation,
                s->qmu_error_count, s->qmu_gpu_restart_count, s->qmu_lmid, s->qmu_ns,
                (pvg_vt_can_suspend(pvg_qvt) && pvg_vt_can_resume(pvg_qvt)) ? 1 : 0,
+               (pvg_vt_can_suspend(pvg_qvt) && pvg_vt_can_resume(pvg_qvt) &&
+                pvg_qvt->suspend_state_capabilities && (pvg_qvt->suspend_state_capabilities() & 1u)) ? 1 : 0,
                s->qmu_path ? s->qmu_path : "?", s->backend_banner);
     pthread_mutex_unlock(&s->backing_lock);
     return buf;

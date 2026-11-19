@@ -106,6 +106,9 @@ struct pvg_qmu_vt {
     int (*session_did_resume)(qmu_session *s);
     int (*suspend_state_validate)(const void *blob, size_t length, uint32_t *error_code);
     void (*suspend_state_free)(void *blob);   /* the blob's owning instance releases it */
+    /* bit0: finishSuspend flushes every GPU-written resource to its guest backing
+     * (reference flushResources).  Absent = no flush. */
+    uint32_t (*suspend_state_capabilities)(void);
     /* identity of the instance this vtable was bound from */
     void       *handle;        /* dlopen/dlmopen handle (base = the LM_ID_BASE copy) */
     long        lmid;          /* link-map namespace id (LM_ID_BASE for the base)    */
