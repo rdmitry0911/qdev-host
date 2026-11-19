@@ -323,6 +323,19 @@ second, so `qdev-host` can (and for a cold-plugged device must) start before QEM
 and it reconnects after a QEMU restart. QMP accepts one client per monitor: give
 QEMU a second `-qmp` for other tools. `--qemu-display` wins if both are given.
 
+Sound in that mode: QEMU's `dbus` audiodev exists only with QEMU's own
+`-display dbus`, so the VM gets an audio-only p2p display next to its sound card:
+`-audiodev dbus,id=ID,... -device ich9-intel-hda,... -device hda-...,audiodev=ID
+-display dbus,p2p=yes,audiodev=ID`. That display has no graphic console
+(`VM.ConsoleIDs` is empty) and no socket of its own; after the QMP handshake
+`qdev-host` asks `query-display-options`, and for `dbus` with `p2p` it becomes
+the display's one client (QMP `getfd` + `add_client protocol=@dbus-display`, as
+libvirt does) and exports QEMU's `/org/qemu/Display1/Audio` next to its own
+console (`VM.Interfaces` lists it). A client's `RegisterOutListener` /
+`RegisterInListener` fd is handed to QEMU, which then streams to the client
+directly. Without such a display nothing changes. Self-test without a guest:
+`make qemu-audio-p2p-test QEMU=... QEMU_L=...` (`tools/test-qemu-audio-p2p.sh`).
+
 Second head: the VM's tablet spans the whole guest desktop, so a point on this
 display is mapped to desktop coordinates first (`--head-origin X,Y`, default: right
 of the VM console; `--desktop WxH`, default: VM console + this display) and then

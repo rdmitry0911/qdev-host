@@ -93,6 +93,11 @@ tools/display1-uiinfo-test: tools/display1-uiinfo-test.c ui-info-reply.h qdp.h $
 ui-info-reply-test: tools/display1-uiinfo-test
 	tools/display1-uiinfo-test
 
+# QEMU's Display1 Audio over its p2p dbus display through QMP (no guest; stock QEMU, dbus-daemon, python3-gi):
+# make qemu-audio-p2p-test QEMU=/path/qemu-system-x86_64 QEMU_L=/path/pc-bios
+qemu-audio-p2p-test: qdev-host plugins/tb-vga/tb-vga.so
+	QEMU=$(QEMU) QEMU_L=$(QEMU_L) tools/test-qemu-audio-p2p.sh
+
 # test client for plugins without a VM: speaks vfio-user itself, needs only the protocol header
 tools/vfu-test-client: tools/vfu-test-client.c $(VFU_DEP)
 	$(CC) $(CFLAGS) $(VFU_CFLAGS) -o $@ $< -lpthread
@@ -168,4 +173,4 @@ distclean: clean
 
 PREFIX ?= /usr/local
 comma := ,
-.PHONY: all clean distclean install vfu uniq-vgpu-selftest ui-info-reply-test
+.PHONY: all clean distclean install vfu uniq-vgpu-selftest ui-info-reply-test qemu-audio-p2p-test

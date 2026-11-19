@@ -1030,6 +1030,7 @@ typedef struct {
     GDBusObjectManagerServer *mgr;
     QemuDBusDisplay1Console *console;
     QemuDBusDisplay1Mouse *mouse;
+    QemuDBusDisplay1VM *vm;      /* borrowed: lives as long as mgr exports it */
 } export_t;
 static GPtrArray *exports;   /* export_t*, one per connection serving the objects */
 
@@ -1297,6 +1298,8 @@ static void setup_input_forwarding(void)
 enum { QMP_DOWN, QMP_CAPS, QMP_MICE, QMP_READY };
 static struct { int fd, state; GString *in; bool abs, warned; uint64_t sent, errors; } qmp = { .fd = -1, .abs = true };
 static void exports_set_absolute(bool abs);
+static void qaudio_query(void);
+static void qaudio_reply(const char *line);
 
 static void qmp_send(const char *json)
 {
@@ -1328,6 +1331,7 @@ static void qmp_btn(guint b, bool down)
 static void qmp_line(const char *line)
 {
     bool ret = strstr(line, "\"return\"") != NULL, err = strstr(line, "\"error\"") != NULL;
+    if (strstr(line, "\"id\": \"qdev-dbus-")) { qaudio_reply(line); return; }
     if (err) { qmp.errors++; if (qmp.errors <= 10 || opt.verbose) LOG("qmp: %s", line); }
     if (qmp.state == QMP_CAPS && (ret || err)) {
         qmp.state = QMP_MICE;
@@ -1341,6 +1345,7 @@ static void qmp_line(const char *line)
         qmp.state = QMP_READY;
         exports_set_absolute(qmp.abs);
         LOG("input forwarded to QEMU QMP %s with input-send-event (%s pointer)", opt.qemu_qmp, qmp.abs ? "absolute" : "relative");
+        qaudio_query();
     }
 }
 static gboolean qmp_read(gint fd, GIOCondition cond, gpointer data)
@@ -1384,6 +1389,102 @@ static gboolean qmp_connect(gpointer data)
     DBG("qmp: connected to %s", path);
     return G_SOURCE_CONTINUE;
 }
+/* QEMU's Display1 Audio while the input goes through QMP. The dbus audiodev
+ * exists only with QEMU's -display dbus; with p2p=yes that display has no
+ * address of its own and takes its one client through QMP add_client
+ * (protocol @dbus-display, an fd passed with getfd), as libvirt does. A VM
+ * whose only display is this device runs QEMU with
+ *   -audiodev dbus,id=ID ... -display dbus,p2p=yes,audiodev=ID
+ * (no graphic console there: VM.ConsoleIDs is empty), and this process is
+ * that client: it exports QEMU's Audio next to its own console. A client's
+ * Register{Out,In}Listener fd is handed to QEMU (audio_reg), which then
+ * streams to the client directly. Without a p2p dbus display nothing is
+ * attached and no Audio is exported, as before. All steps are asynchronous:
+ * QEMU may call into this process (vfio-user) while we wait. */
+static struct { GDBusConnection *conn; bool pending; } qaudio;
+static void export_audio(export_t *e);
+static void export_vm_interfaces(QemuDBusDisplay1VM *vm);
+
+static void qaudio_closed(GDBusConnection *c, gboolean remote, GError *err, gpointer data)
+{
+    if (c != qaudio.conn) return;
+    LOG("QEMU display1 (p2p) closed: Audio no longer exported");
+    g_clear_object(&fwd.audio);
+    for (guint i = 0; exports && i < exports->len; i++) {
+        export_t *e = g_ptr_array_index(exports, i);
+        g_dbus_object_manager_server_unexport(e->mgr, DISPLAY1_ROOT "/Audio");
+        if (e->vm) export_vm_interfaces(e->vm);
+    }
+    g_clear_object(&qaudio.conn);
+}
+static void qaudio_proxy_ready(GObject *src, GAsyncResult *res, gpointer data)
+{
+    g_autoptr(GError) err = NULL;
+    QemuDBusDisplay1Audio *au = qemu_dbus_display1_audio_proxy_new_finish(res, &err);
+    qaudio.pending = false;
+    if (!au) { LOG("QEMU display1 Audio proxy: %s", err->message); return; }
+    g_auto(GStrv) props = g_dbus_proxy_get_cached_property_names(G_DBUS_PROXY(au));
+    if (!props || !props[0]) {   /* GetAll failed: the display has no audiodev */
+        LOG("QEMU display1 (p2p) has no Audio object (no audiodev= on -display dbus): nothing exported");
+        g_object_unref(au);
+        return;
+    }
+    g_clear_object(&fwd.audio);
+    fwd.audio = au;
+    for (guint i = 0; exports && i < exports->len; i++) {
+        export_t *e = g_ptr_array_index(exports, i);
+        export_audio(e);
+        if (e->vm) export_vm_interfaces(e->vm);
+    }
+    LOG("VM interfaces: audio proxied from QEMU's p2p display (nsamples %u)", qemu_dbus_display1_audio_get_nsamples(au));
+}
+static void qaudio_conn_ready(GObject *src, GAsyncResult *res, gpointer data)
+{
+    g_autoptr(GError) err = NULL;
+    GDBusConnection *c = g_dbus_connection_new_finish(res, &err);
+    if (!c) { qaudio.pending = false; LOG("QEMU display1 p2p connection: %s", err->message); return; }
+    qaudio.conn = c;
+    g_signal_connect(c, "closed", G_CALLBACK(qaudio_closed), NULL);
+    qemu_dbus_display1_audio_proxy_new(c, G_DBUS_PROXY_FLAGS_NONE, NULL, DISPLAY1_ROOT "/Audio", NULL, qaudio_proxy_ready, NULL);
+}
+static void qaudio_attach(void)
+{
+    if (qaudio.conn || qaudio.pending || qmp.fd < 0) return;
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) < 0) { LOG("QEMU display1 socketpair: %s", strerror(errno)); return; }
+    static const char getfd[] = "{\"execute\":\"getfd\",\"arguments\":{\"fdname\":\"qdev-host-display1\"},\"id\":\"qdev-dbus-getfd\"}\n";
+    char cbuf[CMSG_SPACE(sizeof(int))] = { 0 };
+    struct iovec iov = { .iov_base = (void *)getfd, .iov_len = sizeof(getfd) - 1 };
+    struct msghdr mh = { .msg_iov = &iov, .msg_iovlen = 1, .msg_control = cbuf, .msg_controllen = sizeof(cbuf) };
+    struct cmsghdr *cm = CMSG_FIRSTHDR(&mh);
+    cm->cmsg_level = SOL_SOCKET; cm->cmsg_type = SCM_RIGHTS; cm->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cm), &sv[1], sizeof(int));
+    if (sendmsg(qmp.fd, &mh, MSG_NOSIGNAL) != (ssize_t)iov.iov_len) {
+        LOG("QEMU display1 getfd: %s", strerror(errno)); close(sv[0]); close(sv[1]); return;
+    }
+    close(sv[1]);
+    qmp_send("{\"execute\":\"add_client\",\"arguments\":{\"protocol\":\"@dbus-display\",\"fdname\":\"qdev-host-display1\"},"
+             "\"id\":\"qdev-dbus-add\"}\n");
+    g_autoptr(GError) err = NULL;
+    g_autoptr(GSocket) sock = g_socket_new_from_fd(sv[0], &err);
+    if (!sock) { LOG("QEMU display1 socket: %s", err->message); close(sv[0]); return; }
+    g_autoptr(GSocketConnection) sc = g_socket_connection_factory_create_connection(sock);
+    qaudio.pending = true;
+    g_dbus_connection_new(G_IO_STREAM(sc), NULL, G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT, NULL, NULL, qaudio_conn_ready, NULL);
+}
+static void qaudio_query(void)
+{
+    if (opt.qemu_display || qaudio.conn || qaudio.pending) return;
+    qmp_send("{\"execute\":\"query-display-options\",\"id\":\"qdev-dbus-display\"}\n");
+}
+static void qaudio_reply(const char *line)
+{
+    if (strstr(line, "\"error\"")) { LOG("qmp (display1 audio): %s", line); return; }
+    if (!strstr(line, "\"id\": \"qdev-dbus-display\"")) return;
+    if (strstr(line, "\"type\": \"dbus\"") && strstr(line, "\"p2p\": true")) { qaudio_attach(); return; }
+    DBG("qmp: QEMU has no p2p dbus display (%s): no Audio", line);
+}
+
 static void setup_qmp(void)
 {
     if (!opt.qemu_qmp) return;
@@ -1479,11 +1580,30 @@ static void export_closed(GDBusConnection *c, gboolean remote, GError *err, gpoi
     g_free(e);
 }
 
-static void export_display1(GDBusConnection *conn)
+static void export_vm_interfaces(QemuDBusDisplay1VM *vm)
 {
     const char *vm_ifaces[3] = { NULL }; int nvi = 0;
     if (fwd.clip_to_qemu) vm_ifaces[nvi++] = "org.qemu.Display1.Clipboard";
     if (fwd.audio) vm_ifaces[nvi++] = "org.qemu.Display1.Audio";
+    qemu_dbus_display1_vm_set_interfaces(vm, vm_ifaces);
+}
+
+static void export_audio(export_t *e)
+{
+    QemuDBusDisplay1Audio *au = qemu_dbus_display1_audio_skeleton_new();
+    static const char *none[] = { NULL };
+    qemu_dbus_display1_audio_set_interfaces(au, none);
+    qemu_dbus_display1_audio_set_nsamples(au, qemu_dbus_display1_audio_get_nsamples(fwd.audio));
+    g_signal_connect(au, "handle-register-out-listener", G_CALLBACK(audio_reg_out), NULL);
+    g_signal_connect(au, "handle-register-in-listener", G_CALLBACK(audio_reg_in), NULL);
+    GDBusObjectSkeleton *auo = g_dbus_object_skeleton_new(DISPLAY1_ROOT "/Audio");
+    g_dbus_object_skeleton_add_interface(auo, G_DBUS_INTERFACE_SKELETON(au));
+    g_dbus_object_manager_server_export(e->mgr, auo);
+    g_object_unref(au); g_object_unref(auo);
+}
+
+static void export_display1(GDBusConnection *conn)
+{
     static const char *con_ifaces[] = { "org.qemu.Display1.Keyboard", "org.qemu.Display1.Mouse", NULL };
     export_t *e = g_new0(export_t, 1);
     e->conn = g_object_ref(conn);
@@ -1493,8 +1613,9 @@ static void export_display1(GDBusConnection *conn)
     guint32 ids[] = { 0 };
     g_autofree char *uuid = g_uuid_string_random();
     g_object_set(vm, "name", opt.vm_name, "uuid", uuid,
-                 "console-ids", g_variant_new_fixed_array(G_VARIANT_TYPE("u"), ids, 1, sizeof(guint32)),
-                 "interfaces", vm_ifaces, NULL);
+                 "console-ids", g_variant_new_fixed_array(G_VARIANT_TYPE("u"), ids, 1, sizeof(guint32)), NULL);
+    export_vm_interfaces(vm);
+    e->vm = vm;
     GDBusObjectSkeleton *vmo = g_dbus_object_skeleton_new(DISPLAY1_ROOT "/VM");
     g_dbus_object_skeleton_add_interface(vmo, G_DBUS_INTERFACE_SKELETON(vm));
     g_dbus_object_manager_server_export(e->mgr, vmo);
@@ -1539,18 +1660,7 @@ static void export_display1(GDBusConnection *conn)
         g_dbus_object_manager_server_export(e->mgr, clo);
         g_object_unref(cl); g_object_unref(clo);
     }
-    if (fwd.audio) {
-        QemuDBusDisplay1Audio *au = qemu_dbus_display1_audio_skeleton_new();
-        static const char *none[] = { NULL };
-        qemu_dbus_display1_audio_set_interfaces(au, none);
-        qemu_dbus_display1_audio_set_nsamples(au, qemu_dbus_display1_audio_get_nsamples(fwd.audio));
-        g_signal_connect(au, "handle-register-out-listener", G_CALLBACK(audio_reg_out), NULL);
-        g_signal_connect(au, "handle-register-in-listener", G_CALLBACK(audio_reg_in), NULL);
-        GDBusObjectSkeleton *auo = g_dbus_object_skeleton_new(DISPLAY1_ROOT "/Audio");
-        g_dbus_object_skeleton_add_interface(auo, G_DBUS_INTERFACE_SKELETON(au));
-        g_dbus_object_manager_server_export(e->mgr, auo);
-        g_object_unref(au); g_object_unref(auo);
-    }
+    if (fwd.audio) export_audio(e);
 
     g_dbus_object_manager_server_set_connection(e->mgr, conn);
     g_signal_connect(conn, "closed", G_CALLBACK(export_closed), e);
