@@ -516,11 +516,26 @@ static void t2_teardown(void *priv)
  * counting reload() and a backend_report() of "reloads=N", for the host-side reload guard test
  * (tools/test-reload-guard.sh): a reload the host refuses must never reach the plugin. */
 static unsigned t2_reloads;
+static uint64_t t2_reload_begin_ns, t2_reload_end_ns;    /* CLOCK_MONOTONIC of the last reload */
 
+static uint64_t t2_now_ns(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+
+/* T2_RELOAD_MS=N: the reload takes N ms (a slow backend hand-over, e.g. under host load), for
+ * tools/test-reload-vm-pause.sh: guest MMIO must never wait for it. */
 static int t2_reload(void *priv, const char *path, uint32_t flags)
 {
+    const char *ms = getenv("T2_RELOAD_MS");
+
+    t2_reload_begin_ns = t2_now_ns();
     t2_reloads++;
     if (g) TLOG(2, "reload #%u %s flags %#x", t2_reloads, path, flags);
+    if (ms && atoi(ms) > 0) usleep((useconds_t)atoi(ms) * 1000);
+    t2_reload_end_ns = t2_now_ns();
     return 0;
 }
 
@@ -530,9 +545,11 @@ static const char *t2_backend_report(void *priv, char *buf, size_t len)
      * T2_HANDOVER=2: with it (the uniq-vgpu backend's state_handover/handover_flush). */
     const char *h = getenv("T2_HANDOVER");
     if (h && (*h == '1' || *h == '2'))
-        snprintf(buf, len, "reloads=%u state_handover=1 handover_flush=%d ", t2_reloads, *h == '2');
+        snprintf(buf, len, "reloads=%u state_handover=1 handover_flush=%d reload_begin_ns=%llu reload_end_ns=%llu",
+                 t2_reloads, *h == '2', (unsigned long long)t2_reload_begin_ns, (unsigned long long)t2_reload_end_ns);
     else
-        snprintf(buf, len, "reloads=%u", t2_reloads);
+        snprintf(buf, len, "reloads=%u reload_begin_ns=%llu reload_end_ns=%llu", t2_reloads,
+                 (unsigned long long)t2_reload_begin_ns, (unsigned long long)t2_reload_end_ns);
     return buf;
 }
 #endif

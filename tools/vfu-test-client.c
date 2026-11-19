@@ -19,6 +19,15 @@
  *                         IRQ record into region B at HZ (quiesce check)
  *   reset                 DEVICE_RESET
  *   sleep MS
+ *   r32max REG OFF MS     32-bit read; fail unless its reply arrives within MS ms (the
+ *                         stock QEMU vfio-user client gives up after 5000 ms: x-msg-timeout)
+ *   qmpfake PATH MS       serve a fake QMP monitor on PATH in a thread (greeting,
+ *                         qmp_capabilities, query-status, stop answered MS ms late with a
+ *                         STOP event first, cont); it records when stop/cont were answered
+ *   qmpcheck SOCK N       after N reloads through qdev-host --vm-qmp: exactly N stops and N conts,
+ *                         the VM running again, and the backend's last reload (reload_begin_ns/
+ *                         reload_end_ns of "backend" on control socket SOCK) inside the
+ *                         stop..cont window (tools/test-reload-vm-pause.sh)
  *   ctl SOCK PREFIX CMD   send CMD to the qdev-host --control socket SOCK and fail unless
  *                         the reply line starts with PREFIX (runs while this client is
  *                         attached, e.g. the reload guard: tools/test-reload-guard.sh)
@@ -366,12 +375,109 @@ static void cmd_remap(int n, unsigned hz)
     wr(0, 0x10, 0, 4); wr(0, 0x14, 0, 4);
 }
 
-/* One control-socket request: send CMD, read one reply line, check its prefix. */
-static void cmd_ctl(const char *path, const char *prefix, const char *cmd)
+
+/* ------------------------------------------------------------ fake QMP monitor (qmpfake) */
+static struct {
+    pthread_mutex_t lock;
+    char path[108];
+    unsigned stop_delay_ms;
+    bool running;
+    unsigned stops, conts;
+    uint64_t stop_ack_ns, cont_ns;      /* CLOCK_MONOTONIC when the last stop/cont was answered */
+} qf = { .lock = PTHREAD_MUTEX_INITIALIZER, .running = true };
+
+static void qf_send(int fd, const char *line) { if (send(fd, line, strlen(line), MSG_NOSIGNAL) < 0) {} }
+
+static void *qf_thread(void *arg)
+{
+    struct sockaddr_un a = { .sun_family = AF_UNIX };
+    int ls = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    (void)arg;
+    snprintf(a.sun_path, sizeof(a.sun_path), "%s", qf.path);
+    unlink(qf.path);
+    if (ls < 0 || bind(ls, (struct sockaddr *)&a, sizeof(a)) < 0 || listen(ls, 4) < 0) DIE("qmpfake %s: %s", qf.path, strerror(errno));
+    for (;;) {
+        int fd = accept4(ls, NULL, NULL, SOCK_CLOEXEC);
+        char line[4096]; size_t n = 0;
+        if (fd < 0) continue;
+        qf_send(fd, "{\"QMP\": {\"version\": {\"qemu\": {\"micro\": 0, \"minor\": 0, \"major\": 0}, \"package\": \"qmpfake\"}, \"capabilities\": []}}\r\n");
+        for (;;) {
+            ssize_t r = read(fd, line + n, 1);
+            if (r <= 0) break;
+            if (line[n] != '\n' && n + 1 < sizeof(line)) { n++; continue; }
+            line[n] = 0; n = 0;
+            if (strstr(line, "qmp_capabilities")) qf_send(fd, "{\"return\": {}}\r\n");
+            else if (strstr(line, "query-status")) {
+                pthread_mutex_lock(&qf.lock);
+                bool run = qf.running;
+                pthread_mutex_unlock(&qf.lock);
+                qf_send(fd, run ? "{\"return\": {\"status\": \"running\", \"running\": true}}\r\n"
+                                : "{\"return\": {\"status\": \"paused\", \"running\": false}}\r\n");
+            } else if (strstr(line, "\"stop\"")) {
+                usleep(qf.stop_delay_ms * 1000);          /* vCPUs leaving KVM_RUN; in-flight MMIO completes */
+                pthread_mutex_lock(&qf.lock);
+                qf.running = false; qf.stops++; qf.stop_ack_ns = now_ns();
+                pthread_mutex_unlock(&qf.lock);
+                qf_send(fd, "{\"timestamp\": {\"seconds\": 0, \"microseconds\": 0}, \"event\": \"STOP\"}\r\n");
+                qf_send(fd, "{\"return\": {}}\r\n");
+            } else if (strstr(line, "\"cont\"")) {
+                pthread_mutex_lock(&qf.lock);
+                qf.running = true; qf.conts++; qf.cont_ns = now_ns();
+                pthread_mutex_unlock(&qf.lock);
+                qf_send(fd, "{\"timestamp\": {\"seconds\": 0, \"microseconds\": 0}, \"event\": \"RESUME\"}\r\n");
+                qf_send(fd, "{\"return\": {}}\r\n");
+            } else qf_send(fd, "{\"error\": {\"class\": \"CommandNotFound\", \"desc\": \"qmpfake\"}}\r\n");
+        }
+        close(fd);
+    }
+    return NULL;
+}
+
+static void cmd_qmpfake(const char *path, unsigned delay_ms)
+{
+    pthread_t t;
+    snprintf(qf.path, sizeof(qf.path), "%s", path);
+    qf.stop_delay_ms = delay_ms;
+    if (pthread_create(&t, NULL, qf_thread, NULL)) DIE("qmpfake thread");
+    pthread_detach(t);
+    for (int i = 0; i < 100; i++) { if (access(path, F_OK) == 0) break; usleep(10000); }
+    printf("qmpfake: monitor on %s, stop answered after %u ms\n", path, delay_ms);
+}
+
+static void cmd_r32max(int region, uint64_t off, unsigned max_ms)
+{
+    uint64_t t0 = now_ns();
+    uint32_t v = rd(region, off, 4);
+    double ms = (now_ns() - t0) / 1e6;
+    check(ms <= max_ms, "read region %d off %#llx = %#x answered in %.1f ms (bound %u ms)",
+          region, (unsigned long long)off, v, ms, max_ms);
+}
+
+static bool ctl_line(const char *path, const char *cmd, char *reply, size_t max);
+
+static void cmd_qmpcheck(const char *ctl, unsigned n)
+{
+    char rep[1024];
+    const char *b, *e;
+    unsigned long long begin = 0, end = 0;
+    if (!ctl_line(ctl, "backend", rep, sizeof(rep))) DIE("qmpcheck: control %s", ctl);
+    if ((b = strstr(rep, "reload_begin_ns="))) begin = strtoull(b + 16, NULL, 10);
+    if ((e = strstr(rep, "reload_end_ns="))) end = strtoull(e + 14, NULL, 10);
+    pthread_mutex_lock(&qf.lock);
+    check(qf.stops == n && qf.conts == n, "QMP: %u stop / %u cont for %u reloads", qf.stops, qf.conts, n);
+    check(qf.running, "QMP: the VM runs again after the reload");
+    check(begin && qf.stop_ack_ns && begin >= qf.stop_ack_ns,
+          "backend reload began %.1f ms after the vCPUs were stopped (>= 0)", ((double)begin - (double)qf.stop_ack_ns) / 1e6);
+    check(end && qf.cont_ns && qf.cont_ns >= end,
+          "vCPUs continued %.1f ms after the backend reload ended (>= 0)", ((double)qf.cont_ns - (double)end) / 1e6);
+    pthread_mutex_unlock(&qf.lock);
+}
+
+/* One control-socket request: send CMD, read one reply line. */
+static bool ctl_line(const char *path, const char *cmd, char *reply, size_t max)
 {
     struct sockaddr_un a = { .sun_family = AF_UNIX };
     struct timeval tv = { .tv_sec = 30 };
-    char reply[1024];
     size_t n = 0;
     int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
 
@@ -379,13 +485,21 @@ static void cmd_ctl(const char *path, const char *prefix, const char *cmd)
     if (s < 0 || connect(s, (struct sockaddr *)&a, sizeof(a)) < 0) DIE("connect %s: %s", path, strerror(errno));
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     if (dprintf(s, "%s\n", cmd) < 0) DIE("control write: %s", strerror(errno));
-    while (n + 1 < sizeof(reply)) {
+    while (n + 1 < max) {
         ssize_t r = read(s, reply + n, 1);
         if (r <= 0 || reply[n] == '\n') break;
         n++;
     }
     reply[n] = 0;
     close(s);
+    return true;
+}
+
+/* One control-socket request: send CMD, read one reply line, check its prefix. */
+static void cmd_ctl(const char *path, const char *prefix, const char *cmd)
+{
+    char reply[1024];
+    ctl_line(path, cmd, reply, sizeof(reply));
     check(!strncmp(reply, prefix, strlen(prefix)), "control \"%s\" -> \"%s\" (expected prefix \"%s\")",
           cmd, reply, prefix);
 }
@@ -409,7 +523,7 @@ int main(int argc, char **argv)
     }
     for (int i = 2; i < argc; i++) {
         const char *c = argv[i];
-        if (!attach && strcmp(c, "ctl") && strcmp(c, "sleep")) DIE("%s needs a vfio-user connection", c);
+        if (!attach && strcmp(c, "ctl") && strcmp(c, "sleep") && strcmp(c, "qmpfake") && strcmp(c, "qmpcheck")) DIE("%s needs a vfio-user connection", c);
 #define ARG(k) need(argc, argv, i + (k), c)
         if (!strcmp(c, "info")) cmd_info();
         else if (!strcmp(c, "cfg")) cmd_cfg();
@@ -439,6 +553,11 @@ int main(int argc, char **argv)
         else if (!strcmp(c, "reset")) check(xfer(VFIO_USER_DEVICE_RESET, NULL, 0, NULL, 0, NULL, 0, NULL) == 0, "DEVICE_RESET");
         else if (!strcmp(c, "sleep")) { usleep(atoi(ARG(1)) * 1000); i++; }
         else if (!strcmp(c, "ctl")) { cmd_ctl(ARG(1), ARG(2), ARG(3)); i += 3; }
+        else if (!strcmp(c, "r32max")) {
+            int reg = region_arg(ARG(1)); uint64_t off = strtoull(ARG(2), NULL, 0); unsigned ms = atoi(ARG(3)); i += 3;
+            cmd_r32max(reg, off, ms);
+        } else if (!strcmp(c, "qmpfake")) { cmd_qmpfake(ARG(1), atoi(ARG(2))); i += 2; }
+        else if (!strcmp(c, "qmpcheck")) { cmd_qmpcheck(ARG(1), atoi(ARG(2))); i += 2; }
         else DIE("unknown command %s", c);
     }
     printf("%s (%d failed checks)\n", failures ? "FAILED" : "OK", failures);

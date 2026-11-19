@@ -172,6 +172,7 @@ qdev-host --plugin plugins/tb-vga/tb-vga.so --socket /run/qdev/tbvga0.sock \
 | `--on-connect CMD`, `--on-disconnect CMD` | run when that connector's status changes (e.g. `tbctl.py … plug/unplug`) |
 | `--qemu-display ADDR`, `--qemu-display-dest NAME`, `--qemu-console N` | forward keyboard/mouse to the VM's own Display1 console (see below) |
 | `--qemu-qmp PATH` | forward keyboard/mouse with QMP `input-send-event`, for VMs without a graphic console (see below) |
+| `--vm-qmp PATH` | a QMP monitor of the VM (its own `-qmp`, not the `--qemu-qmp` one): a control-socket `reload` under an attached guest stops the guest's vCPUs (`stop` .. `cont`) around the backend reload, so guest MMIO never waits for it (stock vfio-user gives up after 5 s and returns all-ones). Without it such a reload is refused unless the caller stopped the VM and adds `--vm-paused` |
 | `--control PATH` | control socket for automation: `screendump FILE`, `frame`, `stats`, `uiinfo W H [WMM HMM]` (see below) |
 | `--stats-interval S` | print damage-detection and KMS statistics every S seconds (`SIGUSR2` prints once) |
 | `--kms-copy` | force the dumb-buffer copy path instead of zero-copy |

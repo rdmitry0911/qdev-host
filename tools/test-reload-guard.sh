@@ -34,8 +34,8 @@ timeout 30 $CL "$RUN/dev.sock" info dma \
     ctl "$C" "err reload refused: a vfio-user client (guest) is attached" "reload /x/backend-2.so" \
     ctl "$C" "err reload refused: a vfio-user client (guest) is attached" "reload /x/backend-2.so --reset" \
     ctl "$C" "ok reloads=1" backend \
-    ctl "$C" "ok reloaded /x/backend-3.so (reset)" "reload /x/backend-3.so --reset --allow-guest-gpu-loss" \
-    ctl "$C" "ok reloaded /x/backend-4.so" "reload --allow-guest-gpu-loss /x/backend-4.so" \
+    ctl "$C" "ok reloaded /x/backend-3.so (reset)" "reload /x/backend-3.so --reset --allow-guest-gpu-loss --vm-paused" \
+    ctl "$C" "ok reloaded /x/backend-4.so" "reload --allow-guest-gpu-loss /x/backend-4.so --vm-paused" \
     ctl "$C" "ok reloads=3" backend \
     ctl "$C" "err usage: reload PATH" "reload /x/a.so /x/b.so" \
     ctl "$C" "err usage: reload PATH" "reload /x/a.so --bogus" \
@@ -66,7 +66,7 @@ for mode in 1 2; do
     timeout 30 $CL "$RUN/dev.sock" info dma \
         ctl "$C" "err reload refused: a vfio-user client (guest) is attached; the backend state hand-over does not flush" "reload /x/h-1.so" \
         ctl "$C" "ok reloads=0" backend \
-        ctl "$C" "ok reloaded /x/h-2.so" "reload /x/h-2.so --allow-unflushed" \
+        ctl "$C" "ok reloaded /x/h-2.so" "reload /x/h-2.so --allow-unflushed --vm-paused" \
         ctl "$C" "ok reloads=1" backend \
         > "$OUT/handover1.client.log" 2>&1
     result $? "attached, unflushed hand-over: refused without the flag (never reaches the plugin), --allow-unflushed proceeds"
@@ -75,7 +75,7 @@ for mode in 1 2; do
   else
     step "attached + hand-over WITH flush: plain reload proceeds"
     timeout 30 $CL "$RUN/dev.sock" info dma \
-        ctl "$C" "ok reloaded /x/h-3.so" "reload /x/h-3.so" \
+        ctl "$C" "ok reloaded /x/h-3.so" "reload /x/h-3.so --vm-paused" \
         ctl "$C" "ok reloads=1" backend \
         > "$OUT/handover2.client.log" 2>&1
     result $? "attached, flushed hand-over: plain reload proceeds"

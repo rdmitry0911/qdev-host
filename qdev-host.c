@@ -48,7 +48,7 @@
 static struct {
     const char *plugin, *socket, *plugin_args, *display_p2p, *display_bus,
                *display_name, *vm_name, *dump_dir, *kms, *on_connect, *on_disconnect,
-               *qemu_display, *qemu_display_dest, *head_origin, *desktop, *control, *qemu_qmp;
+               *qemu_display, *qemu_display_dest, *head_origin, *desktop, *control, *qemu_qmp, *vm_qmp;
     int fps, idle_fps, idle_after, qemu_console, stats_interval;
     bool verbose, kms_copy;
 } opt = { .display_name = "org.qemu", .vm_name = "qdev-host", .dump_dir = ".", .fps = 30,
@@ -618,7 +618,7 @@ static int host_ui_info(uint32_t w, uint32_t h, uint16_t wmm, uint16_t hmm, cons
  *                    shows the size once the guest presents at it
  * Errors: "err <reason>". A client's commands are answered in order: while its
  * screendump waits, its later lines stay queued. */
-typedef struct { int fd; guint watch; GString *in; char *shot; guint shot_timer; } ctl_t;
+typedef struct { int fd; guint watch; GString *in; char *shot; guint shot_timer; bool busy; } ctl_t;
 static GPtrArray *ctls;
 static double last_present_t;
 
@@ -663,6 +663,183 @@ static void disp_presented(uint64_t seq)
     for (guint i = 0; i < ctls->len; i++) { ctl_t *c = g_ptr_array_index(ctls, i); if (c->shot) g_ptr_array_add(done, c); }
     for (guint i = 0; i < done->len; i++) ctl_shot_done(g_ptr_array_index(done, i));
 }
+/* ------------------------------------------- reload with the guest's vCPUs stopped (--vm-qmp)
+ * The backend reload runs on this main loop, which also serves the guest's BAR0 (vfu_run_ctx), so
+ * every MMIO the running guest issues during the reload waits for it.  Stock QEMU's vfio-user client
+ * gives up on a reply after 5 s (x-msg-timeout) and hands the guest all-ones instead: a hand-over
+ * that took 6 s under host load turned DISPLAY_IRQ into 0xffffffff and panicked the guest kext
+ * (apple-virgl evidence/runs/reload-debts-20261119, debt D-GUEST-ISR-SIGNALDISPLAYS).
+ * Reference: the PGDevice suspend/resume this hand-over ports (-[_PGDevice willSuspend]
+ * 7ffb1403b340, finishSuspend 7ffb1403b41c, willResumeWithSuspendState:error: 7ffb1403b756,
+ * didResume 7ffb1403bad8; ParavirtualizedGraphics 26.2) runs with the VM's vCPUs stopped
+ * (Virtualization.framework saves and restores a paused VM), and its register file never waits
+ * for it: -[_PGDevice mmioReadAtOffset:] 7ffb1403722a / mmioWriteAtOffset:value: 7ffb14038919 are
+ * plain ivar accesses with no _runState gate.  So a reload under an attached guest runs only with
+ * the guest's vCPUs stopped: with --vm-qmp this host stops them itself (query-status, stop), keeps
+ * serving BAR0 until the stop is answered (a vCPU waiting for an MMIO reply must get it before it
+ * can stop), reloads, and continues them (cont) only if they were running; or the caller states
+ * that it stopped them (reload ... --vm-paused).  The QMP exchange runs in a worker thread on its
+ * own short connection to the monitor (a QEMU QMP socket serves one client at a time, so it must
+ * not be the --qemu-qmp input relay's monitor). */
+typedef struct {
+    ctl_t *c;
+    char *path;
+    uint32_t flags;
+    int fd;
+    bool was_running, stopped, cont_ok;
+    int r;
+    char err[256];
+    double t0, t_stopped, t_reloaded;
+} reload_job_t;
+static reload_job_t *reload_job;
+
+static void reload_job_forget_ctl(ctl_t *c) { if (reload_job && reload_job->c == c) reload_job->c = NULL; }
+
+/* one QMP command: send, then read lines until its "return" or "error" (greeting/events skipped) */
+static bool vmqmp_cmd(reload_job_t *j, const char *cmd, char *reply, size_t max)
+{
+    if (cmd && send(j->fd, cmd, strlen(cmd), MSG_NOSIGNAL) != (ssize_t)strlen(cmd)) {
+        snprintf(j->err, sizeof(j->err), "QMP send: %s", strerror(errno));
+        return false;
+    }
+    size_t n = 0;
+    for (;;) {
+        char ch;
+        ssize_t r = read(j->fd, &ch, 1);
+        if (r <= 0) {
+            snprintf(j->err, sizeof(j->err), "QMP %s: %s", cmd ? cmd : "greeting",
+                     r < 0 ? strerror(errno) : "monitor closed the connection");
+            return false;
+        }
+        if (ch != '\n') { if (n + 1 < max) reply[n++] = ch; continue; }
+        reply[n] = 0; n = 0;
+        if (!cmd) { if (strstr(reply, "\"QMP\"")) return true; continue; }
+        if (strstr(reply, "\"event\"")) continue;
+        if (strstr(reply, "\"error\"")) { snprintf(j->err, sizeof(j->err), "QMP %.40s: %.180s", cmd, reply); return false; }
+        if (strstr(reply, "\"return\"")) return true;
+    }
+}
+
+static gboolean reload_job_done(gpointer data);
+static gboolean reload_job_stopped(gpointer data);
+
+static void *reload_job_stop_thread(void *data)
+{
+    reload_job_t *j = data;
+    char line[4096];
+    const char *path = g_str_has_prefix(opt.vm_qmp, "unix:") ? opt.vm_qmp + 5 : opt.vm_qmp;
+    struct sockaddr_un a = { .sun_family = AF_UNIX };
+    struct timeval tv = { .tv_sec = 30 };          /* vCPUs leave KVM_RUN within ms; a stuck monitor fails the reload */
+
+    g_strlcpy(a.sun_path, path, sizeof(a.sun_path));
+    j->fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (j->fd < 0 || connect(j->fd, (struct sockaddr *)&a, sizeof(a)) < 0) {
+        snprintf(j->err, sizeof(j->err), "QMP %s: %s", path, strerror(errno));
+    } else {
+        setsockopt(j->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(j->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        if (vmqmp_cmd(j, NULL, line, sizeof(line)) &&
+            vmqmp_cmd(j, "{\"execute\":\"qmp_capabilities\"}\n", line, sizeof(line)) &&
+            vmqmp_cmd(j, "{\"execute\":\"query-status\"}\n", line, sizeof(line))) {
+            j->was_running = strstr(line, "\"running\": true") || strstr(line, "\"running\":true");
+            if (!j->was_running || vmqmp_cmd(j, "{\"execute\":\"stop\"}\n", line, sizeof(line))) {
+                j->stopped = j->was_running;
+                j->err[0] = 0;
+            }
+        }
+    }
+    g_idle_add(reload_job_stopped, j);
+    return NULL;
+}
+
+static void *reload_job_cont_thread(void *data)
+{
+    reload_job_t *j = data;
+    char line[4096];
+    j->cont_ok = vmqmp_cmd(j, "{\"execute\":\"cont\"}\n", line, sizeof(line));
+    g_idle_add(reload_job_done, j);
+    return NULL;
+}
+
+/* quiesce -> plugin reload -> resume, on this loop; > 0: quiesce refused */
+static int reload_run(const char *path, uint32_t flags)
+{
+    bool did_q = false;
+    if (v2.quiesce) {
+        if (quiesce_cb(vfu) != 0) return 1;
+        did_q = true;
+    }
+    int r = v2.reload(priv, path, flags);
+    if (did_q) plugin_resume();
+    return r == 0 ? 0 : (r < 0 ? r : -r);
+}
+
+static void reload_reply(ctl_t *c, int r, const char *path, uint32_t flags, const char *note)
+{
+    if (!c) return;
+    if (r == 1) ctl_reply(c, "err quiesce refused");
+    else if (r == 0) ctl_reply(c, "ok reloaded %s%s%s", path, (flags & QDP_RELOAD_RESET) ? " (reset)" : "", note ? note : "");
+    else ctl_reply(c, "err reload: %s", strerror(-r));
+}
+
+static gboolean reload_job_stopped(gpointer data)
+{
+    reload_job_t *j = data;
+    pthread_t t;
+    j->t_stopped = now_s();
+    if (j->err[0]) {
+        LOG("reload %s refused: the guest's vCPUs could not be stopped (%s); nothing reloaded", j->path, j->err);
+        if (j->c) ctl_reply(j->c, "err reload refused: the guest's vCPUs could not be stopped over QMP: %s", j->err);
+        j->r = 2;
+        if (j->stopped) goto cont;
+        return reload_job_done(j);
+    }
+    LOG("reload %s: guest vCPUs %s (%.0f ms); reloading", j->path,
+        j->was_running ? "stopped over QMP" : "already stopped", (j->t_stopped - j->t0) * 1e3);
+    j->r = reload_run(j->path, j->flags);
+    j->t_reloaded = now_s();
+    if (!j->stopped) return reload_job_done(j);
+cont:
+    if (pthread_create(&t, NULL, reload_job_cont_thread, j) != 0) { j->cont_ok = false; return reload_job_done(j); }
+    pthread_detach(t);
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean reload_job_done(gpointer data)
+{
+    reload_job_t *j = data;
+    if (j->stopped && !j->cont_ok) {
+        LOG("reload %s: QMP cont FAILED (%s): the guest stays paused", j->path, j->err[0] ? j->err : "?");
+        if (j->c && j->r != 2) ctl_reply(j->c, "err reload: %s, but the guest's vCPUs could not be continued over QMP (%s): VM left paused",
+                                         j->r == 0 ? "backend reloaded" : "backend reload failed", j->err);
+    } else if (j->r != 2) {
+        g_autofree char *note = g_strdup_printf(" (vCPUs %s %.0f ms)", j->was_running ? "stopped" : "already stopped",
+                                                (now_s() - j->t_stopped) * 1e3);
+        if (j->stopped) LOG("reload %s: guest vCPUs continued after %.0f ms stopped", j->path, (now_s() - j->t_stopped) * 1e3);
+        reload_reply(j->c, j->r, j->path, j->flags, note);
+    }
+    if (j->fd >= 0) close(j->fd);
+    if (j->c) { j->c->busy = false; ctl_process(j->c); }
+    reload_job = NULL;
+    g_free(j->path); g_free(j);
+    return G_SOURCE_REMOVE;
+}
+
+static void reload_job_start(ctl_t *c, const char *path, uint32_t flags)
+{
+    reload_job_t *j = g_new0(reload_job_t, 1);
+    pthread_t t;
+    j->c = c; j->path = g_strdup(path); j->flags = flags; j->fd = -1; j->t0 = now_s();
+    reload_job = j;
+    c->busy = true;                          /* this client's later lines wait for the reply */
+    if (pthread_create(&t, NULL, reload_job_stop_thread, j) != 0) {
+        snprintf(j->err, sizeof(j->err), "thread: %s", strerror(errno));
+        reload_job_stopped(j);
+        return;
+    }
+    pthread_detach(t);
+}
+
 static void ctl_command(ctl_t *c, char *line)
 {
     const qdp_scanout *s = &disp.cur;
@@ -723,6 +900,7 @@ static void ctl_command(ctl_t *c, char *line)
          * which a device reset (FLR / virtio reset / hot-replug) triggers. */
         char *arg = g_strstrip(line + 4);
         if (!(abi >= 3 && v2.swap)) { ctl_reply(c, "err swap unsupported by plugin"); return; }
+        if (reload_job) { ctl_reply(c, "err swap busy: a reload is in progress"); return; }
         bool did_q = false;
         if (v2.quiesce) {
             if (quiesce_cb(vfu) != 0) { ctl_reply(c, "err quiesce refused"); return; }
@@ -741,17 +919,18 @@ static void ctl_command(ctl_t *c, char *line)
          * reset re-handshake.  On failure the device may be left down: the
          * caller (qdevctl) rolls back by reloading the previous backend. */
         uint32_t flags = 0;
-        bool allow_gpu_loss = false, allow_unflushed = false, bad = false;
+        bool allow_gpu_loss = false, allow_unflushed = false, vm_paused = false, bad = false;
         char *arg = NULL, *save = NULL;
         for (char *t = strtok_r(line + 6, " \t", &save); t; t = strtok_r(NULL, " \t", &save)) {
             if (!strcmp(t, "--reset")) flags |= QDP_RELOAD_RESET;
             else if (!strcmp(t, "--allow-guest-gpu-loss")) allow_gpu_loss = true;
             else if (!strcmp(t, "--allow-unflushed")) allow_unflushed = true;
+            else if (!strcmp(t, "--vm-paused")) vm_paused = true;
             else if (t[0] == '-' || arg) bad = true;
             else arg = t;
         }
         if (!(abi >= 4 && v2.reload)) { ctl_reply(c, "err reload unsupported by plugin"); return; }
-        if (bad || !arg) { ctl_reply(c, "err usage: reload PATH [--reset] [--allow-guest-gpu-loss] [--allow-unflushed]"); return; }
+        if (bad || !arg) { ctl_reply(c, "err usage: reload PATH [--reset] [--allow-guest-gpu-loss] [--allow-unflushed] [--vm-paused]"); return; }
         /* Guard (debt RELOAD-LIVE-REINIT): the re-created backend Session does not carry the
          * device state the guest programmed into the old one (protocol, FIFOs, tasks/channels),
          * so a reload under an attached guest leaves the guest GPU hung (IOAccel GPU-restart
@@ -795,15 +974,23 @@ static void ctl_command(ctl_t *c, char *line)
             LOG("reload %s under an attached guest: backend state hand-over (suspend/resume)%s", arg,
                 handover_flush ? "" : ", UNFLUSHED (--allow-unflushed/--allow-guest-gpu-loss given)");
         if (attached && !handover) LOG("reload %s under an attached guest: --allow-guest-gpu-loss given", arg);
-        bool did_q = false;
-        if (v2.quiesce) {
-            if (quiesce_cb(vfu) != 0) { ctl_reply(c, "err quiesce refused"); return; }
-            did_q = true;
+        if (reload_job) { ctl_reply(c, "err reload busy: another reload is in progress"); return; }
+        /* The guest's MMIO must never wait for the reload (see reload_job_t): stop its vCPUs first. */
+        if (attached && !vm_paused) {
+            if (!opt.vm_qmp) {
+                LOG("reload %s refused: a vfio-user client (guest) is attached and its vCPUs are running: its MMIO "
+                    "would wait for the whole reload (stock vfio-user gives up after 5 s and the guest reads all-ones); "
+                    "start qdev-host with --vm-qmp or stop the VM and add --vm-paused", arg);
+                ctl_reply(c, "err reload refused: a vfio-user client (guest) is attached and its vCPUs are running "
+                          "(its MMIO would wait for the whole reload); start qdev-host with --vm-qmp PATH, or stop the "
+                          "VM and add --vm-paused");
+                return;
+            }
+            reload_job_start(c, arg, flags);
+            return;
         }
-        int r = v2.reload(priv, arg, flags);
-        if (did_q) plugin_resume();
-        if (r == 0) ctl_reply(c, "ok reloaded %s%s", arg, (flags & QDP_RELOAD_RESET) ? " (reset)" : "");
-        else ctl_reply(c, "err reload: %s", strerror(r < 0 ? -r : r));
+        int r = reload_run(arg, flags);
+        reload_reply(c, r, arg, flags, NULL);
     } else if (!strcmp(line, "backend")) {
         /* Backend health/identity report for the reload health-gate (v4). */
         char buf[512];
@@ -813,21 +1000,23 @@ static void ctl_command(ctl_t *c, char *line)
             ctl_reply(c, "err backend report unsupported by plugin");
     } else {
         ctl_reply(c, "err unknown command (screendump FILE | frame | stats | uiinfo W H [WMM HMM] | "
-                  "abi | swap ARG | reload PATH [--reset] [--allow-guest-gpu-loss] [--allow-unflushed] | backend)");
+                  "abi | swap ARG | reload PATH [--reset] [--allow-guest-gpu-loss] [--allow-unflushed] [--vm-paused] | backend)");
     }
 }
 static void ctl_process(ctl_t *c)
 {
     char *nl;
-    while (!c->shot && (nl = memchr(c->in->str, '\n', c->in->len))) {
+    while (!c->shot && !c->busy && (nl = memchr(c->in->str, '\n', c->in->len))) {
         size_t len = nl - c->in->str;
         g_autofree char *line = g_strndup(c->in->str, len);
         g_string_erase(c->in, 0, len + 1);
         ctl_command(c, g_strstrip(line));
     }
 }
+static void reload_job_forget_ctl(ctl_t *c);
 static void ctl_free(ctl_t *c)
 {
+    reload_job_forget_ctl(c);
     if (c->watch) g_source_remove(c->watch);
     if (c->shot_timer) g_source_remove(c->shot_timer);
     close(c->fd); g_string_free(c->in, TRUE); g_free(c->shot);
@@ -1736,9 +1925,11 @@ static void usage(void)
         "  --head-origin X,Y|auto   where this display sits on the guest desktop (default: right of the VM console)\n"
         "  --desktop WxH|auto       guest desktop size for pointer mapping (default: VM console + this display)\n"
         "  --qemu-qmp PATH          the VM's QMP socket: forward keyboard/mouse with input-send-event\n"
+        "  --vm-qmp PATH            a QMP socket of the VM (not the --qemu-qmp one): a control-socket reload\n"
+        "                           under an attached guest stops its vCPUs (stop .. cont) around the reload\n"
         "                           (for VMs without a graphic console; --qemu-display wins if both are given)\n"
         "  --control PATH           control socket for automation: screendump FILE | frame | stats |\n"
-        "                           uiinfo W H [WMM HMM] | abi | swap ARG | reload PATH [--reset] [--allow-guest-gpu-loss] [--allow-unflushed] | backend\n"
+        "                           uiinfo W H [WMM HMM] | abi | swap ARG | reload PATH [--reset] [--allow-guest-gpu-loss] [--allow-unflushed] [--vm-paused] | backend\n"
         "  --kms-copy               force the copy path (no udmabuf zero-copy)\n"
         "  --stats-interval S       print stats every S seconds (SIGUSR2 prints them once)\n"
         "  -v                       verbose\n"
@@ -1909,7 +2100,7 @@ int main(int argc, char **argv)
         { "qemu-display", 1, 0, 'Q' }, { "qemu-display-dest", 1, 0, 3 }, { "qemu-console", 1, 0, 4 },
         { "stats-interval", 1, 0, 'S' }, { "idle-fps", 1, 0, 5 }, { "idle-after", 1, 0, 6 },
         { "head-origin", 1, 0, 7 }, { "desktop", 1, 0, 8 }, { "kms-copy", 0, 0, 9 }, { "control", 1, 0, 10 },
-        { "qemu-qmp", 1, 0, 11 }, { "help", 0, 0, 'h' }, { 0 }
+        { "qemu-qmp", 1, 0, 11 }, { "vm-qmp", 1, 0, 12 }, { "help", 0, 0, 'h' }, { 0 }
     };
     setup_limits();
     setup_cpu_affinity();
@@ -1929,6 +2120,7 @@ int main(int argc, char **argv)
         case 7: opt.head_origin = optarg; break;   case 8: opt.desktop = optarg; break;
         case 9: opt.kms_copy = true; break;
         case 10: opt.control = optarg; break;      case 11: opt.qemu_qmp = optarg; break;
+        case 12: opt.vm_qmp = optarg; break;
         default: usage();
         }
     }
