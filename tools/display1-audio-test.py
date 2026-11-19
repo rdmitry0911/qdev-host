@@ -22,7 +22,7 @@ addr = argv[0]; dest = argv[1] if len(argv) > 1 and argv[1] != "-" else None
 listen = float(argv[2]) if len(argv) > 2 else 2.0
 expect_absent = "--expect-absent" in flags_
 min_writes, min_peak = opt("--min-writes", 0), opt("--min-peak", 0)
-XML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "dbus", "dbus-display1.xml")
+XML = os.environ.get("DISPLAY1_XML") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "dbus", "dbus-display1.xml")
 node = Gio.DBusNodeInfo.new_for_xml(open(XML).read())
 out_iface = node.lookup_interface("org.qemu.Display1.AudioOutListener")
 
