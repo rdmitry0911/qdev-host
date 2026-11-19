@@ -1354,6 +1354,20 @@ int main(int argc, char **argv)
                     wr(PVG_REG_FIFO_WRITE, full);
                     CHECK(wait_reg(PVG_REG_FIFO_READ, full, 5.0), "hand-over reload: B consumes the queued rest "
                           "(FIFO_READ %u)", rd(PVG_REG_FIFO_READ));
+                    {
+                        /* D-RELOAD-MODELIST: the display client's list (step 9b accepted
+                         * [2560x1440]) is client state (-[_PGDisplay setNub:] hands its
+                         * modeList to every Nub, 7ffb1405b4ef); B serves it, not its
+                         * configured three modes. */
+                        uint32_t m0, m1;
+                        wr(PVG_REG_IOSFC_CMD, 0);
+                        m0 = rd(PVG_REG_IOSFC_DATA);
+                        wr(PVG_REG_IOSFC_CMD, 1);
+                        m1 = rd(PVG_REG_IOSFC_DATA);
+                        CHECK(m0 == ((1440u << 16) | 2560u) && m1 == 0,
+                              "hand-over reload: B serves the accepted ui_info mode list [2560x1440] "
+                              "(IOSFC_DATA 0x%08x, then 0x%08x)", m0, m1);
+                    }
                     ops->backend_report(priv, rep, sizeof(rep));
                     char hs_after[64] = "";
                     { char *p = strstr(rep, "handshake_gen="); if (p) sscanf(p, "%63s", hs_after); }
@@ -1391,6 +1405,102 @@ int main(int argc, char **argv)
                 }
                 r = ops->quiesce(priv); ops->dma_unregister(priv, &b); ops->resume(priv);
                 free(inst);
+            }
+            /* 10f. D-RELOAD-MODELIST: a transparent reload of a display that a ui_info
+             * resized posts NO display transaction at resume.  Reference: the display
+             * client keeps its modeList and hands it to every Nub (-[_PGDisplay setNub:]
+             * 7ffb1405b4ef -> -[_PGDisplayNub setModeList:] 7ffb1403d0af), including the
+             * restoring attach of -[_PGDevice didResume] (7ffb1403bad8); finishRestore's
+             * state-machine pass (7ffb14040035, 7ffb1403d2cb) posts a transaction only when
+             * testUpdateSettings: (7ffb1403f3e4) or testUpdateModeList: (7ffb1403f011)
+             * finds a field of that client differing from the page.  The guest side here
+             * is this test: the root node's display word (+0x900, as SET_SHARED_STATE
+             * leaves it), the page's enable mask, and each ACK's page effect (+0xfa9 = 0,
+             * +0xfc0 = 2, as the ch5 ACK pass leaves an acknowledged online) with the
+             * pending flags consumed.  Red without the plugin's re-install: B2 compares
+             * its configured three-mode list and default settings -> txn + 1, 0x0C. */
+            {
+                const uint64_t fifo_gpa = B_IOVA + 0x100000, root_gpa = B_IOVA + 0x0f0000,
+                               page_gpa = B_IOVA + 0x0e0000;
+                uint8_t *rootp = guest + B_FILE_OFF + 0x0f0000, *page = guest + B_FILE_OFF + 0x0e0000;
+                qdp_dma_region b = { B_IOVA, B_LEN, guest + B_FILE_OFF, memfd, B_FILE_OFF,
+                                     PROT_READ | PROT_WRITE };
+                char m1[64], m2[64];
+                char *b1 = mint_instance(reload_golden, sib, 95, root, m1, sizeof(m1));
+                char *b2 = mint_instance(reload_golden, sib, 94, root, m2, sizeof(m2));
+                CHECK(b1 && b2, "ui_info hand-over: mint instances (markers %s, %s)", b1 ? m1 : "FAILED",
+                      b2 ? m2 : "FAILED");
+                r = ops->quiesce(priv); ops->dma_register(priv, &b); ops->resume(priv);
+                if (b1 && b2) {
+                    const uint32_t page_pfn = (uint32_t)(page_gpa >> 12), enable = 0x0c, two = 2, zero = 0;
+                    qdp_ui_info ui = { .size = sizeof(ui), .width = 1280, .height = 800 };
+                    uint32_t txn0 = 0, txn1 = 0, txn2 = 0, st = 0, flags = 0, m0, mm1;
+                    int rr, errs_before;
+#define PAGE_ACK() do { page[0xfa9] = 0; memcpy(page + 0xfc0, &two, 4); memcpy(page + 0x100, &zero, 4); \
+                        (void)rd(PVG_REG_DISPLAY_IRQ); } while (0)
+
+                    wr(PVG_REG_FIFO_ENABLE, 0);
+                    memset(rootp, 0, 0x1000);
+                    memset(page, 0, 0x1000);
+                    memcpy(rootp + 0x900, &page_pfn, 4);
+                    memcpy(page + 0x104, &enable, 4);
+                    wr(PVG_REG_PROTOCOL_VERSION, 6);
+                    wr(PVG_REG_SHARED_STATE_PFN, (uint32_t)(root_gpa >> 12));
+                    wr(PVG_REG_FIFO_PFN, (uint32_t)(fifo_gpa >> 12));
+                    wr(PVG_REG_FIFO_OFFSET, 0x1000);
+                    wr(PVG_REG_FIFO_SIZE, 0x10000);
+                    wr(PVG_REG_FIFO_ENABLE, 1);
+                    /* hand-over 1: B1's restoring attach brings the page's display online */
+                    r = ops->quiesce(priv);
+                    rr = ops->reload(priv, b1, 0);
+                    ops->resume(priv);
+                    memcpy(&txn0, page + 0x200, 4);
+                    memcpy(&st, page + 0xfc0, 4);
+                    CHECK(r == 0 && rr == 0 && st == 1 && page[0xfa9] == 1 && txn0 != 0,
+                          "ui_info hand-over: B1 resumes the display page and posts its online "
+                          "(rc=%d/%d, state %u, ack %u, txn %u)", r, rr, st, page[0xfa9], txn0);
+                    PAGE_ACK();
+                    r = ops->ui_info(priv, &ui);
+                    memcpy(&txn1, page + 0x200, 4);
+                    memcpy(&st, page + 0xfc0, 4);
+                    memcpy(&flags, page + 0x100, 4);
+                    CHECK(r == 0 && txn1 == txn0 + 1 && st == 1 && page[0xfa9] == 1 && (flags & 0x0c) == 0x0c,
+                          "ui_info 1280x800 on the online display: %d, one transaction (txn %u -> %u, "
+                          "state %u, flags 0x%x)", r, txn0, txn1, st, flags);
+                    PAGE_ACK();
+                    errs_before = get_int(&qmetal_errors);
+                    /* hand-over 2: the client's list is unchanged across the reload */
+                    r = ops->quiesce(priv);
+                    rr = ops->reload(priv, b2, 0);
+                    ops->resume(priv);
+                    usleep(50 * 1000);
+                    {
+                        char banner[256];
+                        get_live_banner(banner, sizeof(banner));
+                        CHECK(r == 0 && rr == 0 && strstr(banner, m2) != NULL,
+                              "ui_info hand-over: reload to B2 rc=%d/%d, NEW banner live: %s", r, rr, banner);
+                    }
+                    memcpy(&txn2, page + 0x200, 4);
+                    memcpy(&st, page + 0xfc0, 4);
+                    memcpy(&flags, page + 0x100, 4);
+                    CHECK(txn2 == txn1 && st == 2 && page[0xfa9] == 0 && (flags & 0x0c) == 0 &&
+                          rd(PVG_REG_DISPLAY_IRQ) == 0,
+                          "ui_info hand-over: NO display transaction at resume (txn %u -> %u, state %u, "
+                          "ack %u, flags 0x%x)", txn1, txn2, st, page[0xfa9], flags);
+                    wr(PVG_REG_IOSFC_CMD, 0);
+                    m0 = rd(PVG_REG_IOSFC_DATA);
+                    wr(PVG_REG_IOSFC_CMD, 1);
+                    mm1 = rd(PVG_REG_IOSFC_DATA);
+                    CHECK(m0 == ((800u << 16) | 1280u) && mm1 == 0,
+                          "ui_info hand-over: B2 serves [1280x800] (IOSFC_DATA 0x%08x, then 0x%08x)", m0, mm1);
+                    CHECK(get_int(&qmetal_errors) == errs_before, "ui_info hand-over: 0 new QMU [ERROR] lines (%d)",
+                          get_int(&qmetal_errors) - errs_before);
+#undef PAGE_ACK
+                    wr(PVG_REG_FIFO_ENABLE, 0);
+                }
+                r = ops->quiesce(priv); ops->dma_unregister(priv, &b); ops->resume(priv);
+                free(b1);
+                free(b2);
             }
         }
     }

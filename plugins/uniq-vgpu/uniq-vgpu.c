@@ -3208,6 +3208,66 @@ static void pvg_mode_list_call(void *opaque)
                                              &call->settings);
 }
 
+/* The client's mode list and settings for a normalized, accepted request:
+ * one mode, the request's mm or the 4.8 px/mm policy. */
+static void pvg_ui_info_mode_list(const qdp_ui_info *req, qmu_display_mode *mode,
+                                  qmu_display_settings *settings)
+{
+    const bool mm_given = req->width_mm && req->height_mm;
+
+    memset(mode, 0, sizeof(*mode));
+    memset(settings, 0, sizeof(*settings));
+    mode->width = req->width;
+    mode->height = req->height;
+    mode->refresh_hz = req->refresh_mhz / 1000.0;
+    mode->flags = 0;
+    settings->serial_num = 1;
+    settings->size_mm_width = mm_given ? (float)req->width_mm : (float)req->width / 4.8f;
+    settings->size_mm_height = mm_given ? (float)req->height_mm : (float)req->height / 4.8f;
+    settings->origin_x = 0xffff;
+    settings->origin_y = 0xffff;
+    settings->scale_factor = 0;
+}
+
+/* -[_PGDisplay setNub:] (26.2 PVG 434CC774, 7ffb1405b4ef): the display CLIENT
+ * keeps its modeList and hands it to every Nub it is attached to ("if (nub &&
+ * _modeList) [nub setModeList:_modeList]"), including the restoring attach of
+ * -[_PGDevice didResume] (7ffb1403bad8: setSharedDisplayStatePage:forPort:
+ * restoring:YES -> willRestore, setNub; then finishRestore's state-machine pass,
+ * whose testUpdateModeList: 7ffb1403f011 compares that list with the page).
+ * Here the client is this plugin: a list accepted through ui_info is client
+ * state that outlives a Session.  A re-created Session (reload B, or A again on
+ * a rollback) gets it before its resume, so an unchanged list compares equal
+ * and the resume posts no display re-attach (debt D-RELOAD-MODELIST).
+ * Returns 0, or -errno; nothing to install is 0. */
+static int pvg_reinstall_ui_info_mode_list(PvgState *s, const char *who)
+{
+    PvgModeListCall call = { .state = s };
+    PvgHostWork owner;
+
+    if (!s->ui_info_accepted) {
+        return 0;
+    }
+    if (!qmu_display_set_mode_list || !s->qmu_dev) {
+        pvg_log(s, "[apple-gfx-ml][reload][ERROR] %s has no qmu_display_set_mode_list: the accepted "
+                "ui_info mode list %ux%u is not re-installed\n", who, s->ui_info_last.width,
+                s->ui_info_last.height);
+        return -ENOSYS;
+    }
+    pvg_ui_info_mode_list(&s->ui_info_last, &call.mode, &call.settings);
+    owner = pvg_host_work_ref(s, true);
+    pvg_host_work_invoke(&owner, pvg_mode_list_call, &call);
+    pvg_host_work_unref(&owner);
+    if (call.status != QMU_OK) {
+        pvg_log(s, "[apple-gfx-ml][reload][ERROR] %s: re-install of the ui_info mode list %ux%u: "
+                "status %d\n", who, s->ui_info_last.width, s->ui_info_last.height, (int)call.status);
+        return -EIO;
+    }
+    pvg_log(s, "[apple-gfx-ml][reload] %s: ui_info mode list [%ux%u @ %u mHz] re-installed\n", who,
+            s->ui_info_last.width, s->ui_info_last.height, s->ui_info_last.refresh_mhz);
+    return 0;
+}
+
 static int pvg_ui_info(void *priv, const qdp_ui_info *info)
 {
     PvgState *s = priv;
@@ -3255,16 +3315,7 @@ static int pvg_ui_info(void *priv, const qdp_ui_info *info)
     if (!owner.work) {
         return -ENODEV;
     }
-    call.mode.width = req.width;
-    call.mode.height = req.height;
-    call.mode.refresh_hz = req.refresh_mhz / 1000.0;
-    call.mode.flags = 0;
-    call.settings.serial_num = 1;
-    call.settings.size_mm_width = mm_given ? (float)req.width_mm : (float)req.width / 4.8f;
-    call.settings.size_mm_height = mm_given ? (float)req.height_mm : (float)req.height / 4.8f;
-    call.settings.origin_x = 0xffff;
-    call.settings.origin_y = 0xffff;
-    call.settings.scale_factor = 0;
+    pvg_ui_info_mode_list(&req, &call.mode, &call.settings);
     pvg_host_work_invoke(&owner, pvg_mode_list_call, &call);
     pvg_host_work_unref(&owner);
     if (call.status != QMU_OK) {
@@ -3615,6 +3666,10 @@ static int pvg_reload_load_and_create(PvgState *s, const char *new_path)
                 new_path, strerror(-r));
         return r;   /* device dead; caller rolls back */
     }
+    /* The display client's accepted mode list goes to the new Session before
+     * any resume (setNub: -> setModeList:).  A failure is logged; the Session
+     * then keeps its configured list, as before this step. */
+    (void)pvg_reinstall_ui_info_mode_list(s, new_path);
     return 0;
 }
 
