@@ -273,6 +273,63 @@ static int wait_refusals(int want)
     return get_int(&refusals);
 }
 
+/* --------------------------------------------- reload residue (D-RELOAD-RESIDUE / R5)
+ * Per-process resources a retired libmlapi instance may keep after its reload:
+ * threads, resident memory (anonymous = heap/stacks; file = mapped code), the
+ * mappings of retired unique-SONAME copies, and the GPU device fds that a live
+ * VkInstance/VkDevice holds (RADV: /dev/dri/renderD*, NVIDIA: /dev/nvidia*). */
+#define RESIDUE_WARM_CYCLES 3
+#define RESIDUE_MIN_CYCLES 13
+#define RESIDUE_RSS_KB_PER_CYCLE 1024
+struct residue {
+    long threads, rss_kb, anon_kb, file_kb;
+    int copy_maps, gpu_fds;
+};
+
+static long status_kb(const char *text, const char *key)
+{
+    const char *p = strstr(text, key);
+    return p ? strtol(p + strlen(key), NULL, 10) : -1;
+}
+
+static void sample_residue(struct residue *o)
+{
+    char buf[8192], line[1024], path[64], link[256];
+    FILE *f;
+    size_t n;
+
+    memset(o, 0, sizeof(*o));
+    f = fopen("/proc/self/status", "r");
+    n = f ? fread(buf, 1, sizeof(buf) - 1, f) : 0;
+    if (f) fclose(f);
+    buf[n] = 0;
+    o->threads = status_kb(buf, "\nThreads:");
+    o->rss_kb = status_kb(buf, "\nVmRSS:");
+    o->anon_kb = status_kb(buf, "\nRssAnon:");
+    o->file_kb = status_kb(buf, "\nRssFile:");
+    f = fopen("/proc/self/maps", "r");
+    while (f && fgets(line, sizeof(line), f)) {
+        if (strstr(line, ".pvgns")) o->copy_maps++;
+    }
+    if (f) fclose(f);
+    for (int fd = 0; fd < 4096; fd++) {
+        ssize_t l;
+        snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+        l = readlink(path, link, sizeof(link) - 1);
+        if (l <= 0) continue;
+        link[l] = 0;
+        if (!strncmp(link, "/dev/dri/", 9) || !strncmp(link, "/dev/nvidia", 11)) o->gpu_fds++;
+    }
+}
+
+static void print_residue(const char *when, int cycle, const struct residue *r)
+{
+    printf("INFO reload-residue %s cycle=%d threads=%ld rss_kb=%ld anon_kb=%ld file_kb=%ld "
+           "copy_maps=%d gpu_fds=%d\n", when, cycle, r->threads, r->rss_kb, r->anon_kb,
+           r->file_kb, r->copy_maps, r->gpu_fds);
+    fflush(stdout);
+}
+
 static double now_s(void)
 {
     struct timespec t;
@@ -1085,6 +1142,11 @@ int main(int argc, char **argv)
 
             printf("INFO reload: %d cycles, golden=%s sibdir=%s\n", reload_n, reload_golden, sib);
             banner_capture_start();   /* tee stderr to catch each build's live banner */
+            struct residue res0, res_warm, res_last;
+            sample_residue(&res0);
+            print_residue("before", 0, &res0);
+            res_warm = res0;
+            res_last = res0;
             for (int cyc = 1; cyc <= reload_n; cyc++) {
                 char marker[64]; char *inst;
                 int errs_before = get_int(&qmetal_errors);
@@ -1167,9 +1229,35 @@ int main(int argc, char **argv)
                 }
                 free(inst);
                 ok_cycles++;
+                sample_residue(&res_last);
+                print_residue("after", cyc, &res_last);
+                if (cyc == RESIDUE_WARM_CYCLES) res_warm = res_last;
             }
             printf("INFO reload: %d/%d cycles OK, 0 new QMU errors=%s\n", ok_cycles, reload_n,
                    get_int(&qmetal_errors) == errs_before_all ? "yes" : "NO");
+            /* 10b'. A retired instance keeps nothing (D-RELOAD-RESIDUE): after the
+             * warm-up cycles (first-use caches of the shared ICD/loader), further
+             * reloads leave the thread count, the GPU device fds and the retired
+             * copies' mappings flat and the resident memory within a fixed bound
+             * per cycle.  Measured only on runs long enough to separate growth
+             * from warm-up. */
+            if (ok_cycles == reload_n && reload_n >= RESIDUE_MIN_CYCLES) {
+                const int span = reload_n - RESIDUE_WARM_CYCLES;
+                const long rss_per = (res_last.rss_kb - res_warm.rss_kb) / span;
+                CHECK(res_last.threads <= res_warm.threads,
+                      "reload residue: threads %ld after cycle %d -> %ld after cycle %d (no retired-instance thread)",
+                      res_warm.threads, RESIDUE_WARM_CYCLES, res_last.threads, reload_n);
+                CHECK(res_last.gpu_fds <= res_warm.gpu_fds,
+                      "reload residue: GPU device fds %d -> %d (each retired VkInstance/VkDevice released)",
+                      res_warm.gpu_fds, res_last.gpu_fds);
+                CHECK(res_last.copy_maps <= res_warm.copy_maps,
+                      "reload residue: retired unique-SONAME copy mappings %d -> %d (retired copies unmapped)",
+                      res_warm.copy_maps, res_last.copy_maps);
+                CHECK(rss_per <= RESIDUE_RSS_KB_PER_CYCLE,
+                      "reload residue: RSS %ld -> %ld kB over %d cycles = %ld kB/cycle (bound %d; anon %ld -> %ld, file %ld -> %ld)",
+                      res_warm.rss_kb, res_last.rss_kb, span, rss_per, RESIDUE_RSS_KB_PER_CYCLE,
+                      res_warm.anon_kb, res_last.anon_kb, res_warm.file_kb, res_last.file_kb);
+            }
 
             /* 10c. HEALTH-GATE ROLLBACK: inject a BAD reload (a valid .so that is
              * NOT a libmlapi -> the vtable bind fails after the old Session is
