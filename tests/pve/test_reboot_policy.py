@@ -221,6 +221,15 @@ class QdevctlRoundTrip(unittest.TestCase):
         self.assertNotIn("args", n.cfg(), "reset of an args that held only our groups deletes the key")
 
 
+    def test_cold_keeps_a_vms_own_hookscript(self):
+        n = Node(self, hookscript="local:snippets/uniq-vgpu-vm104-hook.sh")
+        rc, out, err = n.qdevctl("reboot-policy", VMID, "cold")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(n.cfg()["hookscript"], "local:snippets/uniq-vgpu-vm104-hook.sh")
+        self.assertIn("hookscript local:snippets/uniq-vgpu-vm104-hook.sh kept", out)
+        self.assertEqual(len([c for c in n.calls() if c[:2] == ["qm", "set"]]), 1, "only the args change")
+
+
 class PreStart(unittest.TestCase):
     def test_stops_stale_non_persistent_processes_and_starts_relay(self):
         n = Node(self)

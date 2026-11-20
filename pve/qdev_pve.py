@@ -666,8 +666,14 @@ def set_reboot_policy(vmid: int, policy: str) -> list[str]:
     else:
         notes.append(f"VM {vmid} args already carry reboot policy {policy}")
     if policy == "cold":
-        # the hookscript's pre-start keeps the relay socket directory and the relay unit in place before QEMU starts
-        ensure_hookscript(vmid, cfg, conf)
+        if not cfg.get("hookscript"):
+            # qdev-host's pre-start keeps the relay socket directory and the relay unit in place before QEMU starts
+            ensure_hookscript(vmid, cfg, conf)
+        elif not cfg["hookscript"].endswith("/" + HOOK_NAME):
+            # a VM's own hookscript stays as it is (taking it over would also start qdev-host's TB/attach hooks);
+            # the relay unit, enabled at boot before pve-guests, keeps the socket directory, and its fallback stops
+            # device units a cleanup left active
+            notes.append(f"VM {vmid} hookscript {cfg['hookscript']} kept (not qdev-host's)")
     conf["reboot_policy"] = policy
     save_conf(conf)
     unit = relay_unit(vmid)

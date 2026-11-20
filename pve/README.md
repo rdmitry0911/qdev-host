@@ -53,8 +53,9 @@ qdevctl reboot-policy 118 reset    # remove it again (a running cold VM keeps it
 
 - `cold` appends `-action reboot=shutdown -qmp unix:/run/qdev-host/reboot-relay-VMID.qmp,server=on,wait=off`
   to the VM's `args` once (a pending change while the VM runs), records `"reboot_policy": "cold"` in
-  `/etc/qdev-host/vms/VMID.json`, sets the qdev-host hookscript and enables
-  `qdev-host-reboot-relay@VMID.service`. `reset` removes exactly those groups and disables the relay.
+  `/etc/qdev-host/vms/VMID.json`, sets the qdev-host hookscript when the VM has none (a VM's own hookscript is kept)
+  and enables `qdev-host-reboot-relay@VMID.service` (started before `pve-guests`; it creates `/run/qdev-host`).
+  `reset` removes exactly those groups and disables the relay.
 - With `-action reboot=shutdown` (stock QEMU >= 6.0) every reset request is a `SHUTDOWN` event with its cause.
   PVE starts QEMU with `-no-shutdown`: the VM pauses, qmeventd sends `quit`, and `qm cleanup` runs post-stop and
   then starts the VM again when PVE's reboot request `/run/qemu-server/VMID.reboot` exists.
@@ -64,7 +65,8 @@ qdevctl reboot-policy 118 reset    # remove it again (a running cold VM keeps it
   `host-qmp-quit`, `guest-panic`, `host-signal`, `subsystem-reset`, e.g. a watchdog reset) leaves the VM off;
   `qm reboot` and *Shutdown* are unchanged.
 - Race fallback: if the VM does not run again 30 s after the `SHUTDOWN` and nothing holds its config lock, the
-  relay removes a leftover request and runs `qm start VMID` once.
+  relay removes a leftover request, stops the VM's device units that are still active (`qdev-host-device@VMID-*`,
+  not the persistent ones) and runs `qm start VMID` once.
 - What the guest sees at a reboot: a power-on (firmware, boot picker with the NVRAM default; the efidisk keeps
   NVRAM). A console reconnects, PVE shows a stop and a start, passthrough devices re-initialize. Check
   `ha-manager config` first: the restart goes through `qm cleanup` / `qm start`, verified only for VMs that HA

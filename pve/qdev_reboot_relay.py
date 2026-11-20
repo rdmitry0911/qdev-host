@@ -19,14 +19,16 @@ and for nothing else: guest-shutdown, host-qmp-quit, guest-panic, host-signal, s
 
 Race fallback: when the VM is not running again FALLBACK_S (30) seconds after the SHUTDOWN and nothing holds the VM's
 config lock (a cleanup or a start in progress; waits at most CAP_S more), the relay removes a request that is still
-there (it would otherwise restart the VM at a later, unrelated stop) and runs `qm start VMID` once.
+there (it would otherwise restart the VM at a later, unrelated stop), stops the VM's device units that are still active
+(qdev-host-device@VMID-*, except devices marked persistent: a cleanup that did not finish skipped post-stop, and the
+start must get new device processes) and runs `qm start VMID` once.
 
 The relay keeps running while the VM's policy is `cold` (/etc/qdev-host/vms/VMID.json "reboot_policy"); with another
 policy it exits once no QEMU serves its socket.
 
   qdev_reboot_relay.py VMID [--fallback-s 30] [--cap-s 300] [--once]
 Paths (tests): --sock-dir /run/qdev-host --run-dir /run/qemu-server --lock-dir /run/lock/qemu-server
-               --conf-dir /etc/qdev-host/vms --qm /usr/sbin/qm
+               --conf-dir /etc/qdev-host/vms --qm /usr/sbin/qm --systemctl systemctl
 """
 from __future__ import annotations
 import argparse, fcntl, json, os, socket, struct, subprocess, sys, time
@@ -38,6 +40,7 @@ RUN_DIR = "/run/qemu-server"            # pid files and reboot requests (PVE wri
 LOCK_DIR = "/run/lock/qemu-server"      # PVE::QemuConfig config_file_lock: lock-VMID.conf (flock)
 CONF_DIR = "/etc/qdev-host/vms"
 QM = "/usr/sbin/qm"
+SYSTEMCTL = "systemctl"
 
 
 def relay_socket(vmid: int, sock_dir: str = SOCK_DIR) -> Path:
@@ -54,10 +57,11 @@ def peer_pid(s: socket.socket) -> int | None:
 
 class Relay:
     def __init__(self, vmid: int, sock_dir=SOCK_DIR, run_dir=RUN_DIR, lock_dir=LOCK_DIR, conf_dir=CONF_DIR, qm=QM,
-                 fallback_s: float = 30.0, cap_s: float = 300.0, poll_s: float = 1.0, out=None):
+                 fallback_s: float = 30.0, cap_s: float = 300.0, poll_s: float = 1.0, out=None, systemctl=SYSTEMCTL):
         self.vmid = int(vmid)
         self.sock = relay_socket(self.vmid, sock_dir)
         self.run_dir, self.lock_dir, self.conf_dir, self.qm = Path(run_dir), Path(lock_dir), Path(conf_dir), qm
+        self.systemctl = systemctl
         self.fallback_s, self.cap_s, self.poll_s = fallback_s, cap_s, poll_s
         self.out = out or sys.stdout
 
@@ -106,11 +110,31 @@ class Relay:
             os.close(fd)        # closing drops our shared lock at once
         return False
 
-    def policy(self) -> str:
+    def conf(self) -> dict:
         try:
-            return json.loads((self.conf_dir / f"{self.vmid}.json").read_text()).get("reboot_policy", "reset")
+            return json.loads((self.conf_dir / f"{self.vmid}.json").read_text())
         except (OSError, ValueError):
-            return "reset"
+            return {}
+
+    def policy(self) -> str:
+        return self.conf().get("reboot_policy", "reset")
+
+    def stop_stale_units(self) -> list[str]:
+        """Stop the VM's device units that are still active while it does not run (not the persistent ones)."""
+        keep = {f"qdev-host-device@{self.vmid}-{d.get('id')}.service" for d in self.conf().get("devices", [])
+                if d.get("persistent")}
+        try:
+            r = subprocess.run([self.systemctl, "list-units", "--plain", "--no-legend", "--state=active",
+                                f"qdev-host-device@{self.vmid}-*"], capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            return []
+        stopped = []
+        for unit in (l.split()[0] for l in r.stdout.splitlines() if l.strip()):
+            if not unit.startswith(f"qdev-host-device@{self.vmid}-") or unit in keep:
+                continue
+            subprocess.run([self.systemctl, "stop", unit], capture_output=True, timeout=120)
+            stopped.append(unit)
+        return stopped
 
     # ---------------------------------------------------------------- QMP
     def connect(self) -> socket.socket | None:
@@ -179,9 +203,11 @@ class Relay:
                 left = self.request_path().exists()
                 if left:
                     self.request_path().unlink(missing_ok=True)
+                stale = self.stop_stale_units()
                 self.log(f"fallback: VM {self.vmid} not running {round(now - t_event, 1)} s after the SHUTDOWN"
                          f"{' (waited for the config lock)' if waited else ''}; "
-                         f"{'removed the leftover reboot request; ' if left else ''}qm start {self.vmid}")
+                         f"{'removed the leftover reboot request; ' if left else ''}"
+                         f"{'stopped still-active ' + ', '.join(stale) + '; ' if stale else ''}qm start {self.vmid}")
                 try:
                     r = subprocess.run([self.qm, "start", str(self.vmid)], capture_output=True, text=True, timeout=600)
                     tail = (r.stdout + r.stderr).strip().splitlines()[-3:]
@@ -227,8 +253,10 @@ def main(argv=None) -> int:
     p.add_argument("--lock-dir", default=LOCK_DIR)
     p.add_argument("--conf-dir", default=CONF_DIR)
     p.add_argument("--qm", default=QM)
+    p.add_argument("--systemctl", default=SYSTEMCTL)
     a = p.parse_args(argv)
-    r = Relay(a.vmid, a.sock_dir, a.run_dir, a.lock_dir, a.conf_dir, a.qm, a.fallback_s, a.cap_s, a.poll_s)
+    r = Relay(a.vmid, a.sock_dir, a.run_dir, a.lock_dir, a.conf_dir, a.qm, a.fallback_s, a.cap_s, a.poll_s,
+              systemctl=a.systemctl)
     return r.run(once=a.once)
 
 

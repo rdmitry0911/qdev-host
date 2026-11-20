@@ -2,6 +2,8 @@
 Description=qdev-host reboot relay for VM %i (reboot policy cold: an in-guest reboot becomes a cold restart)
 Documentation=https://github.com/rdmitry0911/qdev-host
 After=pve-cluster.service
+# up before PVE starts the onboot VMs: it creates /run/qdev-host, where the VM's relay QMP socket lives
+Before=pve-guests.service
 
 [Service]
 Type=simple

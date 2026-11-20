@@ -63,6 +63,14 @@ class Env:
         with open(self.qm, "w") as f:
             f.write(f"#!/bin/sh\necho \"$(date +%s.%N) $*\" >> {self.qmlog}\n")
         os.chmod(self.qm, 0o755)
+        self.sctl_log = os.path.join(self.d, "systemctl.log")
+        self.sctl = os.path.join(self.bin, "systemctl")
+        with open(self.sctl, "w") as f:
+            # active device units of the VM: pvg0 (a cleanup left it) and keep0 (persistent in the VM's json)
+            f.write("#!/bin/sh\necho \"$*\" >> " + self.sctl_log + "\n"
+                    "[ \"$1\" = list-units ] && printf 'qdev-host-device@%s-pvg0.service loaded active running x\\n"
+                    "qdev-host-device@%s-keep0.service loaded active running y\\n' " + f"{VMID} {VMID}" + "\nexit 0\n")
+        os.chmod(self.sctl, 0o755)
         self.sock = os.path.join(self.sockdir, f"reboot-relay-{VMID}.qmp")
         self.pidfile = os.path.join(self.run, f"{VMID}.pid")
         self.request = os.path.join(self.run, f"{VMID}.reboot")
@@ -72,7 +80,15 @@ class Env:
 
     def set_policy(self, p):
         with open(os.path.join(self.conf, f"{VMID}.json"), "w") as f:
-            json.dump({"vmid": VMID, "devices": [], "reboot_policy": p}, f)
+            json.dump({"vmid": VMID, "devices": [{"id": "pvg0", "persistent": False}, {"id": "keep0", "persistent": True}],
+                       "reboot_policy": p}, f)
+
+    def sctl_calls(self):
+        try:
+            with open(self.sctl_log) as f:
+                return f.read().splitlines()
+        except FileNotFoundError:
+            return []
 
     def qemu(self, events, hold=0.3):
         p = subprocess.Popen([sys.executable, "-I", self.qemu_py, self.sock, json.dumps(events), str(hold),
@@ -91,7 +107,8 @@ class Env:
     def relay(self, fallback=1.0, extra=()):
         p = subprocess.Popen([sys.executable, "-I", RELAY, str(VMID), "--once", "--fallback-s", str(fallback),
                               "--cap-s", "5", "--poll-s", "0.1", "--sock-dir", self.sockdir, "--run-dir", self.run,
-                              "--lock-dir", self.lockd, "--conf-dir", self.conf, "--qm", self.qm, *extra],
+                              "--lock-dir", self.lockd, "--conf-dir", self.conf, "--qm", self.qm,
+                              "--systemctl", self.sctl, *extra],
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         self.procs.append(p)
         return p
@@ -152,6 +169,7 @@ class ReasonMatrix(unittest.TestCase):
                 self.assertIn("-> reboot request", out)
                 self.assertIn("restarted: new QEMU pid", out)
                 self.assertEqual(e.qm_calls(), [], "no fallback start when PVE restarted the VM")
+                self.assertEqual(e.sctl_calls(), [], "no unit touched when PVE restarted the VM")
                 self.assertFalse(os.path.exists(e.request), "request consumed by the cleanup")
 
     def test_other_reasons_leave_the_vm_off(self):
@@ -189,6 +207,10 @@ class RaceFallback(unittest.TestCase):
         self.assertFalse(os.path.exists(e.request), "leftover request removed")
         self.assertIn("removed the leftover reboot request", out)
         self.assertIn("fallback: qm start rc=0", out)
+        # the device unit a cleanup left active is stopped before the start; the persistent one is kept
+        self.assertIn(f"stop qdev-host-device@{VMID}-pvg0.service", e.sctl_calls())
+        self.assertNotIn(f"stop qdev-host-device@{VMID}-keep0.service", e.sctl_calls())
+        self.assertIn(f"stopped still-active qdev-host-device@{VMID}-pvg0.service", out)
 
     def test_cleanup_consumed_but_did_not_restart_fallback_start(self):
         e = Env(self)
