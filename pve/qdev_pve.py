@@ -574,6 +574,125 @@ def stop_process(vmid: int, dev_id: str, kind: str = "vfio-user") -> None:
 def process_active(vmid: int, dev_id: str, kind: str = "vfio-user") -> bool:
     return run(["systemctl", "is-active", unit_name(vmid, dev_id, kind)], check=False).stdout.strip() == "active"
 
+def stop_stale_processes(vmid: int, conf: dict) -> list[str]:
+    """pre-start: every VM start gets new device processes. A device process that is still active while its VM is
+    not running is left from the previous run (a stop that did not finish, a restart that skipped post-stop), and
+    `systemctl start` on an active unit is a no-op, so stop it first (SIGTERM, SIGKILL after the unit's TimeoutStopSec).
+    Persistent devices keep their process by definition."""
+    notes = []
+    for d in conf["devices"]:
+        kind = dev_kind(d)
+        if kind == "tb" or d.get("persistent"):
+            continue
+        if process_active(vmid, d["id"], kind):
+            unit = unit_name(vmid, d["id"], kind)
+            t0 = time.monotonic()
+            stop_process(vmid, d["id"], kind)
+            notes.append(f"{d['id']}: stopped the still-active device process {unit} of the previous run "
+                         f"({time.monotonic() - t0:.1f} s) before the start")
+    return notes
+
+# ----------------------------------------------------------- reboot policy
+# `cold`: an in-guest reboot (or QMP system_reset) becomes a VM-level cold restart. QEMU runs with -action
+# reboot=shutdown (stock, QEMU >= 6.0), so a reset request is a SHUTDOWN with reason guest-reset /
+# host-qmp-system-reset; PVE's -no-shutdown pauses the VM and qmeventd quits QEMU; the relay unit
+# (qdev_reboot_relay.py) reads the reason on its own QMP socket and creates PVE's reboot request, so `qm cleanup`
+# starts the VM again: new QEMU, new device processes, new GPU context. `reset` (default): QEMU's in-process reset.
+REBOOT_POLICIES = ("cold", "reset")
+
+def relay_socket(vmid: int) -> Path:
+    return RUN_DIR / f"reboot-relay-{vmid}.qmp"
+
+def relay_unit(vmid: int) -> str:
+    return f"qdev-host-reboot-relay@{vmid}.service"
+
+def reboot_policy_groups(vmid: int) -> str:
+    return f"-action reboot=shutdown -qmp unix:{relay_socket(vmid)},server=on,wait=off"
+
+def reboot_policy_patterns(vmid: int) -> list[str]:
+    return [r"-action\s+reboot=shutdown", rf"-qmp\s+unix:{re.escape(str(relay_socket(vmid)))},\S*"]
+
+def apply_reboot_policy_args(args: str, vmid: int, policy: str) -> str:
+    """The VM's args with the cold-policy groups present exactly once (cold) or absent (reset); everything else as it
+    was. Idempotent."""
+    if policy not in REBOOT_POLICIES:
+        raise QdevError(f"reboot policy must be one of {', '.join(REBOOT_POLICIES)}")
+    for pattern in reboot_policy_patterns(vmid):
+        args = _drop(args or "", pattern)
+    if policy == "cold":
+        args = (args + " " + reboot_policy_groups(vmid)).strip()
+    return args
+
+def args_reboot_policy(args: str, vmid: int) -> str:
+    return "cold" if all(_find(args or "", p) for p in reboot_policy_patterns(vmid)) else "reset"
+
+def live_reboot_policy(vmid: int) -> str | None:
+    """The policy the RUNNING QEMU was started with (None when the VM does not run)."""
+    try:
+        pid = int(Path(f"/var/run/qemu-server/{vmid}.pid").read_text().strip())
+        cmd = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except (OSError, ValueError):
+        return None
+    if not vm_running(vmid):
+        return None
+    sock = str(relay_socket(vmid)).encode()
+    cold = any(a.startswith(b"reboot=shutdown") for a in cmd) and any(a.startswith(b"unix:" + sock + b",") for a in cmd)
+    return "cold" if cold else "reset"
+
+def ensure_relay(vmid: int) -> None:
+    """The relay's socket directory exists and its unit runs (pre-start of a cold-policy VM; idempotent)."""
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    run(["systemctl", "start", relay_unit(vmid)], check=False)
+
+def set_reboot_policy(vmid: int, policy: str) -> list[str]:
+    """Write the policy into the VM's args (a pending change while it runs: effective at its next start), record it
+    in /etc/qdev-host/vms/VMID.json and enable (cold) or disable (reset) the relay unit."""
+    if policy not in REBOOT_POLICIES:
+        raise QdevError(f"reboot policy must be one of {', '.join(REBOOT_POLICIES)}")
+    node = vm_node(vmid)
+    if node and node != local_node():
+        raise QdevError(f"VM {vmid} is on node {node}; run qdevctl there")
+    check_editable(vmid)
+    cfg = vm_config(vmid)
+    conf = load_conf(vmid)
+    notes = []
+    old = cfg.get("args", "")
+    new = apply_reboot_policy_args(old, vmid, policy)
+    if new != old:
+        qm_set(vmid, "args", new or None)
+        notes.append(f"VM {vmid} args: " + ("-action reboot=shutdown + relay QMP socket "
+                                            f"{relay_socket(vmid)} added" if policy == "cold" else
+                                            "-action reboot=shutdown + relay QMP socket removed"))
+    else:
+        notes.append(f"VM {vmid} args already carry reboot policy {policy}")
+    if policy == "cold":
+        # the hookscript's pre-start keeps the relay socket directory and the relay unit in place before QEMU starts
+        ensure_hookscript(vmid, cfg, conf)
+    conf["reboot_policy"] = policy
+    save_conf(conf)
+    unit = relay_unit(vmid)
+    live = live_reboot_policy(vmid)
+    if policy == "cold":
+        RUN_DIR.mkdir(parents=True, exist_ok=True)
+        run(["systemctl", "enable", "--now", unit])
+        notes.append(f"{unit} enabled and running")
+    else:
+        run(["systemctl", "disable", unit], check=False)
+        if live == "cold":
+            notes.append(f"{unit} disabled; it keeps serving the running VM (started with the cold policy) and exits "
+                         "after that QEMU is gone")
+        else:
+            run(["systemctl", "stop", unit], check=False)
+            notes.append(f"{unit} disabled and stopped")
+    if live is None:
+        notes.append(f"reboot policy {policy}: effective at the next VM start (VM not running)")
+    elif live == policy:
+        notes.append(f"reboot policy {policy}: in effect (the running VM was started with it)")
+    else:
+        notes.append(f"reboot policy {policy}: armed, effective at the next VM start "
+                     f"(the running VM keeps {live} until it stops)")
+    return notes
+
 # --------------------------------------------------------------- flows
 def attach(vmid: int, dev: dict) -> str:
     """Start the device process (if needed) and hot-plug it. Returns a status line."""

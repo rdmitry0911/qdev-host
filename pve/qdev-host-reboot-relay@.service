@@ -1,0 +1,13 @@
+[Unit]
+Description=qdev-host reboot relay for VM %i (reboot policy cold: an in-guest reboot becomes a cold restart)
+Documentation=https://github.com/rdmitry0911/qdev-host
+After=pve-cluster.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/lib/qdev-host/pve/qdev_reboot_relay.py %i
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

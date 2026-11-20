@@ -34,6 +34,42 @@ On every VM start the hookscript (post-start) starts the device processes and
 hot-plugs them; on post-stop it stops them (`--persistent` keeps a process, and
 its VRAM, across VM restarts).
 
+pre-start stops a device process that is still active while its VM is not running
+(left from the previous run: a stop that did not finish), so every start gets new
+device processes; `systemctl start` on an active unit would be a no-op.
+
+### Reboot policy (`qdevctl reboot-policy VMID cold|reset`)
+
+`cold` turns a reboot of the guest into a VM-level cold restart: a new QEMU, new
+device processes and a new GPU context, the same path as a cold start. Use it for
+devices whose in-process reset is not trusted to drop every state of the previous
+boot. `reset` (the default) keeps QEMU's in-process reset.
+
+```bash
+qdevctl reboot-policy 118 cold     # args + relay unit; effective at the next VM start
+qdevctl reboot-policy 118          # configured / args / running VM
+qdevctl reboot-policy 118 reset    # remove it again (a running cold VM keeps its relay until it stops)
+```
+
+- `cold` appends `-action reboot=shutdown -qmp unix:/run/qdev-host/reboot-relay-VMID.qmp,server=on,wait=off`
+  to the VM's `args` once (a pending change while the VM runs), records `"reboot_policy": "cold"` in
+  `/etc/qdev-host/vms/VMID.json`, sets the qdev-host hookscript and enables
+  `qdev-host-reboot-relay@VMID.service`. `reset` removes exactly those groups and disables the relay.
+- With `-action reboot=shutdown` (stock QEMU >= 6.0) every reset request is a `SHUTDOWN` event with its cause.
+  PVE starts QEMU with `-no-shutdown`: the VM pauses, qmeventd sends `quit`, and `qm cleanup` runs post-stop and
+  then starts the VM again when PVE's reboot request `/run/qemu-server/VMID.reboot` exists.
+- The relay (`qdev_reboot_relay.py`, a QMP client on the dedicated socket) creates that request (an empty file, as
+  `qm reboot` does) for reason `guest-reset` (in-guest Restart, ACPI/CF9/keyboard reset, triple fault) and
+  `host-qmp-system-reset` (QMP `system_reset`, the *Reset* button). Every other reason (`guest-shutdown`,
+  `host-qmp-quit`, `guest-panic`, `host-signal`, `subsystem-reset`, e.g. a watchdog reset) leaves the VM off;
+  `qm reboot` and *Shutdown* are unchanged.
+- Race fallback: if the VM does not run again 30 s after the `SHUTDOWN` and nothing holds its config lock, the
+  relay removes a leftover request and runs `qm start VMID` once.
+- What the guest sees at a reboot: a power-on (firmware, boot picker with the NVRAM default; the efidisk keeps
+  NVRAM). A console reconnects, PVE shows a stop and a start, passthrough devices re-initialize. Check
+  `ha-manager config` first: the restart goes through `qm cleanup` / `qm start`, verified only for VMs that HA
+  does not manage.
+
 `set` (the panel's *Edit*) changes the plugin arguments, the KMS output, the
 Display1 export and persistence of a device; the device ID and plugin stay. A
 vfio-user device of a running VM gets a new process and is unplugged and plugged

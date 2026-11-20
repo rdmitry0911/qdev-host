@@ -11,6 +11,10 @@
   qdevctl stop VMID [ID]       hot-unplug and stop device process(es)
   qdevctl hook VMID PHASE      called by the guest hookscript (post-start, post-stop, ...)
   qdevctl tb VMID [--ports N]  the VM's TB bus: hot-plug PCIe root ports with Thunderbolt ACPI properties
+  qdevctl reboot-policy VMID [cold|reset]
+                               cold: an in-guest reboot (or QMP system_reset) becomes a VM-level cold restart
+                               (new QEMU, new device processes); reset (default): QEMU's in-process reset.
+                               Without a policy: show the configured and the running one.
 
 TB bus devices are QEMU's own: --plugin tb-pci (--args 'host=0000:06:00.0', PVE's hostpciN
 syntax), tb-net (--args 'virtio,bridge=vmbr0[,tag=N]', PVE's netN syntax), tb-xhci (a USB
@@ -60,6 +64,10 @@ def cmd_status(a):
         print(f"VM {a.vmid} is on node {info['node']}"); return 1
     print(f"VM {a.vmid}: {'running' if info['running'] else 'stopped'}, {len(info['devices'])} device(s), "
           f"port addr {info['port_addr']} (in args: {info['port_in_args']}, in running VM: {info['port_in_vm']})")
+    live = Q.live_reboot_policy(a.vmid)
+    print(f"  reboot policy: {Q.load_conf(a.vmid).get('reboot_policy', 'reset')} (args: "
+          f"{Q.args_reboot_policy(Q.read_vm_config(a.vmid).get('args', ''), a.vmid)}"
+          + (f", running VM: {live}" if live else "") + ")")
     tb = info["tb"]
     if tb["enabled"]:
         print(f"  TB bus: {tb['ports']} port(s) qdev-tb0..{tb['ports'] - 1}, ACPI {tb['acpi']}, {tb['hotplug']} hot-plug (in args: {tb['in_args']}, "
@@ -115,6 +123,17 @@ def cmd_tb(a):
                 raise Q.QdevError(f"--{key.replace('_', '-')} takes a size such as 32M (empty: QEMU's default)")
             conf.setdefault("tb", {})[key.replace("_", "-")] = value
     for m in TB.set_ports(a.vmid, conf, a.ports or TB.port_count(conf), a.acpi, a.hotplug, a.power_controller):
+        print(m)
+
+def cmd_reboot_policy(a):
+    if a.policy is None:
+        conf = Q.load_conf(a.vmid)
+        live = Q.live_reboot_policy(a.vmid)
+        print(f"VM {a.vmid}: reboot policy {conf.get('reboot_policy', 'reset')} (args: "
+              f"{Q.args_reboot_policy(Q.read_vm_config(a.vmid).get('args', ''), a.vmid)}"
+              + (f", running VM: {live}" if live else ", VM not running") + ")")
+        return 0
+    for m in Q.set_reboot_policy(a.vmid, a.policy):
         print(m)
 
 def _target(pos, control, want_backing):
@@ -174,6 +193,13 @@ def cmd_hook(a):
     conf = Q.load_conf(a.vmid)
     rc = 0
     if a.phase == "pre-start":
+        # every start gets new device processes (an old one may be left from a restart; `systemctl start` on an
+        # active unit is a no-op)
+        for note in Q.stop_stale_processes(a.vmid, conf):
+            print(f"qdev-host: {note}", file=sys.stderr)
+        if conf.get("reboot_policy") == "cold" or \
+                Q.args_reboot_policy(Q.read_vm_config(a.vmid).get("args", ""), a.vmid) == "cold":
+            Q.ensure_relay(a.vmid)
         try:
             for note in TB.pre_start(a.vmid, conf):
                 print(f"qdev-host: {note}", file=sys.stderr)
@@ -268,6 +294,9 @@ def main():
     for key, default in (("io-reserve", "0"), ("mem-reserve", "32M"), ("pref64-reserve", "1G")):
         s.add_argument(f"--{key}", help=f"window the firmware reserves per port (default {default}; '' = QEMU's default)")
     s.set_defaults(fn=cmd_tb)
+    s = sub.add_parser("reboot-policy", help="cold: an in-guest reboot becomes a VM-level cold restart; reset: in-process reset")
+    s.add_argument("vmid", type=int); s.add_argument("policy", nargs="?", choices=Q.REBOOT_POLICIES)
+    s.set_defaults(fn=cmd_reboot_policy)
     s = sub.add_parser("tb-boot", help=argparse.SUPPRESS); s.add_argument("vmid", type=int); s.set_defaults(fn=cmd_tb_boot)
     # warm-swap primitives (increment 1): the product-grade command increment 3
     # (`uniq-vgpu update`) wraps. Target a device by VMID+ID (PVE) or by an
