@@ -45,6 +45,7 @@
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "qdp.h"
@@ -401,12 +402,16 @@ static const pvg_mapper_bridge *vt_bridge(void)
         const char *name = getenv("PVG_MAPPER_BRIDGE_SHM");
         if (name && *name) {
             int fd = shm_open(name, O_RDONLY, 0);
-            if (fd >= 0) {
+            struct stat st;
+            /* only a region the writer has already sized (a read past its end would be SIGBUS) */
+            if (fd >= 0 && fstat(fd, &st) == 0 && (size_t)st.st_size >= pvg_mapper_bridge_bytes()) {
                 void *p = mmap(NULL, pvg_mapper_bridge_bytes(), PROT_READ, MAP_SHARED, fd, 0);
-                close(fd);
                 if (p != MAP_FAILED && pvg_mapper_bridge_valid((const pvg_mapper_bridge *)p))
                     b = (const pvg_mapper_bridge *)p;
+                else if (p != MAP_FAILED)
+                    munmap(p, pvg_mapper_bridge_bytes()); /* another layout: not ours, retried later */
             }
+            if (fd >= 0) close(fd);
         }
     }
     return b;
