@@ -19,6 +19,39 @@
 
 #define MAX_UNIT_ALLOCS 4
 
+/* ---- CUDA/NVDEC: the unit's picture in decode order ---------------------
+ * libavcodec's nvdec hwaccel decodes into an NVDEC-internal surface; the
+ * AVFrame the decoder allocated for the picture receives it only in the frame's
+ * FrameDecodeData.post_process (nvdec_retrieve_data: cuvidMapVideoFrame +
+ * copy), which libavcodec runs when the frame is OUTPUT, in display order. A
+ * read of the unit's buffer right after its decode therefore sees an untouched
+ * pool buffer (warm-4080 2026-11-21: every landed byte 0). VA-API is unaffected
+ * (the decoder writes the VA surface of the frame itself).
+ * So for CUDA the unit's picture is (a) the decoder's own output of that unit
+ * when it comes out during the unit's drain (already post-processed), else
+ * (b) a reference of the decoder's picture taken after the unit's decode, on
+ * which the frame's post_process is run (the same call libavcodec makes on its
+ * output reference; it leaves the decoder's picture untouched).
+ * (b) reads libavcodec's INTERNAL FrameDecodeData (libavcodec/decode.h). That is
+ * sound only for the exact libavcodec this plugin ships with: the package's
+ * bundled minimal LGPL FFmpeg 7.1.3 (lavc 61.19.101, configured with
+ * --extra-version=uniqvgpu-gva1). vtpv_lavc_open(CUDA) refuses any other
+ * libavcodec (the device then falls back like for an unavailable backend), and
+ * every use checks the private_ref size libavcodec itself asserts. */
+#ifndef VTPV_LAVC_BUNDLE_TAG
+#define VTPV_LAVC_BUNDLE_TAG "--extra-version=uniqvgpu-gva1"
+#endif
+#define VTPV_LAVC_BUNDLE_VERSION AV_VERSION_INT(61, 19, 101)
+/* layout of libavcodec 61.19.x's FrameDecodeData (libavcodec/decode.h) */
+typedef struct vtpv_lavc_fdd {
+    int  (*post_process)(void *logctx, AVFrame *frame);
+    void  *post_process_opaque;
+    void (*post_process_opaque_free)(void *opaque);
+    void  *hwaccel_priv;
+    void (*hwaccel_priv_free)(void *priv);
+} vtpv_lavc_fdd;
+
+
 struct vtpv_lavc {
     vtpv_lavc_hw       hw;
     AVBufferRef       *device;   /* NULL for VTPV_LAVC_HW_NONE               */
@@ -43,7 +76,14 @@ struct vtpv_lavc_dec {
     AVFrame         *sw_frame;   /* hardware -> CPU transfer target (kept across units) */
     AVFrame         *map_frame;  /* read mapping of the unit's hardware picture (VA-API) */
     AVFrame         *alloc[MAX_UNIT_ALLOCS]; /* pictures allocated for this unit */
+    AVFrame         *raw[MAX_UNIT_ALLOCS];   /* the decoder's own frame objects of them (CUDA (b);
+                                              * persistent objects owned by the decoder, read only
+                                              * after the unit's decode and only while they still
+                                              * hold the same buffer as alloc[]) */
     int              n_alloc;
+    int64_t          unit_pts;   /* pts of the unit being decoded              */
+    AVFrame         *own_out;    /* CUDA (a): the unit's own picture output in its drain */
+    AVFrame         *pp_frame;   /* CUDA (b): post-processed reference of the unit's picture */
     int              in_unit;
     uint8_t         *conv;       /* software-path NV12/P010 conversion buffer  */
     size_t           conv_cap;
@@ -81,7 +121,10 @@ int vtpv_lavc_open(vtpv_lavc_hw hw, const char *device, vtpv_lavc **out,
     if (hw == VTPV_LAVC_HW_NONE) { *out = v; return VTPV_OK; }
 
     if (hw == VTPV_LAVC_HW_VAAPI) { type = AV_HWDEVICE_TYPE_VAAPI; v->hw_fmt = AV_PIX_FMT_VAAPI; }
-    else if (hw == VTPV_LAVC_HW_CUDA) { type = AV_HWDEVICE_TYPE_CUDA; v->hw_fmt = AV_PIX_FMT_CUDA; }
+    else if (hw == VTPV_LAVC_HW_CUDA) {
+        if (vtpv_lavc_cuda_lib_ok(errbuf, errlen) != 0) { free(v); return VTPV_ERR_UNSUPPORTED; }
+        type = AV_HWDEVICE_TYPE_CUDA; v->hw_fmt = AV_PIX_FMT_CUDA;
+    }
     else { free(v); seterr(errbuf, errlen, "unknown hw type %d", (int)hw); return VTPV_ERR_UNSUPPORTED; }
 
     rc = av_hwdevice_ctx_create(&v->device, type, device, NULL, 0);
@@ -112,6 +155,22 @@ void vtpv_lavc_close(vtpv_lavc *v)
 }
 
 vtpv_lavc_hw vtpv_lavc_hw_type(const vtpv_lavc *v) { return v ? v->hw : VTPV_LAVC_HW_NONE; }
+
+/* The CUDA path reads libavcodec-internal per-frame data (see the top): only
+ * the bundled libavcodec it was written against is accepted. */
+int vtpv_lavc_cuda_lib_ok(char *errbuf, size_t errlen)
+{
+    unsigned ver = avcodec_version();
+    const char *conf = avcodec_configuration();
+    if (LIBAVCODEC_VERSION_INT != VTPV_LAVC_BUNDLE_VERSION || ver != VTPV_LAVC_BUNDLE_VERSION ||
+        !conf || !strstr(conf, VTPV_LAVC_BUNDLE_TAG)) {
+        seterr(errbuf, errlen, "CUDA stream core needs the bundled libavcodec 61.19.101 (%s); loaded %u.%u.%u, %s",
+               VTPV_LAVC_BUNDLE_TAG, ver >> 16, (ver >> 8) & 0xff, ver & 0xff,
+               conf && strstr(conf, VTPV_LAVC_BUNDLE_TAG) ? "bundled configuration" : "another configuration");
+        return -1;
+    }
+    return 0;
+}
 
 /* ---- capabilities --------------------------------------------------- */
 
@@ -269,6 +328,7 @@ static int capture_get_buffer2(AVCodecContext *ctx, AVFrame *f, int flags)
     if (rc < 0 || !d->in_unit) return rc;
     if (d->n_alloc < MAX_UNIT_ALLOCS) {
         d->alloc[d->n_alloc] = av_frame_clone(f);
+        d->raw[d->n_alloc] = f;
         if (d->alloc[d->n_alloc]) d->n_alloc++;
     }
     return rc;
@@ -277,8 +337,10 @@ static int capture_get_buffer2(AVCodecContext *ctx, AVFrame *f, int flags)
 static void drop_allocs(vtpv_lavc_dec *d)
 {
     int i;
-    for (i = 0; i < d->n_alloc; i++) av_frame_free(&d->alloc[i]);
+    for (i = 0; i < d->n_alloc; i++) { av_frame_free(&d->alloc[i]); d->raw[i] = NULL; }
     d->n_alloc = 0;
+    if (d->own_out) av_frame_unref(d->own_out);
+    if (d->pp_frame) av_frame_unref(d->pp_frame);
 }
 
 int vtpv_lavc_open_decoder(vtpv_lavc *v, uint32_t codec, uint32_t width,
@@ -311,7 +373,9 @@ int vtpv_lavc_open_decoder(vtpv_lavc *v, uint32_t codec, uint32_t width,
     d->out_frame = av_frame_alloc();
     d->sw_frame = av_frame_alloc();
     d->map_frame = av_frame_alloc();
-    if (!d->ctx || !d->pkt || !d->out_frame || !d->sw_frame || !d->map_frame) goto fail;
+    d->own_out = av_frame_alloc();
+    d->pp_frame = av_frame_alloc();
+    if (!d->ctx || !d->pkt || !d->out_frame || !d->sw_frame || !d->map_frame || !d->own_out || !d->pp_frame) goto fail;
 
     d->ctx->opaque = d;
     d->ctx->width = (int)width;
@@ -347,6 +411,8 @@ fail:
     av_frame_free(&d->out_frame);
     av_frame_free(&d->sw_frame);
     av_frame_free(&d->map_frame);
+    av_frame_free(&d->own_out);
+    av_frame_free(&d->pp_frame);
     free(d);
     return VTPV_ERR_BACKEND;
 }
@@ -399,21 +465,48 @@ static int sw_to_biplanar(vtpv_lavc_dec *d, const AVFrame *f, uint32_t w, uint32
 }
 
 /* Consume libavcodec's display-order output; the unit's picture is read from
- * the capture instead. */
+ * the capture instead. CUDA: the output of the unit being decoded (its pts) is
+ * kept as that unit's picture ((a), see the top). */
 static int drain_output(vtpv_lavc_dec *d)
 {
     for (;;) {
         int rc = avcodec_receive_frame(d->ctx, d->out_frame);
         if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) return 0;
         if (rc < 0) return rc;
+        if (d->v->hw == VTPV_LAVC_HW_CUDA && d->in_unit && d->out_frame->pts == d->unit_pts &&
+            !d->own_out->buf[0]) {
+            av_frame_move_ref(d->own_out, d->out_frame);
+            continue;
+        }
         av_frame_unref(d->out_frame);
     }
+}
+
+/* CUDA: the unit's picture as a CUDA frame that holds the decoded pixels.
+ * (a) the unit's own output from its drain; (b) a reference of the decoder's
+ * picture object (still holding the unit's buffer) with the frame's
+ * post_process run on it. NULL = no such picture. */
+static const AVFrame *cuda_unit_picture(vtpv_lavc_dec *d, int idx, const AVFrame *pic)
+{
+    AVFrame *raw = d->raw[idx];
+    const vtpv_lavc_fdd *fdd;
+    if (d->own_out->buf[0]) return d->own_out;
+    if (!raw || !raw->buf[0] || !pic->buf[0] || raw->buf[0]->data != pic->buf[0]->data) return NULL;
+    if (!raw->private_ref || raw->private_ref->size != sizeof(vtpv_lavc_fdd)) return NULL;
+    av_frame_unref(d->pp_frame);
+    if (av_frame_ref(d->pp_frame, raw) < 0) return NULL;
+    fdd = (const vtpv_lavc_fdd *)d->pp_frame->private_ref->data;
+    if (fdd->post_process && fdd->post_process(d->ctx, d->pp_frame) < 0) {
+        av_frame_unref(d->pp_frame);
+        return NULL;
+    }
+    return d->pp_frame;
 }
 
 int vtpv_lavc_decode(vtpv_lavc_dec *d, const uint8_t *sample, size_t sample_len,
                      vtpv_lavc_frame *out)
 {
-    int rc, err = 0;
+    int rc, err = 0, pidx;
     AVFrame *pic;
     uint32_t w, h;
 
@@ -436,7 +529,7 @@ int vtpv_lavc_decode(vtpv_lavc_dec *d, const uint8_t *sample, size_t sample_len,
     av_packet_unref(d->pkt);
     d->pkt->data = d->au;
     d->pkt->size = (int)sample_len;
-    d->pkt->pts = d->seq++;
+    d->pkt->pts = d->unit_pts = d->seq++;
     d->pkt->dts = AV_NOPTS_VALUE;
     rc = avcodec_send_packet(d->ctx, d->pkt);
     if (rc == AVERROR(EAGAIN)) {      /* not expected: output always drained */
@@ -460,7 +553,8 @@ int vtpv_lavc_decode(vtpv_lavc_dec *d, const uint8_t *sample, size_t sample_len,
     /* One allocation for a well-formed unit. With concealment frames the
      * decoders allocate the generated pictures before (H.264 frame_num gaps)
      * or after (HEVC missing references) the unit's own picture. */
-    pic = d->codec == VTPV_CODEC_H264 ? d->alloc[d->n_alloc - 1] : d->alloc[0];
+    pidx = d->codec == VTPV_CODEC_H264 ? d->n_alloc - 1 : 0;
+    pic = d->alloc[pidx];
     w = (uint32_t)d->ctx->width;      /* cropped display size from the SPS    */
     h = (uint32_t)d->ctx->height;
 
@@ -486,12 +580,17 @@ int vtpv_lavc_decode(vtpv_lavc_dec *d, const uint8_t *sample, size_t sample_len,
                         av_hwframe_map(d->map_frame, pic, AV_HWFRAME_MAP_READ) == 0)) {
                 cpu = d->map_frame;
             } else {
+                const AVFrame *src = d->v->hw == VTPV_LAVC_HW_CUDA ? cuda_unit_picture(d, pidx, pic) : pic;
                 av_frame_unref(d->map_frame);
-                if (d->sw_frame->buf[0] &&
-                    (d->sw_frame->width != pic->width || d->sw_frame->height != pic->height))
+                if (src && d->sw_frame->buf[0] &&
+                    (d->sw_frame->width != src->width || d->sw_frame->height != src->height))
                     av_frame_unref(d->sw_frame);
-                if (av_hwframe_transfer_data(d->sw_frame, pic, 0) == 0) cpu = d->sw_frame;
+                if (src && av_hwframe_transfer_data(d->sw_frame, src, 0) == 0) cpu = d->sw_frame;
                 else av_frame_unref(d->sw_frame);
+                if (d->v->hw == VTPV_LAVC_HW_CUDA) {   /* CPU copy taken: release the GPU picture now */
+                    av_frame_unref(d->own_out);
+                    av_frame_unref(d->pp_frame);
+                }
             }
             if (!cpu) {
                 rc = VTPV_ERR_BACKEND;
@@ -535,6 +634,8 @@ void vtpv_lavc_close_decoder(vtpv_lavc_dec *d)
     av_frame_free(&d->out_frame);
     av_frame_free(&d->sw_frame);
     av_frame_free(&d->map_frame);
+    av_frame_free(&d->own_out);
+    av_frame_free(&d->pp_frame);
     free(d->conv);
     free(d->au);
     free(d);

@@ -123,6 +123,14 @@ $(BUILD)/test-aw-replay-lavc: $(AW_CORE) vtpv_lavc.c test_aw_replay_lavc.c test_
 $(BUILD)/test-lavc-land: vtpv_lavc.c vtpv_lavc.h vt_scatter.c vt_scatter.h test_lavc_land.c test_lavc_util.c test_lavc_util.h | $(BUILD)
 	$(CC) $(CFLAGS) $(VA_CFLAGS) $(LAVC_CFLAGS) -o $@ vtpv_lavc.c vt_scatter.c test_lavc_land.c test_lavc_util.c $(LAVC_LIBS) $(FMT_LIBS) $(VA_LIBS)
 
+# Stream core on a recorded payload per backend (VA-API or CUDA/NVDEC): every unit
+# decoded + landed, packed NV12 MD5 == the payload's software-oracle MD5 per decode
+# index. Needs no encoder: builds against the package's bundled libavcodec too
+# (PKG_CONFIG_PATH=<bundled prefix>/lib/pkgconfig) for the NVIDIA hosts.
+#   ./build/test-lavc-payload vaapi|cuda <render node|cuda ordinal> <payload dir>...
+$(BUILD)/test-lavc-payload: vtpv_lavc.c vtpv_lavc.h vt_scatter.c vt_scatter.h test_lavc_payload.c | $(BUILD)
+	$(CC) $(CFLAGS) $(VA_CFLAGS) $(LAVC_CFLAGS) -o $@ vtpv_lavc.c vt_scatter.c test_lavc_payload.c $(LAVC_LIBS) $(VA_LIBS)
+
 # E2E payload writer (guest multi-frame decode check: record + samples + oracle MD5s).
 #   make build/gva-payload && ./build/gva-payload <dir> h264|hevc <w> <h> <n>
 $(BUILD)/gva-payload: gva_payload.c test_lavc_util.c test_lavc_util.h | $(BUILD)
@@ -168,7 +176,8 @@ ifeq ($(HAVE_VA),1)
 	 elif [ $$rc != 0 ]; then exit $$rc; fi
 	@echo "== plugin ABI smoke =="; $(BUILD)/test-plugin $(BUILD)/apple-videotoolbox.so
 ifeq ($(HAVE_LAVC),1)
-	@$(MAKE) --no-print-directory $(BUILD)/test-lavc $(BUILD)/test-aw-replay-lavc $(BUILD)/test-lavc-land
+	@$(MAKE) --no-print-directory $(BUILD)/test-lavc $(BUILD)/test-aw-replay-lavc $(BUILD)/test-lavc-land \
+	   $(BUILD)/test-lavc-payload $(BUILD)/gva-payload
 	@echo "== stream decode core (libavcodec + VA-API, decode order vs software oracle) =="; \
 	 $(BUILD)/test-lavc; rc=$$?; \
 	 if [ $$rc = 77 ]; then echo "(lavc test skipped: no usable render node)"; \
@@ -176,6 +185,15 @@ ifeq ($(HAVE_LAVC),1)
 	@echo "== 4K landing: decode + direct scattered landing == shadow landing == software oracle =="; \
 	 $(BUILD)/test-lavc-land; rc=$$?; \
 	 if [ $$rc = 77 ]; then echo "(landing test skipped: no usable render node)"; \
+	 elif [ $$rc != 0 ]; then exit $$rc; fi
+	@echo "== stream core on recorded payloads (H.264 IPB 640x360, HEVC IPB 1280x720), VA-API then CUDA =="; \
+	 mkdir -p $(BUILD)/pl-h264 $(BUILD)/pl-hevc; $(BUILD)/gva-payload $(BUILD)/pl-h264 h264 640 360 30 >/dev/null 2>&1 && \
+	 $(BUILD)/gva-payload $(BUILD)/pl-hevc hevc 1280 720 16 >/dev/null 2>&1 || { echo "(payload test skipped: no encoder)"; exit 0; }; \
+	 $(BUILD)/test-lavc-payload vaapi /dev/dri/renderD128 $(BUILD)/pl-h264 $(BUILD)/pl-hevc; rc=$$?; \
+	 if [ $$rc = 77 ]; then echo "(vaapi payload test skipped: no usable render node)"; \
+	 elif [ $$rc != 0 ]; then exit $$rc; fi; \
+	 $(BUILD)/test-lavc-payload cuda 0 $(BUILD)/pl-h264 $(BUILD)/pl-hevc; rc=$$?; \
+	 if [ $$rc = 77 ]; then echo "(cuda payload test skipped: no NVIDIA GPU, or not the bundled libavcodec)"; \
 	 elif [ $$rc != 0 ]; then exit $$rc; fi
 	@echo "== Apple-wire engine + stream core, multi-frame IPB/HEVC through dfrm/Dbuf/Demt =="; \
 	 $(BUILD)/test-aw-replay-lavc; rc=$$?; \

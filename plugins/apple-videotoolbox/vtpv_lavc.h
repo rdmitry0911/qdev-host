@@ -14,6 +14,10 @@
  * the decoder's buffer allocation for that unit) and hands it back right after
  * that unit was decoded, so emission is in decode order while references stay
  * correct. libavcodec's own display-order output is consumed and dropped.
+ * CUDA/NVDEC: the decoder's picture gets its pixels only in libavcodec's output
+ * post-processing, so the unit's picture is its own output when it comes out
+ * during the unit, else the post-processed reference of the decoder's picture
+ * (vtpv_lavc.c; bundled libavcodec only, vtpv_lavc_cuda_lib_ok).
  *
  * Hardware is mandatory in production: get_format refuses software formats,
  * so a stream the GPU cannot decode fails instead of silently using host CPU.
@@ -60,6 +64,10 @@ typedef struct vtpv_lavc_frame {
 int  vtpv_lavc_open(vtpv_lavc_hw hw, const char *device, vtpv_lavc **out,
                     char *errbuf, size_t errlen);
 void vtpv_lavc_close(vtpv_lavc *v);
+/* 0 when the loaded libavcodec is the one the CUDA path is written against (the
+ * package's bundled FFmpeg 7.1.3, see vtpv_lavc.c); vtpv_lavc_open(CUDA) refuses
+ * otherwise. */
+int  vtpv_lavc_cuda_lib_ok(char *errbuf, size_t errlen);
 vtpv_lavc_hw vtpv_lavc_hw_type(const vtpv_lavc *v);
 
 /* Codecs this device decodes in hardware (H.264, HEVC Main), with max sizes;
