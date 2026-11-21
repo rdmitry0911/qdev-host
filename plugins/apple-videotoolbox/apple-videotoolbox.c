@@ -244,11 +244,17 @@ static void *vt_map(void *ctx, uint64_t iova, uint64_t len)
  * host shadow of the surface allocation and moved to the guest pages by vt_copy_frame. */
 typedef struct vt_landing {
     vt_dev   *d;
-    uint8_t  *shadow;
+    uint8_t  *shadow;      /* shadow path (legacy backends): the composed allocation */
     size_t    total;
     uint32_t  npages;
     uint64_t  page_size;
     uint64_t  gpa_pages[PVG_BRIDGE_MAX_PAGES];
+    /* direct path (stream core): the planes are written row by row into the guest
+     * pages, no shadow (vt_scatter_resolve / vt_scatter_write_rows) */
+    int       direct;
+    size_t    y_off, y_stride, uv_off, uv_stride;
+    void     *ptrs[PVG_BRIDGE_MAX_PAGES];
+    size_t    run[PVG_BRIDGE_MAX_PAGES];
 } vt_landing;
 
 static void *vt_scatter_map(void *ctx, uint64_t gpa, uint64_t len) { return vt_map(ctx, gpa, len); }
@@ -483,22 +489,44 @@ static int vt_resolve_buffer(void *ctx, const uint8_t uuid[16], uint64_t mapping
                     return -1;
                 }
                 land = calloc(1, sizeof *land);
-                if (land) land->shadow = malloc(total);
-                if (!land || !land->shadow) { if (land) free(land->shadow); free(land); return -1; }
+                if (!land) return -1;
                 land->d = d; land->total = total; land->npages = r.page_count; land->page_size = ps;
                 memcpy(land->gpa_pages, r.gpa_pages, (size_t)r.page_count * sizeof(uint64_t));
-                if (vt_scatter_gather(land->shadow, total, land->gpa_pages, land->npages, ps,
-                                      vt_scatter_map, d) != VT_SCATTER_OK) {
-                    vt_log(d, 1, "mapper id %llu: scattered pages not all in the guest DMA regions (%zu B); dropping",
-                           (unsigned long long)mapping_id, total);
-                    free(land->shadow); free(land);
-                    return -1;
+#ifdef VTPV_HAVE_LAVC
+                /* The stream core exposes its picture's planes: land them straight into
+                 * the guest pages in vt_copy_frame (one copy of the visible rows, no 12 MB
+                 * shadow, gather or write-back per 4K frame). Bytes outside the rows keep
+                 * the guest's content, as the shadow round trip leaves them. Every page is
+                 * resolved here (drop if one is unmapped) and again before the first byte
+                 * moves (all-or-nothing). */
+                land->direct = d->lavc != NULL;
+#endif
+                if (land->direct) {
+                    land->y_off = y_off; land->y_stride = y_stride;
+                    land->uv_off = uv_off; land->uv_stride = uv_stride;
+                    if (vt_scatter_resolve(land->ptrs, land->run, total, land->gpa_pages, land->npages, ps,
+                                           vt_scatter_map, d) != VT_SCATTER_OK) {
+                        vt_log(d, 1, "mapper id %llu: scattered pages not all in the guest DMA regions (%zu B); dropping",
+                               (unsigned long long)mapping_id, total);
+                        free(land);
+                        return -1;
+                    }
+                } else {
+                    land->shadow = malloc(total);
+                    if (!land->shadow) { free(land); return -1; }
+                    if (vt_scatter_gather(land->shadow, total, land->gpa_pages, land->npages, ps,
+                                          vt_scatter_map, d) != VT_SCATTER_OK) {
+                        vt_log(d, 1, "mapper id %llu: scattered pages not all in the guest DMA regions (%zu B); dropping",
+                               (unsigned long long)mapping_id, total);
+                        free(land->shadow); free(land);
+                        return -1;
+                    }
                 }
                 p = land->shadow;
             } else {
                 p = vt_map(d, r.gpa_base, total);
             }
-            if (!p) {
+            if (!p && !(land && land->direct)) {
                 vt_log(d, 1, "mapper id %llu gpa %#llx: no guest pages (%zu B) in the DMA regions",
                        (unsigned long long)mapping_id, (unsigned long long)r.gpa_base, total);
                 return -1;
@@ -507,14 +535,14 @@ static int vt_resolve_buffer(void *ctx, const uint8_t uuid[16], uint64_t mapping
             memcpy(out->uuid, uuid, 16);
             out->mapping_id = mapping_id;
             out->landing = land;
-            out->y = p + y_off;                             out->y_stride = y_stride;
-            out->uv = p + uv_off;                           out->uv_stride = uv_stride;
+            out->y = p ? p + y_off : NULL;                  out->y_stride = y_stride;
+            out->uv = p ? p + uv_off : NULL;                out->uv_stride = uv_stride;
             vt_log(d, 3, "mapper id %llu layout: base_off %llu planes %u y_off %zu y_stride %zu uv_off %zu uv_stride %zu alloc %llu",
                    (unsigned long long)mapping_id, (unsigned long long)r.base_offset, r.plane_count,
                    y_off, y_stride, uv_off, uv_stride, (unsigned long long)r.alloc_size);
             out->width = w; out->height = h;
             vt_log(d, 3, "mapper id %llu resolved via bridge (%s): gpa %#llx %ux%u y_stride %zu uv@%zu",
-                   (unsigned long long)mapping_id, land ? "scatter" : "contiguous",
+                   (unsigned long long)mapping_id, land ? (land->direct ? "scatter, direct" : "scatter") : "contiguous",
                    (unsigned long long)r.gpa_base, w, h, y_stride, uv_off);
             return 0;
         }
@@ -540,10 +568,47 @@ static int vt_resolve_buffer(void *ctx, const uint8_t uuid[16], uint64_t mapping
     out->width = w;         out->height = h;
     return 0;
 }
+#ifdef VTPV_HAVE_LAVC
+/* Direct landing of the stream core's picture into scattered guest pages: the same
+ * rows and checks as read_luma/read_chroma into the shadow + vt_scatter_write (luma
+ * width bytes x height rows at y_off/y_stride, CbCr width rounded to even x
+ * ceil(height/2) rows at uv_off/uv_stride), all-or-nothing: every page resolved and
+ * both planes' ranges checked before the first byte moves. */
+static int vt_land_direct(vt_dev *d, const vtpv_decoded_frame *f, vt_landing *l)
+{
+    vtpv_lavc_frame fr;
+    size_t w = f->width, h = f->height, cw = (w + 1) / 2 * 2, ch = (h + 1) / 2, yend, uvend;
+    if (!d->lavc || vtpv_lavc_get_frame(d->lavc, f->surface_id, &fr) != VTPV_OK ||
+        fr.pixfmt != VTPV_PIXFMT_NV12 || w > fr.width || h > fr.height || !w || !h ||
+        l->y_stride < w || l->uv_stride < cw)
+        return -1;
+    if (__builtin_mul_overflow(h - 1, l->y_stride, &yend) || __builtin_add_overflow(yend, l->y_off + w, &yend) ||
+        __builtin_mul_overflow(ch - 1, l->uv_stride, &uvend) || __builtin_add_overflow(uvend, l->uv_off + cw, &uvend) ||
+        yend > l->total || uvend > l->total) {
+        vt_log(d, 1, "direct landing: planes exceed the %zu B surface; frame not delivered", l->total);
+        return -1;
+    }
+    if (vt_scatter_resolve(l->ptrs, l->run, l->total, l->gpa_pages, l->npages, l->page_size,
+                           vt_scatter_map, d) != VT_SCATTER_OK ||
+        vt_scatter_write_rows(l->ptrs, l->run, l->total, l->page_size, l->y_off, l->y_stride,
+                              fr.plane[0], fr.stride[0], w, h) != VT_SCATTER_OK ||
+        vt_scatter_write_rows(l->ptrs, l->run, l->total, l->page_size, l->uv_off, l->uv_stride,
+                              fr.plane[1], fr.stride[1], cw, ch) != VT_SCATTER_OK) {
+        vt_log(d, 1, "scatter write to guest pages failed (%zu B); frame not delivered", l->total);
+        return -1;
+    }
+    return 0;
+}
+#endif
+
 static int vt_copy_frame(void *ctx, const vtpv_decoded_frame *f, const aw_out_buffer *b)
 {
     vt_dev *d = ctx;
     int rc;
+#ifdef VTPV_HAVE_LAVC
+    if (b->landing && ((const vt_landing *)b->landing)->direct)
+        return vt_land_direct(d, f, b->landing);
+#endif
     if (!b->y) return -1;
     /* land the full NV12 frame: Y plane, then the interleaved UV plane. Route to
      * whichever backend is active (the libavcodec stream core, else the legacy

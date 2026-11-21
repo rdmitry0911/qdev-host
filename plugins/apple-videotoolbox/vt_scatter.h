@@ -32,4 +32,21 @@ int vt_scatter_gather(uint8_t *dst, size_t total, const uint64_t *gpa_pages,
 int vt_scatter_write(const uint8_t *src, size_t total, const uint64_t *gpa_pages,
                      uint32_t npages, size_t page_size,
                      vt_scatter_map_fn map, void *ctx);
+
+/* Direct landing (no shadow): resolve the host pointers of the pages covering the
+ * first `total` bytes of the allocation once (all-or-nothing, like the calls above:
+ * nothing is written when a needed page is unmapped), then write image rows
+ * straight into the guest pages. Bytes the rows do not cover keep the guest's
+ * content, exactly as the shadow path (gather + compose + write back) leaves them.
+ * `ptrs` / `run` hold `need` = ceil(total / page_size) entries; run[i] = bytes
+ * that are contiguous in host memory from the start of page i (adjacent pages
+ * merge into one memcpy). */
+int vt_scatter_resolve(void **ptrs, size_t *run, size_t total, const uint64_t *gpa_pages,
+                       uint32_t npages, size_t page_size, vt_scatter_map_fn map, void *ctx);
+/* `rows` rows of `row_bytes` from src (src_stride apart) to allocation offset
+ * dst_off + r * dst_stride. The caller keeps every row inside `total` (checked:
+ * VT_SCATTER_ERR_RANGE, nothing written). */
+int vt_scatter_write_rows(void *const *ptrs, const size_t *run, size_t total, size_t page_size,
+                          size_t dst_off, size_t dst_stride, const uint8_t *src, size_t src_stride,
+                          size_t row_bytes, size_t rows);
 #endif

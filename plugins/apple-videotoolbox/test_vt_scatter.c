@@ -114,12 +114,66 @@ static void test_failures_are_all_or_nothing(void)
     CHECK(vt_scatter_gather(NULL, 10, pg, 4, PS, map_ram, NULL) == VT_SCATTER_ERR_INVAL, "null dst");
 }
 
+/* Direct landing (vt_scatter_resolve + vt_scatter_write_rows) == the shadow path
+ * (gather, overlay the image rows, write back) for every byte of guest RAM, with
+ * scattered pages, a run of host-adjacent pages, rows crossing page boundaries,
+ * strides wider than the rows, and a partial last page. */
+static void overlay_rows(uint8_t *shadow, size_t off, size_t dstride, const uint8_t *src,
+                         size_t sstride, size_t rowb, size_t rows)
+{
+    for (size_t r = 0; r < rows; ++r) memcpy(shadow + off + r * dstride, src + r * sstride, rowb);
+}
+
+static void test_rows_equal_shadow_path(void)
+{
+    printf("-- direct rows == shadow compose (scattered + adjacent pages) --\n");
+    uint64_t pg[24];
+    for (uint32_t i = 0; i < 24; ++i) pg[i] = (uint64_t)((i * 7u + 3u) % RAM_PAGES) * PS;
+    pg[10] = 40u * PS; pg[11] = 41u * PS; pg[12] = 42u * PS; /* a host-adjacent run (merged memcpy) */
+    size_t total = 24 * PS - 333;
+    const size_t ystride = 3072 + 64, w = 3000, h = 20, uvoff = 64000, uvstride = 3200, uvrows = 10;
+    uint8_t *src = malloc(ystride * h), *uvsrc = malloc(uvstride * uvrows);
+    for (size_t i = 0; i < ystride * h; ++i) src[i] = (uint8_t)(i * 37u + 1u);
+    for (size_t i = 0; i < uvstride * uvrows; ++i) uvsrc[i] = (uint8_t)(i * 11u + 9u);
+    /* reference: shadow path */
+    for (size_t i = 0; i < sizeof g_ram; ++i) g_ram[i] = (uint8_t)(i * 3u + 17u);
+    uint8_t *shadow = malloc(total);
+    CHECK(vt_scatter_gather(shadow, total, pg, 24, PS, map_ram, NULL) == 0, "gather");
+    overlay_rows(shadow, 256, ystride, src, ystride, w, h);
+    overlay_rows(shadow, uvoff, uvstride, uvsrc, uvstride, w, uvrows);
+    CHECK(vt_scatter_write(shadow, total, pg, 24, PS, map_ram, NULL) == 0, "write back");
+    uint8_t *want = malloc(sizeof g_ram); memcpy(want, g_ram, sizeof g_ram);
+    /* direct path on the same initial RAM */
+    for (size_t i = 0; i < sizeof g_ram; ++i) g_ram[i] = (uint8_t)(i * 3u + 17u);
+    void *ptrs[24]; size_t run[24];
+    CHECK(vt_scatter_resolve(ptrs, run, total, pg, 24, PS, map_ram, NULL) == 0, "resolve");
+    CHECK(run[10] == 3 * PS && run[11] == 2 * PS && run[12] == PS && run[9] == PS, "adjacent run merged (%zu %zu)", run[10], run[9]);
+    CHECK(vt_scatter_write_rows(ptrs, run, total, PS, 256, ystride, src, ystride, w, h) == 0, "luma rows");
+    CHECK(vt_scatter_write_rows(ptrs, run, total, PS, uvoff, uvstride, uvsrc, uvstride, w, uvrows) == 0, "chroma rows");
+    int bad = 0;
+    for (size_t i = 0; i < sizeof g_ram; ++i) if (g_ram[i] != want[i]) bad++;
+    CHECK(bad == 0, "%d guest bytes differ between direct rows and the shadow path", bad);
+    /* a row past the allocation is refused and writes nothing */
+    memcpy(want, g_ram, sizeof g_ram);
+    CHECK(vt_scatter_write_rows(ptrs, run, total, PS, total - 100, 0, src, 0, 101, 1) == VT_SCATTER_ERR_RANGE, "row past total");
+    CHECK(vt_scatter_write_rows(ptrs, run, total, PS, 0, (size_t)-1, src, 0, 10, 3) == VT_SCATTER_ERR_RANGE, "stride overflow");
+    bad = 0; for (size_t i = 0; i < sizeof g_ram; ++i) if (g_ram[i] != want[i]) bad++;
+    CHECK(bad == 0, "%d bytes written by refused rows", bad);
+    /* an unmapped page fails resolve (nothing written by the caller, which writes only after resolve) */
+    g_unmapped_gpa_valid = 1; g_unmapped_gpa = pg[17];
+    CHECK(vt_scatter_resolve(ptrs, run, total, pg, 24, PS, map_ram, NULL) == VT_SCATTER_ERR_UNMAPPED, "unmapped page");
+    g_unmapped_gpa_valid = 0;
+    CHECK(vt_scatter_resolve(ptrs, run, 25 * PS, pg, 24, PS, map_ram, NULL) == VT_SCATTER_ERR_RANGE, "total beyond pages");
+    free(src); free(uvsrc); free(shadow); free(want);
+}
+
 int main(void)
 {
     test_write_lands_each_byte_at_its_scattered_address();
     test_gather_is_the_inverse();
     test_roundtrip_preserves_untouched_bytes();
     test_failures_are_all_or_nothing();
+    test_rows_equal_shadow_path();
     if (g_fails) { printf("FAILED: %d of %d check(s)\n", g_fails, g_checks); return 1; }
     printf("OK: all vt_scatter checks passed (%d)\n", g_checks);
     return 0;

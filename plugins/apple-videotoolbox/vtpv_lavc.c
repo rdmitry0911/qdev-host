@@ -23,6 +23,12 @@ struct vtpv_lavc {
     vtpv_lavc_hw       hw;
     AVBufferRef       *device;   /* NULL for VTPV_LAVC_HW_NONE               */
     enum AVPixelFormat hw_fmt;   /* AV_PIX_FMT_VAAPI / AV_PIX_FMT_CUDA       */
+    int                map_direct; /* VA-API: read the picture through a direct
+                                    * (derived) mapping - measured cache-readable
+                                    * on Mesa radeonsi (Raphael: 4K NV12 read in
+                                    * ~1.7 ms); other drivers (e.g. Intel, whose
+                                    * derived memory is uncached) take the copying
+                                    * read mapping */
     uint32_t           next_id;  /* backend-local surface ids                */
     vtpv_lavc_dec     *decs;     /* open decoders (surface id lookup)        */
 };
@@ -34,7 +40,8 @@ struct vtpv_lavc_dec {
     AVCodecContext  *ctx;
     AVPacket        *pkt;
     AVFrame         *out_frame;  /* libavcodec's display-order output (dropped) */
-    AVFrame         *sw_frame;   /* hardware -> CPU transfer target            */
+    AVFrame         *sw_frame;   /* hardware -> CPU transfer target (kept across units) */
+    AVFrame         *map_frame;  /* read mapping of the unit's hardware picture (VA-API) */
     AVFrame         *alloc[MAX_UNIT_ALLOCS]; /* pictures allocated for this unit */
     int              n_alloc;
     int              in_unit;
@@ -85,6 +92,12 @@ int vtpv_lavc_open(vtpv_lavc_hw hw, const char *device, vtpv_lavc **out,
                av_hwdevice_get_type_name(type), device ? device : "(default)", e);
         free(v);
         return VTPV_ERR_UNSUPPORTED;
+    }
+    if (hw == VTPV_LAVC_HW_VAAPI) {
+        AVHWDeviceContext *dc = (AVHWDeviceContext *)v->device->data;
+        const AVVAAPIDeviceContext *hc = dc->hwctx;
+        const char *vendor = vaQueryVendorString(hc->display);
+        v->map_direct = vendor && strstr(vendor, "radeonsi") != NULL;
     }
     *out = v;
     return VTPV_OK;
@@ -297,7 +310,8 @@ int vtpv_lavc_open_decoder(vtpv_lavc *v, uint32_t codec, uint32_t width,
     d->pkt = av_packet_alloc();
     d->out_frame = av_frame_alloc();
     d->sw_frame = av_frame_alloc();
-    if (!d->ctx || !d->pkt || !d->out_frame || !d->sw_frame) goto fail;
+    d->map_frame = av_frame_alloc();
+    if (!d->ctx || !d->pkt || !d->out_frame || !d->sw_frame || !d->map_frame) goto fail;
 
     d->ctx->opaque = d;
     d->ctx->width = (int)width;
@@ -332,6 +346,7 @@ fail:
     av_packet_free(&d->pkt);
     av_frame_free(&d->out_frame);
     av_frame_free(&d->sw_frame);
+    av_frame_free(&d->map_frame);
     free(d);
     return VTPV_ERR_BACKEND;
 }
@@ -415,6 +430,7 @@ int vtpv_lavc_decode(vtpv_lavc_dec *d, const uint8_t *sample, size_t sample_len,
     memcpy(d->au, sample, sample_len);
     memset(d->au + sample_len, 0, AV_INPUT_BUFFER_PADDING_SIZE);
 
+    av_frame_unref(d->map_frame);     /* the previous unit's mapping (its picture is gone) */
     drop_allocs(d);
     d->in_unit = 1;
     av_packet_unref(d->pkt);
@@ -451,18 +467,43 @@ int vtpv_lavc_decode(vtpv_lavc_dec *d, const uint8_t *sample, size_t sample_len,
     if (d->v->hw == VTPV_LAVC_HW_NONE) {
         rc = sw_to_biplanar(d, pic, w, h, out);
     } else {
-        av_frame_unref(d->sw_frame);
-        if (pic->format != d->v->hw_fmt || av_hwframe_transfer_data(d->sw_frame, pic, 0) < 0) {
+        /* The unit's picture in CPU-readable memory. VA-API: a read mapping of the
+         * hardware surface (direct where the driver's surface memory reads fast, see
+         * map_direct, else the driver's image copy), read once by the landing: no
+         * second 12 MB copy per 4K frame. Otherwise (CUDA has no CPU mapping) a
+         * transfer into sw_frame, whose buffers are kept while the size stays (no
+         * per-frame allocation). Same bytes either way: the decoded NV12 planes. */
+        const AVFrame *cpu = NULL;
+        if (pic->format != d->v->hw_fmt) {
             rc = VTPV_ERR_BACKEND;
-        } else if (d->sw_frame->format == AV_PIX_FMT_NV12 || d->sw_frame->format == AV_PIX_FMT_P010LE) {
-            out->width = w; out->height = h;
-            out->pixfmt = d->sw_frame->format == AV_PIX_FMT_NV12 ? VTPV_PIXFMT_NV12 : VTPV_PIXFMT_P010;
-            out->plane[0] = d->sw_frame->data[0]; out->stride[0] = (size_t)d->sw_frame->linesize[0];
-            out->plane[1] = d->sw_frame->data[1]; out->stride[1] = (size_t)d->sw_frame->linesize[1];
-            rc = (w <= (uint32_t)d->sw_frame->width && h <= (uint32_t)d->sw_frame->height)
-                 ? VTPV_OK : VTPV_ERR_BACKEND;
         } else {
-            rc = VTPV_ERR_UNSUPPORTED;
+            d->map_frame->format = AV_PIX_FMT_NONE;
+            if (d->v->hw_fmt == AV_PIX_FMT_VAAPI && d->v->map_direct &&
+                av_hwframe_map(d->map_frame, pic, AV_HWFRAME_MAP_READ | AV_HWFRAME_MAP_DIRECT) == 0) {
+                cpu = d->map_frame;
+            } else if (d->v->hw_fmt == AV_PIX_FMT_VAAPI &&
+                       (av_frame_unref(d->map_frame), d->map_frame->format = AV_PIX_FMT_NONE,
+                        av_hwframe_map(d->map_frame, pic, AV_HWFRAME_MAP_READ) == 0)) {
+                cpu = d->map_frame;
+            } else {
+                av_frame_unref(d->map_frame);
+                if (d->sw_frame->buf[0] &&
+                    (d->sw_frame->width != pic->width || d->sw_frame->height != pic->height))
+                    av_frame_unref(d->sw_frame);
+                if (av_hwframe_transfer_data(d->sw_frame, pic, 0) == 0) cpu = d->sw_frame;
+                else av_frame_unref(d->sw_frame);
+            }
+            if (!cpu) {
+                rc = VTPV_ERR_BACKEND;
+            } else if (cpu->format == AV_PIX_FMT_NV12 || cpu->format == AV_PIX_FMT_P010LE) {
+                out->width = w; out->height = h;
+                out->pixfmt = cpu->format == AV_PIX_FMT_NV12 ? VTPV_PIXFMT_NV12 : VTPV_PIXFMT_P010;
+                out->plane[0] = cpu->data[0]; out->stride[0] = (size_t)cpu->linesize[0];
+                out->plane[1] = cpu->data[1]; out->stride[1] = (size_t)cpu->linesize[1];
+                rc = (w <= (uint32_t)cpu->width && h <= (uint32_t)cpu->height) ? VTPV_OK : VTPV_ERR_BACKEND;
+            } else {
+                rc = VTPV_ERR_UNSUPPORTED;
+            }
         }
     }
     drop_allocs(d);
@@ -477,6 +518,7 @@ void vtpv_lavc_flush(vtpv_lavc_dec *d)
 {
     if (!d) return;
     avcodec_flush_buffers(d->ctx);
+    av_frame_unref(d->map_frame);
     drop_allocs(d);
     d->cur_id = 0;
 }
@@ -492,6 +534,7 @@ void vtpv_lavc_close_decoder(vtpv_lavc_dec *d)
     av_packet_free(&d->pkt);
     av_frame_free(&d->out_frame);
     av_frame_free(&d->sw_frame);
+    av_frame_free(&d->map_frame);
     free(d->conv);
     free(d->au);
     free(d);
@@ -564,6 +607,14 @@ static const vtpv_lavc_frame *find_surface(vtpv_lavc *v, uint32_t id)
     for (d = v->decs; d; d = d->next)
         if (d->cur_id == id) return &d->cur;
     return NULL;
+}
+
+int vtpv_lavc_get_frame(vtpv_lavc *v, uint32_t surface_id, vtpv_lavc_frame *out)
+{
+    const vtpv_lavc_frame *f = find_surface(v, surface_id);
+    if (!f || !out) return VTPV_ERR_BACKEND;
+    *out = *f;
+    return VTPV_OK;
 }
 
 int vtpv_lavc_read_luma(vtpv_lavc *v, uint32_t surface_id, uint8_t *dst,

@@ -95,6 +95,9 @@ int  vtpv_lavc_frame_copy(const vtpv_lavc_frame *f, uint8_t *y, size_t y_stride,
  * copy step reads it with read_luma/read_chroma until the next decode on that
  * session. */
 const vtpv_decoder_backend *vtpv_lavc_backend(void);
+/* The current picture of a surface id (planes valid until that decoder's next
+ * unit, flush or close), for a landing that writes the planes itself. */
+int  vtpv_lavc_get_frame(vtpv_lavc *v, uint32_t surface_id, vtpv_lavc_frame *out);
 int  vtpv_lavc_read_luma(vtpv_lavc *v, uint32_t surface_id, uint8_t *dst,
                          size_t dst_stride, uint32_t w, uint32_t h);
 int  vtpv_lavc_read_chroma(vtpv_lavc *v, uint32_t surface_id, uint8_t *dst,
