@@ -43,7 +43,7 @@ ifneq ($(QMETAL_INCLUDE),)
 PLUGINS += plugins/uniq-vgpu/uniq-vgpu.so
 endif
 
-# apple-videotoolbox (Apple paravirt VideoToolbox codec device, PCI 106b:1a03)
+# apple-videotoolbox (paravirt VideoToolbox codec device, PCI 1b36:eee2; Apple's is 106b:1a03)
 # is the AppleGVA host backend (increment 1). It links libva (VA-API decode)
 # and is built only when VIDEOTOOLBOX=1 is given, so the default build is
 # unchanged on hosts without libva:

@@ -1,6 +1,6 @@
 /*
  * apple-videotoolbox.c - qdev-host plugin: the host side of Apple's
- * paravirtualized VideoToolbox codec device (PCI 106b:1a03).
+ * paravirtualized VideoToolbox codec device (PCI 1b36:eee2; Apple's own is 106b:1a03).
  *
  * AppleGVA host backend, increment 1 (lane L-M2V03, 2026-11-16).
  *
@@ -65,8 +65,10 @@
 
 /* ---- device constants ---------------------------------------------- */
 
-#define VT_PCI_VENDOR   0x106b   /* Apple */
-#define VT_PCI_DEVICE   0x1a03   /* com.apple.virtualization.avp.videotoolbox */
+#define VT_PCI_VENDOR   0x1b36   /* Uni-Q vGPU family (same vendor as the eee1 GPU) */
+#define VT_PCI_DEVICE   0xeee2   /* Uni-Q vGPU video (was Apple 106b:1a03; the guest
+                                    * VideoToolbox finds the driver by IOService class
+                                    * name only, analysis/20261121-GVA-VIDEO-IDENTITY-RENAME) */
 #define VT_PCI_CLASS    0x04     /* multimedia controller                     */
 #define VT_PCI_SUBCLASS 0x80     /* other multimedia                          */
 
@@ -294,7 +296,7 @@ static void vt_flush_pending(vt_dev *d)
         if (written < len)
             vt_log(d, 1, "q1 '%s' truncated %u/%u (guest buffer too small)", fc, written, len);
         else
-            vt_log(d, 2, "q1 '%s' (%u B) -> guest", fc, len);
+            vt_log(d, 3, "q1 '%s' (%u B) -> guest", fc, len);
         d->pend_head = (d->pend_head + 1) % VT_PENDING_MAX;
         d->pend_count--;
         delivered++;
@@ -507,11 +509,11 @@ static int vt_resolve_buffer(void *ctx, const uint8_t uuid[16], uint64_t mapping
             out->landing = land;
             out->y = p + y_off;                             out->y_stride = y_stride;
             out->uv = p + uv_off;                           out->uv_stride = uv_stride;
-            vt_log(d, 1, "mapper id %llu layout: base_off %llu planes %u y_off %zu y_stride %zu uv_off %zu uv_stride %zu alloc %llu",
+            vt_log(d, 3, "mapper id %llu layout: base_off %llu planes %u y_off %zu y_stride %zu uv_off %zu uv_stride %zu alloc %llu",
                    (unsigned long long)mapping_id, (unsigned long long)r.base_offset, r.plane_count,
                    y_off, y_stride, uv_off, uv_stride, (unsigned long long)r.alloc_size);
             out->width = w; out->height = h;
-            vt_log(d, 2, "mapper id %llu resolved via bridge (%s): gpa %#llx %ux%u y_stride %zu uv@%zu",
+            vt_log(d, 3, "mapper id %llu resolved via bridge (%s): gpa %#llx %ux%u y_stride %zu uv@%zu",
                    (unsigned long long)mapping_id, land ? "scatter" : "contiguous",
                    (unsigned long long)r.gpa_base, w, h, y_stride, uv_off);
             return 0;
@@ -528,7 +530,7 @@ static int vt_resolve_buffer(void *ctx, const uint8_t uuid[16], uint64_t mapping
                (unsigned long long)mapping_id, ysize + csize);
         return -1;
     }
-    vt_log(d, 2, "Dbuf surface gpa %#llx resolved: %ux%u NV12, y_stride %u, %zu B",
+    vt_log(d, 3, "Dbuf surface gpa %#llx resolved: %ux%u NV12, y_stride %u, %zu B",
            (unsigned long long)mapping_id, w, h, ystride, ysize + csize);
     memset(out, 0, sizeof *out);
     memcpy(out->uuid, uuid, 16);
@@ -604,11 +606,11 @@ static void vt_process_submission(vt_dev *d)
         if (rc != 1) { d->needs_reset = 1; break; } /* malformed ring */
         { char hx[81*3]; size_t hn = len < 80 ? len : 80, o = 0;
           for (size_t i = 0; i < hn; i++) o += (size_t)snprintf(hx+o, sizeof hx-o, "%02x ", msg[i]);
-          hx[o] = 0; vt_log(d, 2, "q0 RX len=%zu bytes: %s", len, hx); }
+          hx[o] = 0; vt_log(d, 3, "q0 RX len=%zu bytes: %s", len, hx); }
         int32_t status = aw_engine_deliver(d->engine, msg, len); /* emits on q1 */
         { aw_msg_view mv; char fc[5] = "????";
           if (aw_parse(msg, len, &mv) == AW_PARSE_OK) vt_fourcc(mv.type, fc);
-          vt_log(d, 2, "q0 '%s' (%zu B, flags %#x) -> status %d", fc, len,
+          vt_log(d, 3, "q0 '%s' (%zu B, flags %#x) -> status %d", fc, len,
                  (aw_parse(msg, len, &mv) == AW_PARSE_OK) ? mv.flags : 0, status); }
         uint32_t written = 0;
         if (wptr && wcap >= 4) { memcpy(wptr, &status, 4); written = 4; } /* native i32 */
@@ -913,7 +915,7 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
         return -ENOMEM;
     }
 
-    /* PCI identity the guest kext matches (IOPCIPrimaryMatch 0x1a03106b) */
+    /* PCI identity the guest kext matches (IOPCIPrimaryMatch 0xEEE21B36) */
     if (vfu_pci_init(ctx, VFU_PCI_TYPE_EXPRESS, PCI_HEADER_TYPE_NORMAL, 0) < 0)
         goto fail;
     vfu_pci_set_id(ctx, VT_PCI_VENDOR, VT_PCI_DEVICE, VT_PCI_VENDOR, VT_PCI_DEVICE);
