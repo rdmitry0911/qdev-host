@@ -56,6 +56,7 @@
 #include "vtpv_virtq.h"
 #include "aw_session.h"   /* the Apple contract-B wire session engine (H5/H6/H7) */
 #include "vt_scatter.h"   /* page-aware landing into a non-contiguous guest surface */
+#include "vt_land.h"      /* GVA-LAND-BOUNDS: only what fits the lent surface lands */
 #ifdef VTPV_HAVE_LAVC
 #define VT_LAVC_CLOSE(d) do { if ((d)->lavc) { vtpv_lavc_close((d)->lavc); (d)->lavc = NULL; } } while (0)
 #else
@@ -250,9 +251,10 @@ typedef struct vt_landing {
     uint64_t  page_size;
     uint64_t  gpa_pages[PVG_BRIDGE_MAX_PAGES];
     /* direct path (stream core): the planes are written row by row into the guest
-     * pages, no shadow (vt_scatter_resolve / vt_scatter_write_rows) */
+     * pages, no shadow (vt_scatter_resolve / vt_land_planes) */
     int       direct;
     size_t    y_off, y_stride, uv_off, uv_stride;
+    vt_land_geom geom;    /* the lent surface's planes (GVA-LAND-BOUNDS): every write fits */
     void     *ptrs[PVG_BRIDGE_MAX_PAGES];
     size_t    run[PVG_BRIDGE_MAX_PAGES];
 } vt_landing;
@@ -383,12 +385,19 @@ static void vt_emit(void *ctx, const uint8_t *msg, size_t len)
  * lazily. The vfio-user launcher sets PVG_MAPPER_BRIDGE_SHM to the VM-scoped shm name that
  * uniq-vgpu creates. Returns NULL when no bridge is wired (then resolve falls back to the
  * GPA-as-mapping-id bring-up path below). */
+static int vt_bridge_configured(void)
+{
+    const char *name = getenv("PVG_MAPPER_BRIDGE_SHM");
+    return name && *name;
+}
+
 static const pvg_mapper_bridge *vt_bridge(void)
 {
+    /* Opened lazily and retried until it opens: uniq-vgpu creates the region at its
+     * first mapper publish. With a bridge configured, a missing region is a miss
+     * (the frame is dropped), never the GPA bring-up path. */
     static const pvg_mapper_bridge *b = NULL;
-    static int tried = 0;
-    if (!tried) {
-        tried = 1;
+    if (!b) {
         const char *name = getenv("PVG_MAPPER_BRIDGE_SHM");
         if (name && *name) {
             int fd = shm_open(name, O_RDONLY, 0);
@@ -476,11 +485,16 @@ static int vt_resolve_buffer(void *ctx, const uint8_t uuid[16], uint64_t mapping
                                                  : uv_off + uv_stride * ((r.height + 1) / 2));
             uint8_t *p = NULL;
             vt_landing *land = NULL;
-            if (!r.contiguous) {
-                /* Scattered guest pages (the IOSurface's own memory is not physically
-                 * contiguous): compose the frame in a host shadow of the allocation
-                 * (seeded from the guest pages so untouched bytes are preserved) and
-                 * scatter it back in vt_copy_frame. Contract: vt_scatter.h. */
+            /* GVA-LAND-BOUNDS: every bridge surface - contiguous or not - lands through the
+             * page list with the surface's own plane geometry, so no write leaves it (the
+             * old contiguous path wrote the picture's full size from gpa_base and ran past
+             * small, physically contiguous surfaces into guest kernel memory). */
+            {
+                /* The surface's pages (scattered or contiguous): the stream core writes the
+                 * fitting rows straight into them (vt_land_direct); the legacy backends compose
+                 * the frame in a host shadow of the allocation (seeded from the guest pages so
+                 * untouched bytes are preserved) and scatter it back in vt_copy_frame.
+                 * Contract: vt_scatter.h, vt_land.h. */
                 size_t need = uv_off + uv_stride * (((size_t)r.height + 1) / 2);
                 if (total < need) total = need;
                 if (r.page_count > PVG_BRIDGE_MAX_PAGES || total > (size_t)r.page_count * ps) {
@@ -492,6 +506,15 @@ static int vt_resolve_buffer(void *ctx, const uint8_t uuid[16], uint64_t mapping
                 if (!land) return -1;
                 land->d = d; land->total = total; land->npages = r.page_count; land->page_size = ps;
                 memcpy(land->gpa_pages, r.gpa_pages, (size_t)r.page_count * sizeof(uint64_t));
+                land->geom.total = total;
+                land->geom.y_off = y_off; land->geom.y_stride = y_stride;
+                land->geom.uv_off = uv_off; land->geom.uv_stride = uv_stride;
+                if (r.plane_count >= 1) {
+                    land->geom.y_w = (uint32_t)r.planes[0].width; land->geom.y_h = (uint32_t)r.planes[0].height;
+                }
+                if (r.plane_count >= 2) {
+                    land->geom.uv_w = (uint32_t)r.planes[1].width; land->geom.uv_h = (uint32_t)r.planes[1].height;
+                }
 #ifdef VTPV_HAVE_LAVC
                 /* The stream core exposes its picture's planes: land them straight into
                  * the guest pages in vt_copy_frame (one copy of the visible rows, no 12 MB
@@ -523,8 +546,6 @@ static int vt_resolve_buffer(void *ctx, const uint8_t uuid[16], uint64_t mapping
                     }
                 }
                 p = land->shadow;
-            } else {
-                p = vt_map(d, r.gpa_base, total);
             }
             if (!p && !(land && land->direct)) {
                 vt_log(d, 1, "mapper id %llu gpa %#llx: no guest pages (%zu B) in the DMA regions",
@@ -548,6 +569,12 @@ static int vt_resolve_buffer(void *ctx, const uint8_t uuid[16], uint64_t mapping
         }
     }
 
+    if (vt_resolve_route_for(mapping_id, vt_bridge_configured(), 0) != VT_ROUTE_GPA) {
+        vt_log(d, 1, "mapper id %llu is not in the mapper bridge: frame not landed (a mapping id is "
+               "never taken as a guest-physical address while a bridge is configured)",
+               (unsigned long long)mapping_id);
+        return -1;
+    }
     uint32_t ystride = (w + 15u) & ~15u;          /* guest CoreVideo rowBytes (16)  */
     size_t   ysize   = (size_t)ystride * h;
     size_t   csize   = (size_t)ystride * ((h + 1u) / 2u); /* NV12 interleaved UV   */
@@ -577,26 +604,29 @@ static int vt_resolve_buffer(void *ctx, const uint8_t uuid[16], uint64_t mapping
 static int vt_land_direct(vt_dev *d, const vtpv_decoded_frame *f, vt_landing *l)
 {
     vtpv_lavc_frame fr;
-    size_t w = f->width, h = f->height, cw = (w + 1) / 2 * 2, ch = (h + 1) / 2, yend, uvend;
+    vt_land_rows lr;
+    uint32_t w = f->width, h = f->height;
     if (!d->lavc || vtpv_lavc_get_frame(d->lavc, f->surface_id, &fr) != VTPV_OK ||
-        fr.pixfmt != VTPV_PIXFMT_NV12 || w > fr.width || h > fr.height || !w || !h ||
-        l->y_stride < w || l->uv_stride < cw)
+        fr.pixfmt != VTPV_PIXFMT_NV12 || w > fr.width || h > fr.height || !w || !h)
         return -1;
-    if (__builtin_mul_overflow(h - 1, l->y_stride, &yend) || __builtin_add_overflow(yend, l->y_off + w, &yend) ||
-        __builtin_mul_overflow(ch - 1, l->uv_stride, &uvend) || __builtin_add_overflow(uvend, l->uv_off + cw, &uvend) ||
-        yend > l->total || uvend > l->total) {
-        vt_log(d, 1, "direct landing: planes exceed the %zu B surface; frame not delivered", l->total);
-        return -1;
-    }
     if (vt_scatter_resolve(l->ptrs, l->run, l->total, l->gpa_pages, l->npages, l->page_size,
-                           vt_scatter_map, d) != VT_SCATTER_OK ||
-        vt_scatter_write_rows(l->ptrs, l->run, l->total, l->page_size, l->y_off, l->y_stride,
-                              fr.plane[0], fr.stride[0], w, h) != VT_SCATTER_OK ||
-        vt_scatter_write_rows(l->ptrs, l->run, l->total, l->page_size, l->uv_off, l->uv_stride,
-                              fr.plane[1], fr.stride[1], cw, ch) != VT_SCATTER_OK) {
-        vt_log(d, 1, "scatter write to guest pages failed (%zu B); frame not delivered", l->total);
+                           vt_scatter_map, d) != VT_SCATTER_OK) {
+        vt_log(d, 1, "landing: surface pages not all in the guest DMA regions (%zu B); frame not delivered", l->total);
         return -1;
     }
+    /* GVA-LAND-BOUNDS: the picture lands at the surface's top left, only what fits each
+     * plane (reference: Apple's host writes the picture unscaled at the top left of a
+     * buffer of the description's size); nothing outside the lent surface is written. */
+    int rc = vt_land_planes(l->ptrs, l->run, l->page_size, &l->geom, fr.plane[0], fr.stride[0],
+                            fr.plane[1], fr.stride[1], w, h, 1, &lr);
+    if (rc != 0) {
+        vt_log(d, 1, "landing: %ux%u picture does not fit the lent surface (%zu B, rc %d); frame not delivered",
+               w, h, l->total, rc);
+        return -1;
+    }
+    if (lr.cropped)
+        vt_log(d, 3, "landing: %ux%u picture larger than the lent surface: top-left %zux%zu landed",
+               w, h, lr.y_bytes, lr.y_rows);
     return 0;
 }
 #endif
@@ -610,25 +640,41 @@ static int vt_copy_frame(void *ctx, const vtpv_decoded_frame *f, const aw_out_bu
         return vt_land_direct(d, f, b->landing);
 #endif
     if (!b->y) return -1;
-    /* land the full NV12 frame: Y plane, then the interleaved UV plane. Route to
+    /* land the NV12 frame: Y plane, then the interleaved UV plane. Route to
      * whichever backend is active (the libavcodec stream core, else the legacy
-     * intra-only NVDEC / VA-API backends). */
+     * intra-only NVDEC / VA-API backends). GVA-LAND-BOUNDS: only what fits the lent
+     * surface - the shadow of a bridge surface (its plane geometry) or the GPA
+     * bring-up surface laid out for the description's size b->width x b->height. */
+    uint32_t lw = f->width, lh = f->height, cw = f->width, ch = f->height;
+    if (b->landing) {
+        vt_land_rows lr;
+        const vt_landing *l = b->landing;
+        if (vt_land_fit(&l->geom, f->width, f->height, 1, &lr) != 0) return -1;
+        lw = (uint32_t)lr.y_bytes; lh = (uint32_t)lr.y_rows;
+        cw = (uint32_t)lr.uv_bytes; ch = (uint32_t)lr.uv_rows * 2u;
+        if (ch > f->height) ch = f->height;
+        if (cw > f->width) cw = f->width;
+    } else {
+        if (b->width && lw > b->width) lw = b->width;
+        if (b->height && lh > b->height) lh = b->height;
+        cw = lw; ch = lh;
+    }
 #ifdef VTPV_HAVE_LAVC
     if (d->lavc) {
-        rc = vtpv_lavc_read_luma(d->lavc, f->surface_id, b->y, b->y_stride, f->width, f->height);
-        if (rc == 0 && b->uv)
-            rc = vtpv_lavc_read_chroma(d->lavc, f->surface_id, b->uv, b->uv_stride, f->width, f->height);
+        rc = vtpv_lavc_read_luma(d->lavc, f->surface_id, b->y, b->y_stride, lw, lh);
+        if (rc == 0 && b->uv && ch)
+            rc = vtpv_lavc_read_chroma(d->lavc, f->surface_id, b->uv, b->uv_stride, cw, ch);
     } else
 #endif
     if (d->nvdec) {
-        rc = vtpv_nvdec_read_luma(d->nvdec, f->surface_id, b->y, b->y_stride, f->width, f->height);
-        if (rc == 0 && b->uv)
-            rc = vtpv_nvdec_read_chroma(d->nvdec, f->surface_id, b->uv, b->uv_stride, f->width, f->height);
+        rc = vtpv_nvdec_read_luma(d->nvdec, f->surface_id, b->y, b->y_stride, lw, lh);
+        if (rc == 0 && b->uv && ch)
+            rc = vtpv_nvdec_read_chroma(d->nvdec, f->surface_id, b->uv, b->uv_stride, cw, ch);
     } else {
         if (!d->va) return -1;
-        rc = vtpv_vaapi_read_luma(d->va, f->surface_id, b->y, b->y_stride, f->width, f->height);
-        if (rc == 0 && b->uv)
-            rc = vtpv_vaapi_read_chroma(d->va, f->surface_id, b->uv, b->uv_stride, f->width, f->height);
+        rc = vtpv_vaapi_read_luma(d->va, f->surface_id, b->y, b->y_stride, lw, lh);
+        if (rc == 0 && b->uv && ch)
+            rc = vtpv_vaapi_read_chroma(d->va, f->surface_id, b->uv, b->uv_stride, cw, ch);
     }
     /* backend-independent: a scattered landing composes into the shadow above for
      * either backend, so the write-back must run for NVDEC as well as VA-API. */

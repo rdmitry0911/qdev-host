@@ -47,7 +47,7 @@ $(BUILD)/test-aw-wire: aw_wire.c aw_wire.h test_aw_wire.c | $(BUILD)
 
 # Apple-wire sbuf reader (aw_sbuf, H3) + session engine (aw_session, H5+H6):
 # routing/status + decode-exchange wire ordering with a mock backend. No libva.
-AW_CORE := aw_wire.c aw_sbuf.c aw_bplist.c aw_session.c vt_scatter.c
+AW_CORE := aw_wire.c aw_sbuf.c aw_bplist.c aw_session.c vt_scatter.c vt_land.c
 $(BUILD)/test-aw-session: $(AW_CORE) test_aw_session.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $(AW_CORE) test_aw_session.c
 
@@ -66,6 +66,10 @@ $(BUILD)/dump-decs: aw_wire.c aw_sbuf.c aw_bplist.c aw_session.c dump_decs.c | $
 # Scattered-page landing of a decoded frame into a non-contiguous guest surface.
 $(BUILD)/test-vt-scatter: vt_scatter.c vt_scatter.h test_vt_scatter.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ vt_scatter.c test_vt_scatter.c
+
+# GVA-LAND-BOUNDS: a picture lands top-left, only what fits the lent surface.
+$(BUILD)/test-vt-land: vt_land.c vt_land.h vt_scatter.c vt_scatter.h test_vt_land.c | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ vt_land.c vt_scatter.c test_vt_land.c
 
 # The uniq-vgpu <-> apple-videotoolbox IOSurface-mapper bridge (header-only shm
 # registry, writer in uniq-vgpu, reader here): publish/lookup/retract contract.
@@ -123,6 +127,12 @@ $(BUILD)/test-aw-replay-lavc: $(AW_CORE) vtpv_lavc.c test_aw_replay_lavc.c test_
 $(BUILD)/test-lavc-land: vtpv_lavc.c vtpv_lavc.h vt_scatter.c vt_scatter.h test_lavc_land.c test_lavc_util.c test_lavc_util.h | $(BUILD)
 	$(CC) $(CFLAGS) $(VA_CFLAGS) $(LAVC_CFLAGS) -o $@ vtpv_lavc.c vt_scatter.c test_lavc_land.c test_lavc_util.c $(LAVC_LIBS) $(FMT_LIBS) $(VA_LIBS)
 
+# GVA-LAND-BOUNDS on a real decoded picture taller than its description (production
+# core, software decode): the pre-fix contiguous path's calls write past a one-page
+# surface; the fixed landing keeps every guard byte.
+$(BUILD)/test-vt-land-lavc: vtpv_lavc.c vt_land.c vt_scatter.c test_vt_land_lavc.c test_lavc_util.c test_lavc_util.h | $(BUILD)
+	$(CC) $(CFLAGS) $(VA_CFLAGS) $(LAVC_CFLAGS) -o $@ vtpv_lavc.c vt_land.c vt_scatter.c test_vt_land_lavc.c test_lavc_util.c $(LAVC_LIBS) $(FMT_LIBS) $(VA_LIBS)
+
 # Stream core on a recorded payload per backend (VA-API or CUDA/NVDEC): every unit
 # decoded + landed, packed NV12 MD5 == the payload's software-oracle MD5 per decode
 # index. Needs no encoder: builds against the package's bundled libavcodec too
@@ -136,7 +146,7 @@ $(BUILD)/test-lavc-payload: vtpv_lavc.c vtpv_lavc.h vt_scatter.c vt_scatter.h te
 $(BUILD)/gva-payload: gva_payload.c test_lavc_util.c test_lavc_util.h | $(BUILD)
 	$(CC) $(CFLAGS) $(LAVC_CFLAGS) -o $@ gva_payload.c test_lavc_util.c $(LAVC_LIBS) $(FMT_LIBS)
 
-$(BUILD)/apple-videotoolbox.so: apple-videotoolbox.c $(AW_CORE) $(BACKEND) vtpv_nvdec.c $(PLUGIN_LAVC_SRC) $(BRIDGE_DIR)/pvg_mapper_bridge.h vt_scatter.h | $(BUILD)
+$(BUILD)/apple-videotoolbox.so: apple-videotoolbox.c $(AW_CORE) $(BACKEND) vtpv_nvdec.c $(PLUGIN_LAVC_SRC) $(BRIDGE_DIR)/pvg_mapper_bridge.h vt_scatter.h vt_land.h | $(BUILD)
 	$(CC) $(CFLAGS) -Wno-unused-parameter -fPIC -shared $(QDP_INC) $(VFU_INC) $(VA_CFLAGS) $(PLUGIN_LAVC_CFLAGS) \
 	    -o $@ apple-videotoolbox.c $(AW_CORE) $(BACKEND) vtpv_nvdec.c $(PLUGIN_LAVC_SRC) $(VA_LIBS) $(if $(PLUGIN_LAVC_SRC),$(LAVC_LIBS)) -ldl
 
@@ -146,11 +156,12 @@ $(BUILD)/test-plugin: test_plugin.c $(BUILD)/apple-videotoolbox.so | $(BUILD)
 plugin: $(BUILD)/apple-videotoolbox.so
 
 test: $(BUILD)/test-proto $(BUILD)/test-virtq $(BUILD)/test-aw-wire $(BUILD)/test-aw-bplist $(BUILD)/test-aw-session $(BUILD)/test-vt-scatter \
-      $(BUILD)/test-pvg-mapper-bridge
+      $(BUILD)/test-pvg-mapper-bridge $(BUILD)/test-vt-land
 	@echo "== Apple real-wire codec =="; $(BUILD)/test-aw-wire
 	@echo "== binary-plist encoder (H4) =="; $(BUILD)/test-aw-bplist
 	@echo "== Apple-wire session engine (H3/H5/H6, mock backend) =="; $(BUILD)/test-aw-session
 	@echo "== scattered-page landing =="; $(BUILD)/test-vt-scatter
+	@echo "== landing bounds (GVA-LAND-BOUNDS) =="; $(BUILD)/test-vt-land
 	@echo "== IOSurface-mapper bridge (uniq-vgpu writer / VT reader) =="; $(BUILD)/test-pvg-mapper-bridge
 	@echo "== protocol handler =="; $(BUILD)/test-proto
 	@echo "== virtio virtqueue =="; $(BUILD)/test-virtq
@@ -177,7 +188,11 @@ ifeq ($(HAVE_VA),1)
 	@echo "== plugin ABI smoke =="; $(BUILD)/test-plugin $(BUILD)/apple-videotoolbox.so
 ifeq ($(HAVE_LAVC),1)
 	@$(MAKE) --no-print-directory $(BUILD)/test-lavc $(BUILD)/test-aw-replay-lavc $(BUILD)/test-lavc-land \
-	   $(BUILD)/test-lavc-payload $(BUILD)/gva-payload
+	   $(BUILD)/test-lavc-payload $(BUILD)/gva-payload $(BUILD)/test-vt-land-lavc
+	@echo "== landing bounds on a decoded picture taller than its description (GVA-LAND-BOUNDS) =="; \
+	 $(BUILD)/test-vt-land-lavc > $(BUILD)/test-vt-land-lavc.out 2>&1; rc=$$?; grep -v '^\[lib' $(BUILD)/test-vt-land-lavc.out; \
+	 if [ $$rc = 77 ]; then echo "(land-bounds lavc test skipped: no encoder)"; \
+	 elif [ $$rc != 0 ]; then exit $$rc; fi
 	@echo "== stream decode core (libavcodec + VA-API, decode order vs software oracle) =="; \
 	 $(BUILD)/test-lavc; rc=$$?; \
 	 if [ $$rc = 77 ]; then echo "(lavc test skipped: no usable render node)"; \
