@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Off-guest tests: the guest GL bundle (UniqVGPUGL.bundle) in uniq-vgpu-mkbundle and
-uniq-vgpu-guest-install.
+"""Off-guest tests: the guest GL bundle (UniqVGPUGL.bundle) and the static desktop picture
+step (manifest "wallpaper" block) in uniq-vgpu-mkbundle and uniq-vgpu-guest-install.
 
   python3 tests/uniq-vgpu/test_guest_gl_bundle.py
 
 mkbundle runs as is. uniq-vgpu-guest-install runs as is through its test-root seam
 (UNIQVGPU_GUEST_TEST_ROOT): every macOS tool it calls by absolute path resolves to a
 DOUBLE under a per-test root. The doubles (kmutil, ditto, PlistBuddy, shasum,
-dwarfdump, sw_vers, csrutil, chown, reboot, `id`, and install-gpu-bundle.sh) are
+dwarfdump, sw_vers, csrutil, chown, reboot, `id`, install-gpu-bundle.sh and the
+wallpaper tool uniqvgpu-wallpaper.sh) are
 scoped to this file: they model only the call/output contract the installer relies
 on and are NOT evidence for the real macOS tools, the AuxKC, or the real GL bundle
 layout; the live guest install is the gate for those.
@@ -105,6 +106,27 @@ FAKE_GL_INSTALLER = textwrap.dedent("""\
     *) exit 2 ;;
     esac
 """)
+
+# DOUBLE of apple-virgl tools/guest/uniqvgpu-wallpaper.sh: its argument/output contract
+# (apply PICTURE -> copies itself to the support dir, WALLPAPER_APPLY_OK; revert ->
+# WALLPAPER_REVERT_OK, support dir removed), rooted at UNIQVGPU_GUEST_TEST_ROOT. The real
+# tool has its own test (apple-virgl tools/tests/run_uniqvgpu_wallpaper_tests.sh).
+FAKE_WP_TOOL = textwrap.dedent("""\
+    #!/bin/bash
+    # TEST DOUBLE of uniqvgpu-wallpaper.sh (tests/uniq-vgpu/test_guest_gl_bundle.py only)
+    R="$UNIQVGPU_GUEST_TEST_ROOT"; SUP="$R/Library/Application Support/UniqVGPU/wallpaper"
+    echo "wp $*" >> "$FAKE_CALLS"
+    case $1 in
+    apply)
+        mkdir -p "$SUP"; cp "$0" "$SUP/uniqvgpu-wallpaper.sh"
+        [ "${FAKE_WP_FAIL:-0}" = 1 ] && { echo "WALLPAPER_USER devops FAIL WALLPAPER_FAIL double"; echo "WALLPAPER_APPLY_FAIL picture=$2"; exit 1; }
+        echo "WALLPAPER_USER devops live WALLPAPER_SET_OK 0=$2"; echo "WALLPAPER_APPLY_OK picture=$2" ;;
+    revert) rm -rf "$SUP"; echo "WALLPAPER_REVERT_OK" ;;
+    *) exit 2 ;;
+    esac
+""")
+FAKE_WP_SETTER = "// TEST DOUBLE of uniqvgpu-wallpaper-set.js\n"
+PIC = "/System/Library/Desktop Pictures/iMac Blue.heic"
 
 # macOS tool doubles (paths relative to the test root)
 DOUBLES = {
@@ -441,6 +463,98 @@ def main():
         rc, out, _ = run_install(root, ["--rollback", "--no-reboot"])
         check(f"{tag}: rollback as before", rc == 0 and "GL:" not in out
               and not os.path.exists(os.path.join(root, "Library/Extensions/UniqVGPU.kext")), out)
+
+    # ================================================================ static desktop picture
+    wpd = os.path.join(src, "wp")
+    write(os.path.join(wpd, "uniqvgpu-wallpaper.sh"), FAKE_WP_TOOL, 0o644)
+    write(os.path.join(wpd, "uniqvgpu-wallpaper-set.js"), FAKE_WP_SETTER, 0o644)
+    WPARGS = ["--wallpaper-tool", wpd]
+    print("[mkbundle: --wallpaper-tool -> wallpaper block + wallpaper/ files in SHA256SUMS]")
+    bw = os.path.join(tmp, "b-wp")
+    rc, out = mkb(MKBUNDLE, bw, *base, "--kext", ktar, "--kext-sha", ksha, *GLARGS, *WPARGS, "--wallpaper-origin", "o")
+    mw = json.load(open(os.path.join(bw, "uniq-vgpu-bundle.json"))) if rc == 0 else {}
+    check("wp mkbundle rc 0", rc == 0, out)
+    check("wp manifest block exact (default static picture)", mw.get("wallpaper") == {
+        "tool": "wallpaper/uniqvgpu-wallpaper.sh", "setter": "wallpaper/uniqvgpu-wallpaper-set.js",
+        "picture": PIC, "origin": "o"}, mw)
+    sw = sums(bw) if rc == 0 else {}
+    check("wp tool + setter in SHA256SUMS, verbatim, tool executable",
+          rc == 0 and {"./wallpaper/uniqvgpu-wallpaper.sh", "./wallpaper/uniqvgpu-wallpaper-set.js"} <= set(sw)
+          and set(sw) == files_of(bw)
+          and open(os.path.join(bw, "wallpaper/uniqvgpu-wallpaper.sh")).read() == FAKE_WP_TOOL
+          and os.stat(os.path.join(bw, "wallpaper/uniqvgpu-wallpaper.sh")).st_mode & 0o111, sw)
+    rc, out = mkb(MKBUNDLE, os.path.join(tmp, "b-wppic"), *base, *WPARGS, "--wallpaper-picture", "/x/y.png")
+    check("--wallpaper-picture recorded",
+          rc == 0 and json.load(open(os.path.join(tmp, "b-wppic", "uniq-vgpu-bundle.json")))["wallpaper"]["picture"] == "/x/y.png", out)
+    rc, out = mkb(MKBUNDLE, os.path.join(tmp, "b-wpnotool"), *base, "--wallpaper-picture", "/x/y.png")
+    check("--wallpaper-picture without --wallpaper-tool refused", rc != 0, out)
+    rc, out = mkb(MKBUNDLE, os.path.join(tmp, "b-wpbad"), *base, "--wallpaper-tool", src)
+    check("--wallpaper-tool dir without the tool refused", rc != 0 and "has no uniqvgpu-wallpaper" in out, out)
+    rc, out = mkb(MKBUNDLE, os.path.join(tmp, "b-wpguest"), "--name", "n", "--version", "1", *WPARGS)
+    check("wallpaper-only guest bundle needs no envelope", rc == 0, out)
+    check("gl bundle without --wallpaper-tool has no wallpaper block", "wallpaper" not in m1, m1)
+
+    print("[guest-install: wallpaper step]")
+    fx_wp = os.path.join(tmp, "fx-wp")
+    r3, o3 = mkb(FIX_MKBUNDLE, fx_wp, "--name", "n", "--version", "1", "--envelope", "e", "--kext", ktar,
+                 "--kext-sha", ksha, "--kext-uuid", KUUID, "--kext-build", "25C56", *GLARGS, *WPARGS)
+    check("wp fixture built", r3 == 0, o3)
+    root = make_root(tmp, "wpdry")
+    rc, out, calls = run_install(root, [fx_wp, "--dry-run"])
+    check("wp dry-run passes the wallpaper STOP-IF and makes no change",
+          rc == 0 and "wallpaper tool + setter match SHA256SUMS" in out and f"would run: bash wallpaper/uniqvgpu-wallpaper.sh apply '{PIC}'" in out
+          and "wp " not in calls, out + calls)
+    fx_wpbad = os.path.join(tmp, "fx-wpbad")
+    shutil.copytree(fx_wp, fx_wpbad, symlinks=True)
+    with open(os.path.join(fx_wpbad, "wallpaper", "uniqvgpu-wallpaper.sh"), "a") as f:
+        f.write("# tampered\n")
+    rc, out, calls = run_install(root, [fx_wpbad, "--dry-run"])
+    check("wp tool not matching SHA256SUMS -> STOP-IF (rc 2)",
+          rc == 2 and "STOP-IF: wallpaper/uniqvgpu-wallpaper.sh sha256" in out, out)
+    rc, out, calls = run_install(root, [fx_wpbad, "--no-reboot", "--yes"])
+    check("wp tampered tool stops BEFORE any change (no kext, no GL, no wp call)",
+          rc == 2 and "kmutil create" not in calls and "glinst" not in calls and "wp " not in calls
+          and not os.path.exists(os.path.join(root, "Library/Extensions/UniqVGPU.kext")), out + calls)
+    rc, out, _ = run_install(root, [fx_wp, "--dry-run", "--force-build"], no_python=True)
+    check("wp block unreadable without python3 -> STOP-IF, not a silent skip",
+          rc == 2 and ("STOP-IF: manifest gl block lacks" in out or "STOP-IF: manifest wallpaper block lacks" in out), out)
+
+    root = make_root(tmp, "wp")
+    rc, out, calls = run_install(root, [fx_wp, "--no-reboot", "--yes"])
+    seq = [" ".join(l.split()[:2]) for l in calls.splitlines()]
+    check("wp install rc 0 + OK line", rc == 0 and "OK  wallpaper: static picture set" in out, out)
+    check("wp tool called with apply <picture> from the bundle",
+          f"wp apply {PIC}" in calls.splitlines(), calls)
+    check("wp step runs AFTER the GL install",
+          "wp apply" in seq and "glinst install" in seq and seq.index("wp apply") > seq.index("glinst install"), seq)
+    st = open(os.path.join(root, state_rel)).read() if os.path.exists(os.path.join(root, state_rel)) else ""
+    check("rollback state records WALLPAPER_MANAGED=1", "WALLPAPER_MANAGED=1" in st, st)
+    rc, out, calls = run_install(root, ["--rollback", "--no-reboot"])
+    check("rollback runs the installed tool's revert, then the kext rollback",
+          rc == 0 and "wp revert" in calls and "OK  wallpaper: prior desktop pictures restored" in out
+          and not os.path.exists(os.path.join(root, "Library/Application Support/UniqVGPU/wallpaper"))
+          and not os.path.exists(os.path.join(root, "Library/Extensions/UniqVGPU.kext")), out)
+
+    root = make_root(tmp, "wpopt")
+    rc, out, calls = run_install(root, [fx_wp, "--no-reboot", "--yes", "--no-wallpaper"])
+    st = open(os.path.join(root, state_rel)).read() if os.path.exists(os.path.join(root, state_rel)) else ""
+    check("--no-wallpaper: kext + GL installed, no wp call, no wallpaper state",
+          rc == 0 and "wallpaper" in out and "SKIPPED" in out and "wp " not in calls and "WALLPAPER" not in st
+          and os.path.lexists(os.path.join(root, GLLINK)), out + calls)
+    rc, out, calls = run_install(root, ["--rollback", "--no-reboot"])
+    check("--no-wallpaper: rollback makes no wp call", rc == 0 and "wp " not in calls, out + calls)
+
+    root = make_root(tmp, "wpfail")
+    rc, out, calls = run_install(root, [fx_wp, "--yes"], extra_env={"FAKE_WP_FAIL": "1"})
+    st = open(os.path.join(root, state_rel)).read() if os.path.exists(os.path.join(root, state_rel)) else ""
+    check("wp failure is a WARN: rc 0, kext + GL installed, reboot proceeds, state lets --rollback revert",
+          rc == 0 and "WARN wallpaper step rc=1" in out and "REBOOT" in calls and "WALLPAPER_MANAGED=1" in st
+          and os.path.lexists(os.path.join(root, GLLINK)), out + calls)
+
+    root = make_root(tmp, "wpnone")
+    rc, out, calls = run_install(root, [fx_gl, "--no-reboot", "--yes"])
+    check("bundle without a wallpaper block: no wp call, no wallpaper output",
+          rc == 0 and "wp " not in calls and "wallpaper" not in out, out + calls)
 
     shutil.rmtree(tmp, ignore_errors=True)
     print()

@@ -13,6 +13,7 @@
 #   sudo uniq-vgpu-guest-install <KEXT> --dry-run          STOP-IF checks only, no change
 #   sudo uniq-vgpu-guest-install --rollback               restore the prior kext + rebuild AuxKC
 #   sudo uniq-vgpu-guest-install <BUNDLE-DIR> --no-gl     kext only: skip the bundle's GL step
+#   sudo uniq-vgpu-guest-install <BUNDLE-DIR> --no-wallpaper   keep the guest's desktop picture
 #
 # <KEXT> is a .kext directory, a .tar of one, OR a `uniq-vgpu` bundle directory
 # (the manifest's kext block supplies id / expected sha / uuid / validated builds).
@@ -27,6 +28,18 @@
 # AppleVirglGL is retired). The kext publishes IOGLBundleName only when that path
 # is a directory at accelerator start, hence the same reboot. --rollback also puts
 # the prior GL layout back. A manifest without "gl" installs the kext only.
+#
+# Static desktop picture (DEFAULT when the manifest has a "wallpaper" block,
+# uniq-vgpu-mkbundle --wallpaper-tool; user decision 2026-11-21): the default
+# animated aerial wallpaper decodes HEVC video in software in the guest (no video
+# decoder), costing host CPU on every frame. After the GL step the installer runs
+# the bundle's wallpaper/uniqvgpu-wallpaper.sh (apple-virgl tools/guest, checked
+# against SHA256SUMS before any change) `apply <picture>`: a stock static picture
+# for every logged-in user now (NSWorkspace in the user's session; the login
+# window shows the user's exported picture) and, through its login agent, for every
+# other or later user at the next login (once per user). A wallpaper failure is a
+# WARN (kext/GL stay installed). --rollback runs the tool's `revert` (each user's
+# prior wallpaper store back). --no-wallpaper skips the step.
 #
 # It performs EXACTLY the sequence validated end-to-end on a 25G342 clone
 # (evidence/runs/pvg-warmswap-25g342-*): verify binary sha+uuid -> back up any
@@ -59,6 +72,8 @@ GL_LINK_DIR="$ROOT"/Library/GPUBundles
 GL_REAL="$GL_REAL_DIR/$GL_NAME.bundle"
 GL_LINK="$GL_LINK_DIR/$GL_NAME.bundle"
 GL_OLD_NAMES="AppleVirglGL"   # former name; retired by the installer if still present
+# static desktop picture tool, installed copy (apple-virgl tools/guest/uniqvgpu-wallpaper.sh apply copies itself here)
+WP_SUPPORT="$ROOT/Library/Application Support/UniqVGPU/wallpaper/uniqvgpu-wallpaper.sh"
 
 say()  { echo "guest-install: $*"; }
 stop() { echo "guest-install: STOP-IF: $*" >&2; exit 2; }
@@ -94,7 +109,7 @@ gl_snapshot() { # TAG PATH
 
 # ------------------------------------------------------------------ args
 SRC=""
-DO_ROLLBACK=0; DRY_RUN=0; NO_REBOOT=0; ASSUME_YES=0; FORCE_BUILD=0; NO_GL=0
+DO_ROLLBACK=0; DRY_RUN=0; NO_REBOOT=0; ASSUME_YES=0; FORCE_BUILD=0; NO_GL=0; NO_WP=0
 EXPECT_SHA=""; EXPECT_UUID=""; KEXT_ID="$KEXT_ID_DEFAULT"; VALIDATED_BUILDS=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -107,7 +122,8 @@ while [ $# -gt 0 ]; do
     --expect-uuid) EXPECT_UUID="$2"; shift ;;
     --id)          KEXT_ID="$2"; shift ;;
     --no-gl)       NO_GL=1 ;;
-    -h|--help)     sed -n '3,38p' "$0"; exit 0 ;;
+    --no-wallpaper) NO_WP=1 ;;
+    -h|--help)     sed -n '3,52p' "$0"; exit 0 ;;
     -*)            stop "unknown option: $1" ;;
     *)             SRC="$1" ;;
   esac
@@ -140,6 +156,15 @@ if [ "$DO_ROLLBACK" = "1" ]; then
     gl_restore "$GL_REAL" "${GL_PRIOR_REAL_KIND:-}" "${GL_PRIOR_REAL_TARGET:-}" "${GL_PRIOR_REAL_BACKUP:-}"
     gl_restore "$GL_LINK" "${GL_PRIOR_LINK_KIND:-}" "${GL_PRIOR_LINK_TARGET:-}" "${GL_PRIOR_LINK_BACKUP:-}"
     [ -n "${GL_RETIRED:-}" ] && say "  GL: former $GL_RETIRED stays retired in /var/db/uniqvgpu-retired (the kext publishes only $GL_NAME)"
+  fi
+  # 1c) the static desktop picture, only if this install applied it: the installed tool restores every user's prior store
+  if [ "${WALLPAPER_MANAGED:-0}" = "1" ]; then
+    if [ -f "$WP_SUPPORT" ]; then
+      WOUT="$("$ROOT"/bin/bash "$WP_SUPPORT" revert 2>&1)"; WRC=$?
+      printf '%s\n' "$WOUT" | sed 's/^/    wp| /'
+      if [ "$WRC" -eq 0 ] && printf '%s\n' "$WOUT" | grep -q '^WALLPAPER_REVERT_OK'; then ok "wallpaper: prior desktop pictures restored"
+      else say "  WARN wallpaper revert rc=$WRC (see wp| lines); kext rollback continues"; fi
+    else say "  wallpaper: tool already removed ($WP_SUPPORT absent): nothing to revert"; fi
   fi
   # 2) restore the AuxKC. Preferred: put back the exact pre-install collection file
   # (byte-for-byte PRE==POST). This also correctly handles "no aux kexts remain",
@@ -182,7 +207,7 @@ trap cleanup EXIT
 
 # -- resolve the .kext bundle + expected metadata (bundle manifest / .tar / dir)
 KEXTDIR=""
-GL_PRESENT=0; GL_DO=0
+GL_PRESENT=0; GL_DO=0; WP_PRESENT=0; WP_DO=0
 if [ -d "$SRC" ] && [ -f "$SRC/uniq-vgpu-bundle.json" ]; then
   say "reading uniq-vgpu bundle manifest"
   MF="$SRC/uniq-vgpu-bundle.json"
@@ -208,6 +233,12 @@ PY
     GL_PRESENT=1
     GL_MNAME="$(read_json name gl)";      GL_SHA="$(read_json binary_sha256 gl)"
     GL_TAR_REL="$(read_json bundle gl)";  GL_INST_REL="$(read_json installer gl)"
+  fi
+  # the static desktop picture block (same fail-closed detection)
+  if grep -q '"wallpaper"[[:space:]]*:' "$MF"; then
+    WP_PRESENT=1
+    WP_TOOL_REL="$(read_json tool wallpaper)"; WP_SETTER_REL="$(read_json setter wallpaper)"
+    WP_PIC="$(read_json picture wallpaper)"
   fi
 else
   KEXTDIR="$SRC"
@@ -327,6 +358,28 @@ elif [ "$GL_PRESENT" = "1" ]; then
   GL_DO=1
 fi
 
+# -- STOP-IF 7: the static desktop picture tool (manifest "wallpaper" block), checked before ANY change
+if [ "$WP_PRESENT" = "1" ] && [ "$NO_WP" = "1" ]; then
+  say "wallpaper: the bundle ships the static-picture step but --no-wallpaper was given -> SKIPPED"
+elif [ "$WP_PRESENT" = "1" ]; then
+  [ -n "$WP_TOOL_REL" ] && [ -n "$WP_SETTER_REL" ] && [ -n "$WP_PIC" ] \
+    || stop "manifest wallpaper block lacks tool/setter/picture (or python3 cannot read it); --no-wallpaper skips it"
+  [ -f "$SRC/$WP_TOOL_REL" ]   || stop "wallpaper tool missing: $SRC/$WP_TOOL_REL"
+  [ -f "$SRC/$WP_SETTER_REL" ] || stop "wallpaper setter missing: $SRC/$WP_SETTER_REL"
+  if [ -f "$SRC/SHA256SUMS" ]; then
+    for _rel in "$WP_TOOL_REL" "$WP_SETTER_REL"; do
+      _want="$(awk -v p="./$_rel" '$2 == p {print $1}' "$SRC/SHA256SUMS")"
+      _got="$("$ROOT"/usr/bin/shasum -a 256 "$SRC/$_rel" | awk '{print $1}')"
+      [ -n "$_want" ] || stop "SHA256SUMS has no entry for ./$_rel"
+      [ "$_got" = "$_want" ] || stop "$_rel sha256 $_got != SHA256SUMS $_want"
+    done
+    ok "wallpaper tool + setter match SHA256SUMS (picture $WP_PIC)"
+  else
+    say "  (bundle has no SHA256SUMS: wallpaper tool not sum-checked)"
+  fi
+  WP_DO=1
+fi
+
 if [ "$DRY_RUN" = "1" ]; then
   say "DRY-RUN: pre-install STOP-IF checks passed (id, sha, uuid, build, SIP); no changes made."
   if [ "$GL_DO" = "1" ]; then
@@ -336,6 +389,7 @@ if [ "$DRY_RUN" = "1" ]; then
     elif [ -d "$GL_LINK" ]; then say "  current GL: $GL_LINK (a real directory)"
     else say "  current GL: $GL_LINK absent"; fi
   fi
+  [ "$WP_DO" = "1" ] && say "  wallpaper: after the GL step it would run: bash $WP_TOOL_REL apply '$WP_PIC'"
   say "  (external-symbol resolution is checked during the real install -- kmutil libraries"
   say "   needs the kext installed root:wheel under /Library/Extensions; it is fail-closed +"
   say "   reversible: an unresolved symbol aborts before the AuxKC rebuild, undo with --rollback)"
@@ -453,6 +507,20 @@ if [ "$GL_DO" = "1" ]; then
     fi
   done
   say "GL: the kext publishes IOGLBundleName $GL_NAME only if $GL_LINK is a directory at accelerator start -> needs the reboot"
+fi
+
+# -- 7) the static desktop picture (manifest "wallpaper" block): after the GL step; a failure is a WARN, not a STOP
+if [ "$WP_DO" = "1" ]; then
+  say "wallpaper: bash $WP_TOOL_REL apply '$WP_PIC'"
+  WOUT="$("$ROOT"/bin/bash "$SRC/$WP_TOOL_REL" apply "$WP_PIC" 2>&1)"; WRC=$?
+  printf '%s\n' "$WOUT" | sed 's/^/    wp| /'
+  # the tool installed itself (agent, backups) -> --rollback reverts it, also after a partial failure
+  [ -f "$WP_SUPPORT" ] && echo "WALLPAPER_MANAGED=1" >> "$ROLLBACK_STATE"
+  if [ "$WRC" -eq 0 ] && printf '%s\n' "$WOUT" | grep -q '^WALLPAPER_APPLY_OK'; then
+    ok "wallpaper: static picture set for logged-in users; others get it at their next login"
+  else
+    say "  WARN wallpaper step rc=$WRC (see wp| lines); kext + GL are installed; retry: sudo bash $SRC/$WP_TOOL_REL apply"
+  fi
 fi
 
 say "INSTALL COMPLETE. Rollback anytime: sudo uniq-vgpu-guest-install --rollback"

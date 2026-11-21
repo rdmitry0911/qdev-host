@@ -11,6 +11,7 @@ compares against the running resident.
       [--kind host-backend] [--backing PATH.so]
       [--kext KEXT [--kext-manifest OLD.json] ...]
       [--gl-bundle UniqVGPUGL.bundle --gl-sha SHA --gl-installer install-gpu-bundle.sh]
+      [--wallpaper-tool DIR [--wallpaper-picture PATH]]
 
 A GUEST-ONLY bundle (no --envelope, no --backing: a kext and/or the GL bundle)
 carries no envelope/kind; only `uniq-vgpu-guest-install` consumes it.
@@ -19,6 +20,12 @@ The optional guest GL bundle (UniqVGPUGL.bundle, H-SANDBOX-GPUBUNDLES option A)
 is shipped as gl/UniqVGPUGL.bundle.tar + gl/install-gpu-bundle.sh (the apple-virgl
 tools/guest/install-gpu-bundle.sh, verbatim); the guest installer runs it after
 the kext/AuxKC steps.
+
+The optional static desktop picture step (--wallpaper-tool: the apple-virgl tools/guest
+directory with uniqvgpu-wallpaper.sh + uniqvgpu-wallpaper-set.js, copied verbatim to
+wallpaper/) is run by the guest installer after the GL step, by default (its
+--no-wallpaper skips it): the aerial wallpaper decodes HEVC video in software in a
+guest without a video decoder.
 
 Example (VT host-backend warm bundle from increment 1's backing):
   uniq-vgpu-mkbundle /tmp/vt-hevc --name vt-hevc --version 0.3-warmswapB \
@@ -32,6 +39,11 @@ GL_NAME = "UniqVGPUGL"                      # the only name the kext publishes (
 GL_EXE = f"{GL_NAME}.bundle/Contents/MacOS/{GL_NAME}"
 GL_TAR = f"gl/{GL_NAME}.bundle.tar"
 GL_INSTALLER = "gl/install-gpu-bundle.sh"
+WP_TOOL_NAME = "uniqvgpu-wallpaper.sh"
+WP_SETTER_NAME = "uniqvgpu-wallpaper-set.js"
+WP_TOOL = f"wallpaper/{WP_TOOL_NAME}"
+WP_SETTER = f"wallpaper/{WP_SETTER_NAME}"
+WP_PICTURE_DEFAULT = "/System/Library/Desktop Pictures/iMac Blue.heic"   # stock, static (no dynamic metadata)
 
 
 def sha256_file(path):
@@ -120,6 +132,11 @@ def main():
     ap.add_argument("--gl-installer", help="install-gpu-bundle.sh (apple-virgl tools/guest; "
                                            "required with --gl-bundle)")
     ap.add_argument("--gl-origin", help="free-text provenance of the GL bundle (recorded in the manifest)")
+    ap.add_argument("--wallpaper-tool", help="directory with uniqvgpu-wallpaper.sh + uniqvgpu-wallpaper-set.js "
+                                             "(apple-virgl tools/guest): the guest installer sets a static desktop "
+                                             "picture by default")
+    ap.add_argument("--wallpaper-picture", help=f"picture for --wallpaper-tool (default {WP_PICTURE_DEFAULT!r})")
+    ap.add_argument("--wallpaper-origin", help="free-text provenance of the wallpaper tool (recorded in the manifest)")
     ap.add_argument("--extra", action="append", default=[],
                     help="extra file to include as RELPATH=SRCPATH (repeatable)")
     a = ap.parse_args()
@@ -131,11 +148,17 @@ def main():
             ap.error(f"--gl-installer not a file: {a.gl_installer}")
     elif a.gl_sha or a.gl_installer or a.gl_origin:
         ap.error("--gl-sha/--gl-installer/--gl-origin need --gl-bundle")
+    if a.wallpaper_tool:
+        for fn in (WP_TOOL_NAME, WP_SETTER_NAME):
+            if not os.path.isfile(os.path.join(a.wallpaper_tool, fn)):
+                ap.error(f"--wallpaper-tool has no {fn}: {a.wallpaper_tool}")
+    elif a.wallpaper_picture or a.wallpaper_origin:
+        ap.error("--wallpaper-picture/--wallpaper-origin need --wallpaper-tool")
     if a.kext_manifest and not a.kext:
         ap.error("--kext-manifest needs --kext")
-    if not a.envelope and (a.backing or not (a.kext or a.gl_bundle)):
-        ap.error("--envelope is required (only a guest-only bundle: --kext/--gl-bundle without "
-                 "--backing, may omit it)")
+    if not a.envelope and (a.backing or not (a.kext or a.gl_bundle or a.wallpaper_tool)):
+        ap.error("--envelope is required (only a guest-only bundle: --kext/--gl-bundle/--wallpaper-tool "
+                 "without --backing, may omit it)")
 
     out = os.path.abspath(a.outdir)
     os.makedirs(out, exist_ok=True)
@@ -195,6 +218,17 @@ def main():
             gmeta["origin"] = a.gl_origin
         manifest["gl"] = gmeta
 
+    if a.wallpaper_tool:
+        os.makedirs(os.path.join(out, "wallpaper"), exist_ok=True)
+        shutil.copyfile(os.path.join(a.wallpaper_tool, WP_TOOL_NAME), os.path.join(out, WP_TOOL))
+        shutil.copyfile(os.path.join(a.wallpaper_tool, WP_SETTER_NAME), os.path.join(out, WP_SETTER))
+        os.chmod(os.path.join(out, WP_TOOL), 0o755)
+        os.chmod(os.path.join(out, WP_SETTER), 0o644)
+        wmeta = {"tool": WP_TOOL, "setter": WP_SETTER, "picture": a.wallpaper_picture or WP_PICTURE_DEFAULT}
+        if a.wallpaper_origin:
+            wmeta["origin"] = a.wallpaper_origin
+        manifest["wallpaper"] = wmeta
+
     for spec in a.extra:
         rel, _, src = spec.partition("=")
         if not src:
@@ -231,6 +265,8 @@ def main():
     if a.gl_bundle:
         print(f"  gl={manifest['gl']['bundle']} installer={manifest['gl']['installer']} "
               f"sha={manifest['gl']['binary_sha256']}")
+    if a.wallpaper_tool:
+        print(f"  wallpaper={manifest['wallpaper']['tool']} picture={manifest['wallpaper']['picture']!r}")
     print(f"  {len(lines)} file(s) in SHA256SUMS")
 
 
