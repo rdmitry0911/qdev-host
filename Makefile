@@ -139,6 +139,19 @@ uniq-vgpu-selftest: plugins/uniq-vgpu/uniq-vgpu.so plugins/uniq-vgpu/selftest
 	plugins/uniq-vgpu/selftest plugins/uniq-vgpu/uniq-vgpu.so
 	plugins/uniq-vgpu/selftest plugins/uniq-vgpu/uniq-vgpu.so --personality 0xeee1
 
+# Native unit test of the process-VM provider and the ordinary physical capture
+# (production pvg-process-vm.c / pvg-memory.c / pvg-dmabuf.c; no VM, GPU or
+# libmlapi; QMetal headers only): descriptor ownership per mapped range
+# (PVM-RANGE-NOHANDLE-01), data identity, pin across the client's unregister.
+PVM_TEST_SRC := $(addprefix plugins/uniq-vgpu/,pvg_process_vm_test.c pvg-process-vm.c pvg-memory.c pvg-dmabuf.c)
+plugins/uniq-vgpu/pvg_process_vm_test: $(PVM_TEST_SRC) $(UNIQ_VGPU_HDR) qdp.h $(VFU_DEP)
+	@test -n "$(QMETAL_INCLUDE)" || { echo "pvg_process_vm_test needs QMETAL_INCLUDE" >&2; exit 1; }
+	$(CC) $(CFLAGS) -pthread -I. -Iplugins/uniq-vgpu -I$(QMETAL_INCLUDE) $(VFU_CFLAGS) $(GLIB_ONLY_CFLAGS) \
+	    -o $@ $(PVM_TEST_SRC) $(GLIB_ONLY_LIBS)
+
+uniq-vgpu-pvm-test: plugins/uniq-vgpu/pvg_process_vm_test
+	plugins/uniq-vgpu/pvg_process_vm_test
+
 # apple-videotoolbox: the multi-source codec device + libva backend. Explicit
 # rule (overrides the generic plugins/%.so single-source rule).
 $(VT_DIR)/apple-videotoolbox.so: $(VT_SRC) $(VT_HDR) qdp.h $(VFU_DEP)
@@ -159,7 +172,7 @@ install: all
 	install -D -m 644 plugins/tb-vga/edid-1280x800.bin $(DESTDIR)$(PREFIX)/share/qdev-host/edid-1280x800.bin
 
 clean:
-	rm -f qdev-host plugins/*/*.so pve/libqdev-vugpu-guard.so plugins/uniq-vgpu/selftest tools/display1-input-bench tools/display1-uiinfo-test tools/vfu-test-client dbus/dbus-display1.c dbus/dbus-display1.h
+	rm -f qdev-host plugins/*/*.so pve/libqdev-vugpu-guard.so plugins/uniq-vgpu/selftest plugins/uniq-vgpu/pvg_process_vm_test tools/display1-input-bench tools/display1-uiinfo-test tools/vfu-test-client dbus/dbus-display1.c dbus/dbus-display1.h
 	rm -rf $(VT_DIR)/build
 
 distclean: clean
@@ -167,4 +180,4 @@ distclean: clean
 
 PREFIX ?= /usr/local
 comma := ,
-.PHONY: all clean distclean install vfu uniq-vgpu-selftest ui-info-reply-test qemu-audio-p2p-test
+.PHONY: all clean distclean install vfu uniq-vgpu-selftest uniq-vgpu-pvm-test ui-info-reply-test qemu-audio-p2p-test

@@ -48,7 +48,11 @@ DMA region itself from a dup of its fd, so a mapping QMetal holds stays valid
 after the client unmaps it (the fork's MemoryRegion reference). Targets that
 are not fd-backed RAM fail and are logged as `[uniq-vgpu-ml][memory][ERROR]`;
 there is no message-DMA fallback. udmabuf exports (`/dev/udmabuf`) are built
-over the same memfds.
+over the same memfds. Process-VM task remaps and ordinary-capture pieces borrow
+that one region fd under a region reference (as the reference's mach_vm_remap,
+no descriptor per mapped range): the plugin holds one fd per DMA region plus one
+per live udmabuf export, however many guest pages are mapped
+(`make QMETAL_INCLUDE=... uniq-vgpu-pvm-test`, no GPU needed).
 
 Threads: MMIO runs on the host's vfio-user thread; `agfx-main` runs what the
 fork ran in QEMU main-loop BHs (display completions, frame chain, mode, cursor),

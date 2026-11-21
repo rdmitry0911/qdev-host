@@ -12,6 +12,16 @@
  * native EEEE factory's source-backing/dma-buf capability tables, which the
  * production realize never installs.
  *
+ * Deviation from the fork (D-QDEV-MEMFD-FD-GROWTH, contract PVM-RANGE-NOHANDLE-01):
+ * the fork dup'ed the RAM block fd for every remap alias and every capture piece
+ * (to survive RAM block/fd table changes). A PvgRegion's fd is already the
+ * plugin's own dup, set once at dma_register and closed only by the last
+ * pvg_region_unref, and every alias/piece holds a region reference; so a backing
+ * borrows region->fd. As the reference (PGMemoryMap -mapMemoryAtVirtualAddress:/
+ * -newRangeMapping: -> mach_vm_remap, no per-range handle), a mapped range owns
+ * its mapping and a region pin, not a descriptor: one guest page per range gave
+ * one fd per page (~100k fds under GPU work).
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "pvg-process-vm.h"
@@ -22,13 +32,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-/* Identity captured at admitted remap; the dup'ed fd survives the client's
- * unmap, the region reference pins the mapping and the table identity. */
+/* Identity captured at admitted remap. The region reference pins the region
+ * (its mapping, its fd and the table identity) across the client's unmap; fd is
+ * BORROWED from that region (region->fd, never closed here). */
 typedef struct AgfxEeeePhysicalBacking {
     int references;
     PvgState *state;
     PvgRegion *region;
-    int fd;
+    int fd;                 /* borrowed region->fd */
     uint64_t file_offset;
 } AgfxEeeePhysicalBacking;
 
@@ -134,10 +145,7 @@ static void agfx_eeee_physical_backing_unref(AgfxEeeePhysicalBacking *backing)
     region = backing->region;
     state = backing->state;
     if (pvg_atomic_fetch_dec(&backing->references) == 1) {
-        if (backing->fd >= 0) {
-            close(backing->fd);
-        }
-        g_free(backing);
+        g_free(backing);   /* fd is the region's: its last unref closes it */
     }
     if (region) {
         pvg_region_unref(state, region);
@@ -522,7 +530,6 @@ static int agfx_eeee_task_remap_shared_fixed_overwrite(
     AgfxEeeeAllocation *allocation;
     AgfxEeeeAlias *alias;
     AgfxEeeePhysicalBacking *backing;
-    int saved_fd;
     const uint64_t page_size = pvg_page_size();
 
     if (!address || !current_protection || !maximum_protection ||
@@ -556,19 +563,15 @@ static int agfx_eeee_task_remap_shared_fixed_overwrite(
                        "region not referenced by the task", 0);
         return 0;
     }
-    saved_fd = fcntl(region->fd, F_DUPFD_CLOEXEC, 0);
-    if (saved_fd < 0) {
-        PVM_REMAP_FAIL("dup fd", errno);
-        return 0;
-    }
+    /* The task's region reference (checked above) keeps region->fd open; the
+     * alias takes its own region pin below and borrows that fd. */
     mapped = mmap((void *)(uintptr_t)*address, length, PROT_READ | PROT_WRITE,
-                  MAP_SHARED | MAP_FIXED, saved_fd, (off_t)(file_offset + region_offset));
+                  MAP_SHARED | MAP_FIXED, region->fd, (off_t)(file_offset + region_offset));
     if (mapped == MAP_FAILED || mapped != (void *)(uintptr_t)*address) {
         PVM_REMAP_FAIL(mapped == MAP_FAILED ? "mmap" : "mmap moved", mapped == MAP_FAILED ? errno : 0);
         if (mapped != MAP_FAILED) {
             munmap(mapped, length);
         }
-        close(saved_fd);
         return 0;
     }
     /* Keep the exact RAM owner across the provider's earlier region_unref. */
@@ -578,7 +581,7 @@ static int agfx_eeee_task_remap_shared_fixed_overwrite(
         .references = 1,
         .state = s,
         .region = region,
-        .fd = saved_fd,
+        .fd = region->fd,
         .file_offset = file_offset,
     };
     agfx_eeee_remove_overwritten_aliases(state, allocation, *address, length);
@@ -1249,10 +1252,7 @@ static void agfx_ordinary_physical_capture(void *opaque,
         g_array_append_val(source->pieces, saved);
         pvg_region_ref(s, region);
         backing->region = region;
-        backing->fd = fcntl(region->fd, F_DUPFD_CLOEXEC, 0);
-        if (backing->fd < 0) {
-            goto partial;
-        }
+        backing->fd = region->fd;   /* borrowed: pinned by the reference above */
     }
     pvg_memory_read_leave(s);
     if (agfx_source_backing_map_pieces(source, request->allocation_alignment)) {
