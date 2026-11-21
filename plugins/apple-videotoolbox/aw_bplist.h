@@ -55,6 +55,13 @@ size_t aw_bplist_finalize(aw_bplist *b, int root, uint8_t *out, size_t cap);
  * through CFPropertyListCreateWithData, which is unavailable off a Mac. */
 int aw_bplist_check(const uint8_t *buf, size_t len);
 
+/* Read a bplist00 whose TOP object is a string (ASCII 0x5N, or UTF-16BE 0x6N
+ * with only ASCII code points) into out[cap] (NUL-terminated). Returns the
+ * string length, or <0 if the buffer is not such a plist or out is too small.
+ * Used for the guest's dcop ,key (VTParavirtualizationMessageAppendCFPropertyList
+ * of a CFString). */
+int aw_bplist_read_string(const uint8_t *buf, size_t len, char *out, size_t cap);
+
 #ifdef __cplusplus
 }
 #endif

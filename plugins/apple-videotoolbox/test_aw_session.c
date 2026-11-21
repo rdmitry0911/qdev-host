@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 /*
  * test_aw_session.c - unit tests for the Apple-wire session engine (aw_session),
  * with a MOCK backend: no libva, no GPU, no guest. Proves H5 routing + statuses
@@ -366,6 +367,64 @@ static void test_parked_frames(void) {
     aw_engine_destroy(e);
 }
 
+/* AW-PROP-01..05: dsup lists UsingHardwareAcceleratedVideoDecoder; dcop of it
+ * answers true (bplist), other properties -12900 without ,val, a non-string
+ * ,key is refused without a reply (reference: guest dcop/dsup handlers,
+ * vt_callers2.c L4188-4200/L4509-4519; Apple host decoder measurements). */
+static size_t build_dcop(uint8_t *m, const uint8_t *uuid, const char *key) {
+    uint8_t pls[128]; size_t pl = 0;
+    aw_bplist *b = aw_bplist_new();
+    int r = aw_bpl_string(b, key);
+    pl = aw_bplist_finalize(b, r, pls, sizeof pls);
+    aw_bplist_free(b);
+    aw_builder bb; aw_builder_init(&bb, m, 512);
+    aw_build_header(&bb, AW_MSG_DCOP, AW_FLAG_GUEST_REQ, uuid, 77);
+    aw_put_bytes(&bb, AW_KEY_KEY, AW_VT_PLS, pls, pl);
+    return aw_build_finalize(&bb);
+}
+static void test_properties(void) {
+    printf("-- dsup / dcop: UsingHardwareAcceleratedVideoDecoder --\n");
+    aw_engine *e = mk(); uint8_t m[512]; aw_msg_view v;
+    uint8_t uuid[16]; memset(uuid, 0x5a, 16);
+    const uint8_t *p; size_t pl; int32_t err = 1; char str[64];
+    aw_engine_deliver(e, m, msg0(m, AW_MSG_PDEC, AW_FLAG_GUEST_REQ, uuid));
+    /* read_string round trip: short and >15-char strings */
+    {
+        uint8_t pls[128]; aw_bplist *b = aw_bplist_new();
+        size_t n = aw_bplist_finalize(b, aw_bpl_string(b, "RealTime"), pls, sizeof pls); aw_bplist_free(b);
+        CHECK(aw_bplist_read_string(pls, n, str, sizeof str) == 8 && !strcmp(str, "RealTime"), "read_string short");
+        b = aw_bplist_new();
+        n = aw_bplist_finalize(b, aw_bpl_string(b, "UsingHardwareAcceleratedVideoDecoder"), pls, sizeof pls); aw_bplist_free(b);
+        CHECK(aw_bplist_read_string(pls, n, str, sizeof str) == 36 && !strcmp(str, "UsingHardwareAcceleratedVideoDecoder"), "read_string long");
+        CHECK(aw_bplist_read_string(pls, n, str, 10) < 0, "read_string refuses a short buffer");
+    }
+    ereset();
+    CHECK(aw_engine_deliver(e, m, msg0(m, AW_MSG_DSUP, AW_FLAG_GUEST_REQ, uuid)) == AW_NOERR, "dsup status 0");
+    CHECK(g_ne == 1 && e_type(0, &v) == AW_PARSE_OK && v.type == AW_MSG_DSUP && v.flags == AW_FLAG_HOST_REPLY, "dsup reply");
+    CHECK(aw_get_s32(&v, AW_KEY_ERR, &err) == AW_PARSE_OK && err == 0, "dsup ,err 0");
+    CHECK(aw_get_bytes(&v, AW_KEY_SUP, AW_VT_PLS, &p, &pl) == AW_PARSE_OK && aw_bplist_check(p, pl) == 0 &&
+          memmem(p, pl, "UsingHardwareAcceleratedVideoDecoder", 36) != NULL, "dsup ,sup dict lists the property");
+    ereset();
+    CHECK(aw_engine_deliver(e, m, build_dcop(m, uuid, "UsingHardwareAcceleratedVideoDecoder")) == AW_NOERR, "dcop hw status 0");
+    CHECK(g_ne == 1 && e_type(0, &v) == AW_PARSE_OK && v.type == AW_MSG_DCOP && v.reply_id == 77, "dcop reply");
+    CHECK(aw_get_s32(&v, AW_KEY_ERR, &err) == AW_PARSE_OK && err == 0, "dcop hw ,err 0");
+    CHECK(aw_get_bytes(&v, AW_KEY_VAL, AW_VT_PLS, &p, &pl) == AW_PARSE_OK && pl == 8 + 1 + 1 + 32 &&
+          !memcmp(p, "bplist00", 8) && p[8] == 0x09, "dcop hw ,val = bplist true");
+    ereset();
+    aw_engine_deliver(e, m, build_dcop(m, uuid, "RealTime"));
+    CHECK(g_ne == 1 && e_type(0, &v) == AW_PARSE_OK && aw_get_s32(&v, AW_KEY_ERR, &err) == AW_PARSE_OK && err == -12900 &&
+          aw_get_bytes(&v, AW_KEY_VAL, AW_VT_PLS, &p, &pl) != AW_PARSE_OK, "dcop other: -12900 without ,val");
+    ereset();
+    {
+        aw_builder bb; aw_builder_init(&bb, m, 512);
+        aw_build_header(&bb, AW_MSG_DCOP, AW_FLAG_GUEST_REQ, uuid, 78);
+        aw_put_s32(&bb, AW_KEY_KEY, 5);
+        size_t n = aw_build_finalize(&bb);
+        CHECK(aw_engine_deliver(e, m, n) == AW_ERR_MALFORMED && g_ne == 0, "dcop non-string key refused, no reply");
+    }
+    aw_engine_destroy(e);
+}
+
 static void test_sbuf(void) {
     printf("-- sbuf (H3): sdat + native-scalar stia --\n");
     uint8_t buf[256];
@@ -403,6 +462,7 @@ int main(void) {
     test_session_open_close();
     test_decode_exchange();
     test_parked_frames();
+    test_properties();
     if (g_fail) { printf("FAILED: %d check(s)\n", g_fail); return 1; }
     printf("OK: all aw_session checks passed\n");
     return 0;

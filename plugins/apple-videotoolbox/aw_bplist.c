@@ -225,3 +225,43 @@ int aw_bplist_check(const uint8_t *buf, size_t len)
     if (top_nibble != 0xd && top_nibble != 0xa) return -1;
     return 0;
 }
+
+int aw_bplist_read_string(const uint8_t *buf, size_t len, char *out, size_t cap)
+{
+    if (!buf || !out || !cap || len < 8 + 32 || memcmp(buf, "bplist00", 8) != 0) return -1;
+    const uint8_t *tr = buf + len - 32;
+    int off_size = tr[6];
+    if (off_size < 1 || off_size > 8) return -1;
+    uint64_t nobj = 0, top = 0, table = 0;
+    for (int i = 0; i < 8; i++) {
+        nobj  = (nobj  << 8) | tr[8 + i];
+        top   = (top   << 8) | tr[16 + i];
+        table = (table << 8) | tr[24 + i];
+    }
+    if (nobj == 0 || top >= nobj || table >= len || table + nobj * (uint64_t)off_size + 32 != len) return -1;
+    uint64_t o = 0;
+    for (int k = 0; k < off_size; k++) o = (o << 8) | buf[table + top * off_size + k];
+    if (o < 8 || o >= table) return -1;
+    uint8_t m = buf[o], kind = m >> 4;
+    uint64_t n = m & 0xf, p = o + 1;
+    if (kind != 0x5 && kind != 0x6) return -1;
+    if (n == 0xf) {                         /* length follows as an int object */
+        if (p >= table || (buf[p] >> 4) != 0x1) return -1;
+        int ib = 1 << (buf[p] & 0xf);
+        if (ib > 8 || p + 1 + (uint64_t)ib > table) return -1;
+        n = 0;
+        for (int k = 0; k < ib; k++) n = (n << 8) | buf[p + 1 + k];
+        p += 1 + (uint64_t)ib;
+    }
+    uint64_t bytes = kind == 0x5 ? n : 2 * n;
+    if (p + bytes > table || n + 1 > cap) return -1;
+    for (uint64_t i = 0; i < n; i++) {
+        if (kind == 0x5) out[i] = (char)buf[p + i];
+        else {
+            if (buf[p + 2 * i] != 0 || buf[p + 2 * i + 1] >= 0x80) return -1;
+            out[i] = (char)buf[p + 2 * i + 1];
+        }
+    }
+    out[n] = 0;
+    return (int)n;
+}

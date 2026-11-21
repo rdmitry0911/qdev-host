@@ -49,7 +49,7 @@ static void fill_frame(AVFrame *f, int idx)
         }
 }
 
-int make_stream(const char *encoder, const char *params, enum AVPixelFormat pf,
+static int make_stream_once(const char *encoder, const char *params, enum AVPixelFormat pf,
                        int w, int h, int n, const char *tag, stream *out)
 {
     const AVCodec *c = avcodec_find_encoder_by_name(encoder);
@@ -102,6 +102,12 @@ int make_stream(const char *encoder, const char *params, enum AVPixelFormat pf,
 
     if (avformat_open_input(&ic, path, NULL, NULL) < 0) goto done;
     if (avformat_find_stream_info(ic, NULL) < 0) goto done;
+    /* x265 with very short 10-bit streams occasionally leaves an MP4 without a
+     * track (seen 1 in ~15 runs); report it as a generation failure. */
+    if (ic->nb_streams < 1 || !ic->streams[0]->codecpar->extradata_size) {
+        printf("stream %s: muxed file has no usable track\n", encoder);
+        goto done;
+    }
     st = ic->streams[0];
     out->id = st->codecpar->codec_id;
     out->extradata_len = (size_t)st->codecpar->extradata_size;
@@ -186,3 +192,15 @@ int run_oracle(const stream *s, oracle *o)
     return 0;
 }
 
+
+int make_stream(const char *encoder, const char *params, enum AVPixelFormat pf,
+                int w, int h, int n, const char *tag, stream *out)
+{
+    int rc = 1, attempt;
+    for (attempt = 0; attempt < 3; attempt++) {
+        rc = make_stream_once(encoder, params, pf, w, h, n, tag, out);
+        if (rc != 1) break;
+        stream_free(out);
+    }
+    return rc;
+}

@@ -786,6 +786,63 @@ static int32_t reply_err(aw_engine *e, const aw_msg_view *v, int32_t err)
     return AW_NOERR;
 }
 
+/* dsup / dcop (reference: the guest decoder reads dsup ,sup with
+ * CopyCFDictionary and sends dcop ,key as a CFPropertyList string,
+ * vt_callers2.c L4188-4200 / L4509-4519; Apple's host decoders list
+ * UsingHardwareAcceleratedVideoDecoder (read-only, true) with an empty
+ * description and answer dcop of it true, -12900 for a property they lack -
+ * wire contract measurements). We serve that one property. */
+#define AW_PROP_HW "UsingHardwareAcceleratedVideoDecoder"
+#define AW_ERR_PROP_NOT_SUPPORTED (-12900) /* kVTPropertyNotSupportedErr   */
+
+static int32_t handle_dsup(aw_engine *e, aw_dsession *s, const aw_msg_view *v)
+{
+    (void)s;
+    uint8_t pls[256], buf[512]; size_t pl = 0;
+    aw_bplist *b = aw_bplist_new();
+    if (b) {
+        int k = aw_bpl_string(b, AW_PROP_HW);
+        int d = aw_bpl_dict(b, NULL, NULL, 0);       /* empty description       */
+        int root = aw_bpl_dict(b, &k, &d, 1);
+        pl = root >= 0 ? aw_bplist_finalize(b, root, pls, sizeof pls) : 0;
+        aw_bplist_free(b);
+    }
+    aw_builder bb;
+    aw_builder_init(&bb, buf, sizeof buf);
+    aw_build_header(&bb, v->type, AW_FLAG_HOST_REPLY, v->uuid, v->reply_id);
+    aw_put_s32(&bb, AW_KEY_ERR, AW_NOERR);
+    if (pl) aw_put_bytes(&bb, AW_KEY_SUP, AW_VT_PLS, pls, pl);
+    size_t n = aw_build_finalize(&bb); if (n) emit(e, buf, n);
+    return AW_NOERR;
+}
+
+static int32_t handle_dcop(aw_engine *e, aw_dsession *s, const aw_msg_view *v)
+{
+    (void)s;
+    const uint8_t *kp; size_t kl; char key[128];
+    if (aw_get_bytes(v, AW_KEY_KEY, AW_VT_PLS, &kp, &kl) != AW_PARSE_OK ||
+        aw_bplist_read_string(kp, kl, key, sizeof key) < 0)
+        return AW_ERR_MALFORMED;     /* ,key must be a string: no reply          */
+    uint8_t pls[64], buf[256]; size_t pl = 0;
+    int32_t err = AW_ERR_PROP_NOT_SUPPORTED;
+    if (strcmp(key, AW_PROP_HW) == 0) {
+        aw_bplist *b = aw_bplist_new();
+        if (b) {
+            int t = aw_bpl_bool(b, 1);
+            pl = t >= 0 ? aw_bplist_finalize(b, t, pls, sizeof pls) : 0;
+            aw_bplist_free(b);
+        }
+        if (pl) err = AW_NOERR;
+    }
+    aw_builder bb;
+    aw_builder_init(&bb, buf, sizeof buf);
+    aw_build_header(&bb, v->type, AW_FLAG_HOST_REPLY, v->uuid, v->reply_id);
+    aw_put_s32(&bb, AW_KEY_ERR, err);
+    if (err == AW_NOERR) aw_put_bytes(&bb, AW_KEY_VAL, AW_VT_PLS, pls, pl);
+    size_t n = aw_build_finalize(&bb); if (n) emit(e, buf, n);
+    return AW_NOERR;
+}
+
 static int32_t handle_dinv(aw_engine *e, aw_dsession *s, const aw_msg_view *v)
 {
     int32_t rc = reply_err(e, v, AW_NOERR);
@@ -832,8 +889,8 @@ int32_t aw_engine_deliver(aw_engine *e, const uint8_t *msg, size_t len)
     case AW_MSG_DFIN: return reply_err(e, &v, AW_NOERR); /* finish/flush: frames
                                         complete synchronously on the Dbuf reply,
                                         so a drain has nothing outstanding -> noErr */
-    case AW_MSG_DSUP: return reply_err(e, &v, AW_NOERR);
-    case AW_MSG_DCOP:
+    case AW_MSG_DSUP: return handle_dsup(e, s, &v);
+    case AW_MSG_DCOP: return handle_dcop(e, s, &v);
     case AW_MSG_DSET: return reply_err(e, &v, AW_NOERR);
     default:          return AW_ERR_UNKNOWN_UUID;
     }
