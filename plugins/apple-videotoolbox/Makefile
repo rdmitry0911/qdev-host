@@ -117,6 +117,11 @@ $(BUILD)/test-lavc: vtpv_lavc.c vtpv_lavc.h test_lavc.c test_lavc_util.c test_la
 $(BUILD)/test-aw-replay-lavc: $(AW_CORE) vtpv_lavc.c test_aw_replay_lavc.c test_lavc_util.c test_lavc_util.h | $(BUILD)
 	$(CC) $(CFLAGS) $(VA_CFLAGS) $(LAVC_CFLAGS) -o $@ $(AW_CORE) vtpv_lavc.c test_aw_replay_lavc.c test_lavc_util.c $(LAVC_LIBS) $(FMT_LIBS) $(VA_LIBS)
 
+# E2E payload writer (guest multi-frame decode check: record + samples + oracle MD5s).
+#   make build/gva-payload && ./build/gva-payload <dir> h264|hevc <w> <h> <n>
+$(BUILD)/gva-payload: gva_payload.c test_lavc_util.c test_lavc_util.h | $(BUILD)
+	$(CC) $(CFLAGS) $(LAVC_CFLAGS) -o $@ gva_payload.c test_lavc_util.c $(LAVC_LIBS) $(FMT_LIBS)
+
 $(BUILD)/apple-videotoolbox.so: apple-videotoolbox.c $(AW_CORE) $(BACKEND) vtpv_nvdec.c $(PLUGIN_LAVC_SRC) $(BRIDGE_DIR)/pvg_mapper_bridge.h vt_scatter.h | $(BUILD)
 	$(CC) $(CFLAGS) -Wno-unused-parameter -fPIC -shared $(QDP_INC) $(VFU_INC) $(VA_CFLAGS) $(PLUGIN_LAVC_CFLAGS) \
 	    -o $@ apple-videotoolbox.c $(AW_CORE) $(BACKEND) vtpv_nvdec.c $(PLUGIN_LAVC_SRC) $(VA_LIBS) $(if $(PLUGIN_LAVC_SRC),$(LAVC_LIBS)) -ldl
