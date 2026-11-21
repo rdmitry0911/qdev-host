@@ -794,7 +794,7 @@ static void nvdec_close_decoder(void *dec)
 }
 
 static const vtpv_decoder_backend g_nvdec_backend = {
-    nvdec_query_caps, nvdec_open_decoder, nvdec_decode, nvdec_close_decoder
+    nvdec_query_caps, nvdec_open_decoder, nvdec_decode, nvdec_close_decoder, NULL /* NV12 only: '420v' */
 };
 
 /* ====================================================================== *

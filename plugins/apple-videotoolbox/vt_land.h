@@ -19,6 +19,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "vtpv_proto.h"
 
 /* The lent surface as the guest described it (mapper bridge = the guest's own
  * IOSurface descriptor). Extents 0 = unknown (then only `total` bounds a plane). */
@@ -36,7 +37,7 @@ typedef struct vt_land_rows {
     int    cropped;              /* the picture did not fit whole                     */
 } vt_land_rows;
 
-/* Fit a fw x fh 4:2:0 biplanar picture (bpp bytes a sample: 1 NV12) into g.
+/* Fit a fw x fh 4:2:0 biplanar picture (bpp bytes a sample: 1 NV12, 2 P010) into g.
  * 0 and *out = the rows to write (every row inside its plane's extents and inside
  * total), or -1 when not even one luma row fits (broken geometry: nothing lands). */
 int vt_land_fit(const vt_land_geom *g, uint32_t fw, uint32_t fh, int bpp, vt_land_rows *out);
@@ -48,6 +49,25 @@ int vt_land_fit(const vt_land_geom *g, uint32_t fw, uint32_t fh, int bpp, vt_lan
 int vt_land_planes(void *const *ptrs, const size_t *run, size_t page_size, const vt_land_geom *g,
                    const uint8_t *y, size_t ys, const uint8_t *uv, size_t uvs,
                    uint32_t fw, uint32_t fh, int bpp, vt_land_rows *out);
+
+/* Bytes per sample for a picture of `frame_pixfmt` (VTPV_PIXFMT_*) landing in a lent
+ * surface of CoreVideo format `surface_fmt` (VTPV_CV_*, the guest descriptor's pixel
+ * format; 0 = unknown, the legacy no-bridge path, taken as '420v'): 1 for NV12 into
+ * '420v'/'420f', 2 for P010 into 'x420'/'xf20' (each 10-bit sample in the high bits
+ * of a little-endian 16-bit word), -1 for any other pair (8-bit into a 10-bit pool or
+ * the reverse, or another format): the frame then fails instead of landing in a
+ * layout the guest reads differently. Reference: Apple's host asks for the pool by
+ * the stream's bit depth and range ('420v'/'420f' 8-bit, 'x420'/'xf20' 10-bit;
+ * reims docs/video/devices.md @3b3a5a7f^ "HEVC"); the guest descriptor stores the
+ * surface's getPixelFormat() verbatim (populate_descriptor @0x8610, OMAP-X420-01). */
+static inline int vt_land_bpp(uint32_t frame_pixfmt, uint32_t surface_fmt)
+{
+    if (frame_pixfmt == VTPV_PIXFMT_NV12)
+        return (surface_fmt == 0 || surface_fmt == VTPV_CV_420V || surface_fmt == VTPV_CV_420F) ? 1 : -1;
+    if (frame_pixfmt == VTPV_PIXFMT_P010)
+        return (surface_fmt == VTPV_CV_X420 || surface_fmt == VTPV_CV_XF20) ? 2 : -1;
+    return -1;
+}
 
 /* How a lent buffer's mapping id resolves. */
 enum vt_resolve_route {

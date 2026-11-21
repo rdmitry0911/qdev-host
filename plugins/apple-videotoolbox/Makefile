@@ -138,11 +138,11 @@ $(BUILD)/test-vt-land-lavc: vtpv_lavc.c vt_land.c vt_scatter.c test_vt_land_lavc
 # index. Needs no encoder: builds against the package's bundled libavcodec too
 # (PKG_CONFIG_PATH=<bundled prefix>/lib/pkgconfig) for the NVIDIA hosts.
 #   ./build/test-lavc-payload vaapi|cuda <render node|cuda ordinal> <payload dir>...
-$(BUILD)/test-lavc-payload: vtpv_lavc.c vtpv_lavc.h vt_scatter.c vt_scatter.h test_lavc_payload.c | $(BUILD)
-	$(CC) $(CFLAGS) $(VA_CFLAGS) $(LAVC_CFLAGS) -o $@ vtpv_lavc.c vt_scatter.c test_lavc_payload.c $(LAVC_LIBS) $(VA_LIBS)
+$(BUILD)/test-lavc-payload: vtpv_lavc.c vtpv_lavc.h vt_scatter.c vt_scatter.h vt_land.c vt_land.h test_lavc_payload.c | $(BUILD)
+	$(CC) $(CFLAGS) $(VA_CFLAGS) $(LAVC_CFLAGS) -o $@ vtpv_lavc.c vt_scatter.c vt_land.c test_lavc_payload.c $(LAVC_LIBS) $(VA_LIBS)
 
 # E2E payload writer (guest multi-frame decode check: record + samples + oracle MD5s).
-#   make build/gva-payload && ./build/gva-payload <dir> h264|hevc <w> <h> <n>
+#   make build/gva-payload && ./build/gva-payload <dir> h264|hevc|hevc10 <w> <h> <n>
 $(BUILD)/gva-payload: gva_payload.c test_lavc_util.c test_lavc_util.h | $(BUILD)
 	$(CC) $(CFLAGS) $(LAVC_CFLAGS) -o $@ gva_payload.c test_lavc_util.c $(LAVC_LIBS) $(FMT_LIBS)
 
@@ -202,12 +202,15 @@ ifeq ($(HAVE_LAVC),1)
 	 if [ $$rc = 77 ]; then echo "(landing test skipped: no usable render node)"; \
 	 elif [ $$rc != 0 ]; then exit $$rc; fi
 	@echo "== stream core on recorded payloads (H.264 IPB 640x360, HEVC IPB 1280x720), VA-API then CUDA =="; \
-	 mkdir -p $(BUILD)/pl-h264 $(BUILD)/pl-hevc; $(BUILD)/gva-payload $(BUILD)/pl-h264 h264 640 360 30 >/dev/null 2>&1 && \
-	 $(BUILD)/gva-payload $(BUILD)/pl-hevc hevc 1280 720 16 >/dev/null 2>&1 || { echo "(payload test skipped: no encoder)"; exit 0; }; \
-	 $(BUILD)/test-lavc-payload vaapi /dev/dri/renderD128 $(BUILD)/pl-h264 $(BUILD)/pl-hevc; rc=$$?; \
+	 mkdir -p $(BUILD)/pl-h264 $(BUILD)/pl-hevc $(BUILD)/pl-hevc10 $(BUILD)/pl-hevc10-4k; \
+	 $(BUILD)/gva-payload $(BUILD)/pl-h264 h264 640 360 30 >/dev/null 2>&1 && \
+	 $(BUILD)/gva-payload $(BUILD)/pl-hevc hevc 1280 720 16 >/dev/null 2>&1 && \
+	 $(BUILD)/gva-payload $(BUILD)/pl-hevc10 hevc10 1280 720 16 >/dev/null 2>&1 && \
+	 $(BUILD)/gva-payload $(BUILD)/pl-hevc10-4k hevc10 3840 2160 6 >/dev/null 2>&1 || { echo "(payload test skipped: no encoder)"; exit 0; }; \
+	 $(BUILD)/test-lavc-payload vaapi /dev/dri/renderD128 $(BUILD)/pl-h264 $(BUILD)/pl-hevc $(BUILD)/pl-hevc10 $(BUILD)/pl-hevc10-4k; rc=$$?; \
 	 if [ $$rc = 77 ]; then echo "(vaapi payload test skipped: no usable render node)"; \
 	 elif [ $$rc != 0 ]; then exit $$rc; fi; \
-	 $(BUILD)/test-lavc-payload cuda 0 $(BUILD)/pl-h264 $(BUILD)/pl-hevc; rc=$$?; \
+	 $(BUILD)/test-lavc-payload cuda 0 $(BUILD)/pl-h264 $(BUILD)/pl-hevc $(BUILD)/pl-hevc10 $(BUILD)/pl-hevc10-4k; rc=$$?; \
 	 if [ $$rc = 77 ]; then echo "(cuda payload test skipped: no NVIDIA GPU, or not the bundled libavcodec)"; \
 	 elif [ $$rc != 0 ]; then exit $$rc; fi
 	@echo "== Apple-wire engine + stream core, multi-frame IPB/HEVC through dfrm/Dbuf/Demt =="; \

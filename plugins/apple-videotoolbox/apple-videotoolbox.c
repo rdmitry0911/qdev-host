@@ -256,6 +256,7 @@ typedef struct vt_landing {
     int       direct;
     size_t    y_off, y_stride, uv_off, uv_stride;
     vt_land_geom geom;    /* the lent surface's planes (GVA-LAND-BOUNDS): every write fits */
+    uint32_t  surface_fmt; /* the lent surface's CoreVideo format (guest descriptor), 0 unknown */
     void     *ptrs[PVG_BRIDGE_MAX_PAGES];
     size_t    run[PVG_BRIDGE_MAX_PAGES];
 } vt_landing;
@@ -510,6 +511,7 @@ static int vt_resolve_buffer(void *ctx, const uint8_t uuid[16], uint64_t mapping
                 land = calloc(1, sizeof *land);
                 if (!land) return -1;
                 land->d = d; land->total = total; land->npages = r.page_count; land->page_size = ps;
+                land->surface_fmt = r.pixel_format;
                 memcpy(land->gpa_pages, r.gpa_pages, (size_t)r.page_count * sizeof(uint64_t));
                 land->geom.total = total;
                 land->geom.y_off = y_off; land->geom.y_stride = y_stride;
@@ -612,8 +614,17 @@ static int vt_land_direct(vt_dev *d, const vtpv_decoded_frame *f, vt_landing *l)
     vt_land_rows lr;
     uint32_t w = f->width, h = f->height;
     if (!d->lavc || vtpv_lavc_get_frame(d->lavc, f->surface_id, &fr) != VTPV_OK ||
-        fr.pixfmt != VTPV_PIXFMT_NV12 || w > fr.width || h > fr.height || !w || !h)
+        w > fr.width || h > fr.height || !w || !h)
         return -1;
+    /* D-GVA-P010: NV12 lands in a '420v'/'420f' surface a byte a sample, P010 in an
+     * 'x420'/'xf20' one two bytes a sample (the pool Dpba asked for); any other pair
+     * fails the frame rather than landing in a layout the guest reads differently. */
+    const int bpp = vt_land_bpp(fr.pixfmt, l->surface_fmt);
+    if (bpp < 0) {
+        vt_log(d, 1, "landing: a %#x picture does not go into a %#x surface; frame not delivered",
+               fr.pixfmt, l->surface_fmt);
+        return -1;
+    }
     if (vt_scatter_resolve(l->ptrs, l->run, l->total, l->gpa_pages, l->npages, l->page_size,
                            vt_scatter_map, d) != VT_SCATTER_OK) {
         vt_log(d, 1, "landing: surface pages not all in the guest DMA regions (%zu B); frame not delivered", l->total);
@@ -623,7 +634,7 @@ static int vt_land_direct(vt_dev *d, const vtpv_decoded_frame *f, vt_landing *l)
      * plane (reference: Apple's host writes the picture unscaled at the top left of a
      * buffer of the description's size); nothing outside the lent surface is written. */
     int rc = vt_land_planes(l->ptrs, l->run, l->page_size, &l->geom, fr.plane[0], fr.stride[0],
-                            fr.plane[1], fr.stride[1], w, h, 1, &lr);
+                            fr.plane[1], fr.stride[1], w, h, bpp, &lr);
     if (rc != 0) {
         vt_log(d, 1, "landing: %ux%u picture does not fit the lent surface (%zu B, rc %d); frame not delivered",
                w, h, l->total, rc);
@@ -651,6 +662,12 @@ static int vt_copy_frame(void *ctx, const vtpv_decoded_frame *f, const aw_out_bu
      * surface - the shadow of a bridge surface (its plane geometry) or the GPA
      * bring-up surface laid out for the description's size b->width x b->height. */
     uint32_t lw = f->width, lh = f->height, cw = f->width, ch = f->height;
+    /* the legacy (no-stream-core) and bring-up paths land NV12 only (D-GVA-P010:
+     * P010 goes through the stream core's direct landing) */
+    if (vt_land_bpp(f->pixfmt, b->landing ? ((const vt_landing *)b->landing)->surface_fmt : 0) != 1) {
+        vt_log(d, 1, "landing: a %#x picture does not go into this surface; frame not delivered", f->pixfmt);
+        return -1;
+    }
     if (b->landing) {
         vt_land_rows lr;
         const vt_landing *l = b->landing;
@@ -923,7 +940,7 @@ static int fake_decode(void *dec, const uint8_t *s, size_t sl,
 { (void)dec; (void)s; (void)sl; (void)o; return -1; }
 static void fake_close(void *dec) { (void)dec; }
 static const vtpv_decoder_backend fake_h264_be = {
-    fake_query_caps, fake_open_decoder, fake_decode, fake_close
+    fake_query_caps, fake_open_decoder, fake_decode, fake_close, NULL
 };
 
 /* ---- qdp_device_ops ------------------------------------------------- */

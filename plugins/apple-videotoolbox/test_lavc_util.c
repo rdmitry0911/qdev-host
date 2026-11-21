@@ -158,6 +158,30 @@ static void md5_nv12_from_planar(const AVFrame *f, int w, int h, uint8_t out[16]
     av_free(m);
 }
 
+/* x420 / P010: each 10-bit sample in the high bits of a little-endian 16-bit word
+ * (CoreVideo kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange), CbCr interleaved. */
+static void put_p010(uint8_t *d, uint16_t v10) { uint16_t v = (uint16_t)(v10 << 6); d[0] = (uint8_t)v; d[1] = (uint8_t)(v >> 8); }
+static void md5_p010_from_planar(const AVFrame *f, int w, int h, uint8_t out[16])
+{
+    struct AVMD5 *m = av_md5_alloc();
+    static uint8_t row[16384];
+    int y, x, cw = (w + 1) / 2;
+    av_md5_init(m);
+    for (y = 0; y < h; y++) {
+        const uint16_t *s = (const uint16_t *)(f->data[0] + (size_t)f->linesize[0] * y);
+        for (x = 0; x < w; x++) put_p010(row + 2 * x, s[x]);
+        av_md5_update(m, row, (size_t)w * 2);
+    }
+    for (y = 0; y < (h + 1) / 2; y++) {
+        const uint16_t *u = (const uint16_t *)(f->data[1] + (size_t)f->linesize[1] * y);
+        const uint16_t *v = (const uint16_t *)(f->data[2] + (size_t)f->linesize[2] * y);
+        for (x = 0; x < cw; x++) { put_p010(row + 4 * x, u[x]); put_p010(row + 4 * x + 2, v[x]); }
+        av_md5_update(m, row, (size_t)cw * 4);
+    }
+    av_md5_final(m, out);
+    av_free(m);
+}
+
 int run_oracle(const stream *s, oracle *o)
 {
     const AVCodec *c = avcodec_find_decoder(s->id);
@@ -178,8 +202,15 @@ int run_oracle(const stream *s, oracle *o)
         } else rc = avcodec_send_packet(ctx, NULL);
         (void)rc;
         while (avcodec_receive_frame(ctx, f) == 0) {
-            if (f->pts >= 0 && f->pts < MAXF && f->format == AV_PIX_FMT_YUV420P) {
-                md5_nv12_from_planar(f, f->width, f->height, o->md5[f->pts]);
+            if (f->pts >= 0 && f->pts < MAXF &&
+                (f->format == AV_PIX_FMT_YUV420P || f->format == AV_PIX_FMT_YUV420P10LE)) {
+                if (f->format == AV_PIX_FMT_YUV420P10LE) {
+                    md5_p010_from_planar(f, f->width, f->height, o->md5[f->pts]);
+                    o->bits = 10;
+                } else {
+                    md5_nv12_from_planar(f, f->width, f->height, o->md5[f->pts]);
+                    o->bits = 8;
+                }
                 o->have[f->pts] = 1;
                 o->w = f->width; o->h = f->height;
                 o->n_out++;

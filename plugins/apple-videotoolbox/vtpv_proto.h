@@ -45,6 +45,17 @@ extern "C" {
 #define VTPV_PIXFMT_NV12   0x4e563132u /* 'NV12' - 8-bit 4:2:0 biplanar       */
 #define VTPV_PIXFMT_P010   0x50303130u /* 'P010' - 10-bit 4:2:0 biplanar      */
 
+/* CoreVideo pixel formats of the guest's decoder-output pool (the Dpba
+ * PixelFormatType). Apple's host asks for the format the stream's first SPS
+ * gives, by bit depth and range: '420v' / '420f' for 8 bits, 'x420' / 'xf20'
+ * for 10 (measured on Apple's host session, recorded in reims
+ * docs/video/devices.md @3b3a5a7f^ "HEVC"). 'x420'/'xf20' hold each 10-bit
+ * sample in the high bits of a little-endian 16-bit word = P010. */
+#define VTPV_CV_420V       0x34323076u /* '420v' 8-bit video range            */
+#define VTPV_CV_420F       0x34323066u /* '420f' 8-bit full range             */
+#define VTPV_CV_X420       0x78343230u /* 'x420' 10-bit video range           */
+#define VTPV_CV_XF20       0x78663230u /* 'xf20' 10-bit full range            */
+
 /*
  * Transport limits from the device contract (devices.md "Transport",
  * verified against the x86_64 AppleVirtIO.kext, 2026-10-24):
@@ -196,6 +207,10 @@ typedef struct vtpv_decoder_backend {
 
     /* Close a decoder opened by open_decoder. */
     void (*close_decoder)(void *dec);
+
+    /* Optional: the CoreVideo pixel format (VTPV_CV_*) of the guest pool this
+     * decoder's pictures need, known after open_decoder. NULL or 0 = '420v'. */
+    uint32_t (*output_format)(void *dec);
 } vtpv_decoder_backend;
 
 /* ---- the protocol handler ------------------------------------------ */

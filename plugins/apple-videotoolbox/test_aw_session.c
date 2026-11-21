@@ -63,15 +63,20 @@ static int mock_decode(void *dec, const uint8_t *s, size_t sl, vtpv_decoded_fram
     return 0;
 }
 static void mock_close(void *dec){ (void)dec; g_close_calls++; }
+static uint32_t g_out_fmt; /* what the mock decoder says its pictures need (0 = default) */
+static uint32_t mock_outfmt(void *dec){ (void)dec; return g_out_fmt; }
 static const vtpv_decoder_backend MOCK = {
-    mock_query, mock_open, mock_decode, mock_close };
+    mock_query, mock_open, mock_decode, mock_close, mock_outfmt };
+static const vtpv_decoder_backend MOCK_NOFMT = {
+    mock_query, mock_open, mock_decode, mock_close, NULL };
 
 /* ---- mock guest buffer provider (resolve a lent surface) ------------ */
-static int g_resolve_calls, g_copy_calls, g_putbuf_calls;
+static int g_resolve_calls, g_copy_calls, g_putbuf_calls, g_resolve_fail;
 static uint64_t g_last_mapid;
 static int mock_resolve(void *c, const uint8_t uuid[16], uint64_t mapid,
                         uint32_t w, uint32_t h, aw_out_buffer *o){
     (void)c;(void)uuid; g_resolve_calls++; g_last_mapid = mapid;
+    if (g_resolve_fail) return -1;
     memset(o, 0, sizeof *o);
     memset(o->uuid, 0xB0, 16);
     o->mapping_id = mapid; o->width = w; o->height = h;
@@ -456,6 +461,104 @@ static void test_sbuf(void) {
     CHECK(aw_sbuf_read(bad, 16, &rau, &ral, NULL, NULL) < 0, "sbuf with no sdat refused");
 }
 
+/* The Dpba ,pba plist's PixelFormatType: the one 4-byte bplist integer (marker
+ * 0x12, big-endian) among the known CoreVideo formats. 0 if absent. */
+static uint32_t dpba_pixfmt(const aw_msg_view *v) {
+    static const uint32_t fmts[4] = { VTPV_CV_420V, VTPV_CV_420F, VTPV_CV_X420, VTPV_CV_XF20 };
+    const uint8_t *pls; size_t pl; uint32_t found = 0; int nfound = 0;
+    if (aw_get_bytes(v, AW_KEY_PBA, AW_VT_PLS, &pls, &pl) != AW_PARSE_OK) return 0;
+    for (size_t i = 0; i + 5 <= pl; i++)
+        for (int k = 0; k < 4; k++)
+            if (pls[i] == 0x12 && aw_get_be32(pls + i + 1) == fmts[k]) { found = fmts[k]; nfound++; }
+    return nfound == 1 ? found : 0;
+}
+
+/* AW-FMT-01..03 (GVA cycle 3): Dpba asks for the pool format the decoder's
+ * pictures need - '420v' by default, 'x420'/'xf20'/'420f' when the backend says
+ * so (Apple's host: the format the hvcC's first SPS gives, by bit depth and
+ * range; reims docs/video/devices.md @3b3a5a7f^ "HEVC"). */
+static void test_dpba_format(void) {
+    printf("-- Dpba PixelFormatType from the decoder's output format --\n");
+    static const struct { const vtpv_decoder_backend *be; uint32_t fmt, want; const char *name; } cases[] = {
+        { &MOCK_NOFMT, 0,            VTPV_CV_420V, "no output_format -> 420v" },
+        { &MOCK,       0,            VTPV_CV_420V, "output_format 0 -> 420v" },
+        { &MOCK,       VTPV_CV_X420, VTPV_CV_X420, "10-bit -> x420" },
+        { &MOCK,       VTPV_CV_XF20, VTPV_CV_XF20, "10-bit full range -> xf20" },
+        { &MOCK,       VTPV_CV_420F, VTPV_CV_420F, "8-bit full range -> 420f" },
+    };
+    for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        aw_session_cfg cfg; memset(&cfg, 0, sizeof cfg);
+        cfg.be = cases[i].be; cfg.emit = cap_emit;
+        cfg.resolve_buffer = mock_resolve; cfg.copy_frame = mock_copy; cfg.put_buffer = mock_putbuf;
+        aw_engine *e = aw_engine_create(&cfg);
+        uint8_t m[512]; aw_msg_view v; uint8_t uuid[16]; memset(uuid, 0x60 + (int)i, 16);
+        g_out_fmt = cases[i].fmt;
+        aw_engine_deliver(e, m, msg0(m, AW_MSG_PDEC, AW_FLAG_GUEST_REQ, uuid));
+        ereset();
+        aw_engine_deliver(e, m, build_dsta(m, uuid));
+        CHECK(g_ne == 2 && e_type(0, &v) == AW_PARSE_OK && v.type == AW_MSG_DPBA, "%s: Dpba emitted", cases[i].name);
+        uint32_t got = dpba_pixfmt(&v);
+        CHECK(got == cases[i].want, "%s: Dpba PixelFormatType 0x%08x (want 0x%08x)", cases[i].name, got, cases[i].want);
+        aw_engine_destroy(e);
+    }
+    g_out_fmt = 0;
+}
+
+/* AW-LEND-01..02 (D-GVA-LEND-FAIL-FAST, host half): a lent buffer the host
+ * cannot resolve fails THAT frame at once - the unit is still decoded (its
+ * picture may be a reference of later units), then Demt -12909 without a
+ * buffer, Dfub of the lent ,uui and rels of a nonzero id, as Apple's host
+ * answers a frame it cannot output (reims docs/video/devices.md @3b3a5a7f^
+ * "A frame that does not decode") - instead of no Demt at all (the guest then
+ * waited out its 10 s reply timeout) - and the next parked unit starts. */
+static void test_lend_failure(void) {
+    printf("-- unresolvable lent buffer: decode, Demt -12909 no buffer, Dfub, rels, next --\n");
+    aw_engine *e = mk(); uint8_t m[512]; aw_msg_view v;
+    uint8_t uuid[16]; memset(uuid, 0x77, 16);
+    static const uint8_t au[8] = { 0,0,0,4, 0x65, 1,2,3 };
+    int64_t frm = -1; int32_t err = 0; uint8_t got[16];
+    aw_engine_deliver(e, m, msg0(m, AW_MSG_PDEC, AW_FLAG_GUEST_REQ, uuid));
+    aw_engine_deliver(e, m, build_dsta(m, uuid));
+    aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 30, 701, au, sizeof au));
+    aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 31, 702, au, sizeof au));
+    int dec0 = g_decode_calls, copy0 = g_copy_calls;
+
+    g_resolve_fail = 1;
+    ereset();
+    CHECK(aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0x9500)) == AW_NOERR, "lend-fail: Dbuf reply status 0");
+    CHECK(g_decode_calls == dec0 + 1, "lend-fail: the unit is still decoded (DPB kept)");
+    CHECK(g_copy_calls == copy0, "lend-fail: nothing copied");
+    CHECK(g_ne == 5, "lend-fail: dfrm reply, Demt, Dfub, rels, Dbuf(31) (got %d)", g_ne);
+    CHECK(e_type(0, &v) == AW_PARSE_OK && v.type == AW_MSG_DFRM && v.reply_id == 701, "lend-fail: dfrm reply 701");
+    CHECK(e_type(1, &v) == AW_PARSE_OK && v.type == AW_MSG_DEMT &&
+          aw_get_s64(&v, AW_KEY_FRM, &frm) == AW_PARSE_OK && frm == 30 &&
+          aw_get_s32(&v, AW_KEY_ERR, &err) == AW_PARSE_OK && err == AW_ERR_MALFUNCTION &&
+          aw_get_uui(&v, AW_KEY_UUI, got) != AW_PARSE_OK, "lend-fail: Demt(30) -12909 without ,uui");
+    CHECK(e_type(2, &v) == AW_PARSE_OK && v.type == AW_MSG_DFUB, "lend-fail: Dfub returns the lent buffer");
+    uint64_t rid[4]; unsigned nr = 0;
+    CHECK(e_is_rels(3) && aw_rels_read(g_e[3], g_el[3], rid, 4, &nr) == AW_PARSE_OK && nr == 1 && rid[0] == 0x9500,
+          "lend-fail: rels names the lent id");
+    CHECK(e_type(4, &v) == AW_PARSE_OK && v.type == AW_MSG_DBUF && aw_get_s64(&v, AW_KEY_FRM, &frm) == AW_PARSE_OK &&
+          frm == 31, "lend-fail: Dbuf(31) started at once");
+
+    /* AW-LEND-02: a Dbuf reply that lent no surface (id 0): no rels for id 0 */
+    ereset();
+    aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0));
+    CHECK(g_ne == 3, "lend-none: dfrm reply, Demt, Dfub - no rels of id 0 (got %d)", g_ne);
+    CHECK(e_type(1, &v) == AW_PARSE_OK && v.type == AW_MSG_DEMT &&
+          aw_get_s32(&v, AW_KEY_ERR, &err) == AW_PARSE_OK && err == AW_ERR_MALFUNCTION, "lend-none: Demt -12909");
+    CHECK(e_type(2, &v) == AW_PARSE_OK && v.type == AW_MSG_DFUB, "lend-none: Dfub");
+    g_resolve_fail = 0;
+
+    /* the session goes on: the next frame decodes into its lent buffer */
+    aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 32, 703, au, sizeof au));
+    ereset();
+    aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0x9600));
+    CHECK(g_ne == 2 && e_type(1, &v) == AW_PARSE_OK && v.type == AW_MSG_DEMT &&
+          aw_get_uui(&v, AW_KEY_UUI, got) == AW_PARSE_OK, "after lend-fail: Demt(32) with buffer");
+    aw_engine_destroy(e);
+}
+
 int main(void) {
     test_sbuf();
     test_listlike_routing();
@@ -463,6 +566,8 @@ int main(void) {
     test_decode_exchange();
     test_parked_frames();
     test_properties();
+    test_dpba_format();
+    test_lend_failure();
     if (g_fail) { printf("FAILED: %d check(s)\n", g_fail); return 1; }
     printf("OK: all aw_session checks passed\n");
     return 0;

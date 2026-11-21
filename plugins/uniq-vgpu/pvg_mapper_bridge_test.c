@@ -91,6 +91,52 @@ static int test_misses_and_limits(pvg_mapper_bridge *b) {
     return 0;
 }
 
+/* BRIDGE-4K-P010 (GVA cycle 3): a 3840x2160 'x420' (10-bit, two bytes a sample) decode-output
+ * surface - luma 7680 B/row x 2160, CbCr 7680 B/row x 1080 = 24883200 B = 6075 pages - round
+ * trips with every scattered page; the v1 4096-page slot refused it, so the guest's 10-bit lend
+ * never reached the video device. */
+static int test_4k_p010(pvg_mapper_bridge *b) {
+    const uint32_t n = 6075;
+    uint64_t *pages = malloc(n * sizeof *pages);
+    if (!pages) return 1;
+    for (uint32_t i = 0; i < n; i++) pages[i] = 0x100000000ull + (uint64_t)((i * 7919u) % n) * 4096u;
+    pvg_bridge_publish_info info;
+    memset(&info, 0, sizeof info);
+    info.pixel_format = 0x78343230; /* 'x420' */
+    info.width = 3840; info.height = 2160; info.plane_count = 2;
+    info.alloc_size = (uint64_t)n * 4096;
+    info.planes[0].offset = 0;        info.planes[0].bytes_per_row = 7680; info.planes[0].size = 7680ull * 2160;
+    info.planes[1].offset = 16588800; info.planes[1].bytes_per_row = 7680; info.planes[1].size = 7680ull * 1080;
+    info.page_count = n; info.gpa_pages = pages; info.page_size = 4096;
+    CHECK(PVG_BRIDGE_MAX_PAGES >= n);
+    CHECK(pvg_mapper_bridge_publish(b, 4321, &info) == 0);
+    pvg_bridge_resolved *r = malloc(sizeof *r);
+    if (!r) { free(pages); return 1; }
+    CHECK(pvg_mapper_bridge_lookup(b, 4321, r) == 0);
+    CHECK(r->pixel_format == 0x78343230 && r->page_count == n && r->contiguous == 0);
+    CHECK(r->planes[1].offset == 16588800 && r->planes[1].bytes_per_row == 7680);
+    CHECK(memcmp(r->gpa_pages, pages, n * sizeof *pages) == 0);
+    pvg_mapper_bridge_retract(b, 4321);
+    CHECK(pvg_mapper_bridge_lookup(b, 4321, r) == -1);
+    free(r); free(pages);
+    printf("ok  4K x420 surface (6075 scattered pages) round trip\n");
+    return 0;
+}
+
+/* BRIDGE-VERSION-01: a region written by a writer of another layout version (a stale shm of the
+ * 4096-page v1 bridge) is not valid for this reader (the reader then must not trust its slots). */
+static int test_version(void) {
+    pvg_mapper_bridge *b = malloc(pvg_mapper_bridge_bytes());
+    if (!b) return 1;
+    pvg_mapper_bridge_init(b, 4096);
+    CHECK(PVG_BRIDGE_VERSION == 2u && pvg_mapper_bridge_valid(b));
+    b->version = 1;
+    CHECK(!pvg_mapper_bridge_valid(b));
+    free(b);
+    printf("ok  layout version 2; a v1 region is refused\n");
+    return 0;
+}
+
 int main(void) {
     pvg_mapper_bridge *b = malloc(pvg_mapper_bridge_bytes());
     if (!b) return 2;
@@ -99,6 +145,8 @@ int main(void) {
     rc |= test_contiguous_round_trip(b);
     rc |= test_scattered_and_retract(b);
     rc |= test_misses_and_limits(b);
+    rc |= test_4k_p010(b);
+    rc |= test_version();
     free(b);
     if (rc == 0) printf("ALL BRIDGE TESTS PASSED\n");
     return rc;

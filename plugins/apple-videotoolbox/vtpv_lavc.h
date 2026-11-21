@@ -76,9 +76,9 @@ int  vtpv_lavc_query_caps(vtpv_lavc *v, vtpv_caps *out, size_t out_cap);
 
 /* Open a decoder: codec = VTPV_CODEC_H264 (extradata avcC) or VTPV_CODEC_HEVC
  * (extradata hvcC); samples are length-prefixed NAL units as the guest sends
- * them. Refuses (VTPV_ERR_UNSUPPORTED) what the output contract cannot carry
- * today: anything but 8-bit 4:2:0 (the guest pool is '420v'), interlaced is
- * left to the decoder. */
+ * them. Accepts 4:2:0 at 8 bits (H.264, HEVC Main) and HEVC Main 10 where the
+ * device decodes it; refuses (VTPV_ERR_UNSUPPORTED) anything else (no lossy
+ * conversion); interlaced is left to the decoder. */
 int  vtpv_lavc_open_decoder(vtpv_lavc *v, uint32_t codec, uint32_t width,
                             uint32_t height, const uint8_t *extradata,
                             size_t extradata_len, vtpv_lavc_dec **out);
@@ -90,6 +90,10 @@ int  vtpv_lavc_decode(vtpv_lavc_dec *d, const uint8_t *sample, size_t sample_len
 /* Drop the DPB (invalidate/seek); the next unit must start at a random access
  * point. */
 void vtpv_lavc_flush(vtpv_lavc_dec *d);
+/* The guest pool's CoreVideo format for this decoder's pictures (VTPV_CV_*):
+ * '420v' / '420f' for 8 bits, 'x420' / 'xf20' (P010 layout) for 10, by the
+ * first SPS's range (HEVC) - what the host asks for in Dpba. */
+uint32_t vtpv_lavc_output_format(const vtpv_lavc_dec *d);
 void vtpv_lavc_close_decoder(vtpv_lavc_dec *d);
 
 /* Copy a frame's cropped planes into destination planes (row by row): luma

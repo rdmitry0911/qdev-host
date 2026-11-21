@@ -37,9 +37,13 @@
 #endif
 
 #define PVG_BRIDGE_MAGIC     0x50564742524447ULL /* "PVGBRDG" */
-#define PVG_BRIDGE_VERSION   1u
+/* v2 (GVA cycle 3): 8192 pages a slot. A 3840x2160 'x420' 10-bit surface (two bytes a sample, the
+ * HEVC Main 10 aerial wallpaper's pool) needs 6075 4 KiB pages; v1's 4096 (a 4K NV12 surface, ~3038)
+ * made the writer refuse its publish. The slot layout changes, so the version does: a reader and a
+ * writer of different versions see each other's region as invalid (no bridge), never as slots. */
+#define PVG_BRIDGE_VERSION   2u
 #define PVG_BRIDGE_SLOTS     64u    /* concurrent mapped decode-output surfaces (pools are small) */
-#define PVG_BRIDGE_MAX_PAGES 4096u  /* up to a 4K NV12 surface (~3038 4 KiB pages) */
+#define PVG_BRIDGE_MAX_PAGES 8192u  /* up to 32 MiB: a 4K x420 surface (6075 4 KiB pages) */
 #define PVG_BRIDGE_MAX_PLANES 4u
 
 /* One plane's authoritative layout, straight from the guest IOSurface descriptor the mapper ring

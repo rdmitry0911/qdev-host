@@ -21,6 +21,7 @@ typedef struct oracle {
     int     have[MAXF];
     uint8_t md5[MAXF][16];
     int     w, h, n_out;
+    int     bits;   /* 8: packed NV12 MD5s; 10: packed P010 ('x420') MD5s */
 } oracle;
 
 void stream_free(stream *s);

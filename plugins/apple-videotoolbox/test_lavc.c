@@ -63,11 +63,18 @@ static void check_decode_order(vtpv_lavc *v, const char *name, const char *arm, 
         rc = vtpv_lavc_decode(d, s->pkt[i], s->pkt_len[i], &f);
         if (rc != VTPV_OK) { if (first_bad < 0) first_bad = i; printf("  %s/%s: unit %d rc %d\n", name, arm, i, rc); continue; }
         frame_md5(&f, md5);
-        if (f.width == (uint32_t)o->w && f.height == (uint32_t)o->h && f.pixfmt == VTPV_PIXFMT_NV12 &&
+        if (f.width == (uint32_t)o->w && f.height == (uint32_t)o->h &&
+            f.pixfmt == (o->bits == 10 ? VTPV_PIXFMT_P010 : VTPV_PIXFMT_NV12) &&
             o->have[i] && !memcmp(md5, o->md5[i], 16)) ok++;
         else if (first_bad < 0) first_bad = i;
     }
     CHECK(ok == s->n, "%s/%s: %d/%d units match the oracle in decode order (first bad %d)", name, arm, ok, s->n, first_bad);
+    {
+        uint32_t want = o->bits == 10 ? VTPV_CV_X420 : VTPV_CV_420V, got = vtpv_lavc_output_format(d);
+        if (strstr(name, "full")) want = o->bits == 10 ? VTPV_CV_XF20 : VTPV_CV_420F;
+        if (s->id == AV_CODEC_ID_H264) want = VTPV_CV_420V;
+        CHECK(got == want, "%s/%s: pool format 0x%08x (want 0x%08x)", name, arm, got, want);
+    }
     printf("  %s/%s: %d/%d units == oracle (decode order, %dx%d)\n", name, arm, ok, s->n, o->w, o->h);
     vtpv_lavc_close_decoder(d);
 }
@@ -124,16 +131,25 @@ int main(int argc, char **argv)
     run_case(hw, sw, "hevc-main-3840x2160", "libx265", "bframes=2:keyint=8:scenecut=0:log-level=error",
              AV_PIX_FMT_YUV420P, 3840, 2160, 6);
 
-    /* LAVC-REFUSE-01: what the '420v' output contract cannot carry is refused
-     * at open (guest keeps software): HEVC Main10, H.264 High 4:4:4. */
+    /* LAVC-HEVC-MAIN10-01..03 (GVA cycle 3): HEVC Main 10 decodes into P010 ('x420'
+     * pool, two bytes a sample) in decode order == the software oracle's packed P010;
+     * 3840x2160 = the aerial wallpaper's size; a full-range SPS asks for 'xf20'.
+     * (Before: refused at open -> the guest decoded Main 10 in software.) */
+    run_case(hw, sw, "hevc-main10-1280x720", "libx265", "bframes=3:keyint=16:min-keyint=16:scenecut=0:log-level=error",
+             AV_PIX_FMT_YUV420P10LE, 1280, 720, 24);
+    run_case(hw, sw, "hevc-main10-full-640x360", "libx265", "bframes=2:keyint=8:scenecut=0:range=full:log-level=error",
+             AV_PIX_FMT_YUV420P10LE, 640, 360, 8);
+    run_case(hw, sw, "hevc-main10-3840x2160", "libx265", "bframes=2:keyint=8:scenecut=0:log-level=error",
+             AV_PIX_FMT_YUV420P10LE, 3840, 2160, 6);
+    /* LAVC-HEVC-RANGE-01: 8-bit full range asks for '420f' */
+    run_case(hw, sw, "hevc-main-full-640x360", "libx265", "bframes=2:keyint=8:scenecut=0:range=full:log-level=error",
+             AV_PIX_FMT_YUV420P, 640, 360, 8);
+
+    /* LAVC-REFUSE-01: what no biplanar 4:2:0 pool can carry is refused at open
+     * (guest keeps software): H.264 High 4:4:4. */
     {
         stream s;
         vtpv_lavc_dec *d = NULL;
-        if (make_stream("libx265", "keyint=4:log-level=error", AV_PIX_FMT_YUV420P10LE, 320, 240, 2, "m10", &s) == 0) {
-            rc = vtpv_lavc_open_decoder(hw, VTPV_CODEC_HEVC, 320, 240, s.extradata, s.extradata_len, &d);
-            CHECK(rc == VTPV_ERR_UNSUPPORTED && !d, "refuse: HEVC Main10 open rc %d", rc);
-            stream_free(&s);
-        }
         if (make_stream("libx264", "keyint=4", AV_PIX_FMT_YUV444P, 320, 240, 2, "444", &s) == 0) {
             rc = vtpv_lavc_open_decoder(hw, VTPV_CODEC_H264, 320, 240, s.extradata, s.extradata_len, &d);
             CHECK(rc == VTPV_ERR_UNSUPPORTED && !d, "refuse: H.264 4:4:4 open rc %d", rc);

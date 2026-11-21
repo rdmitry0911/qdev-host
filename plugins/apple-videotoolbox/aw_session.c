@@ -18,6 +18,9 @@
 #define AW_EXT_AVCC   AW_4CC('a','v','c','C')
 #define AW_EXT_HVCC   AW_4CC('h','v','c','C')
 #define AW_PIXFMT_420V AW_4CC('4','2','0','v')
+#define AW_PIXFMT_420F AW_4CC('4','2','0','f')
+#define AW_PIXFMT_X420 AW_4CC('x','4','2','0')
+#define AW_PIXFMT_XF20 AW_4CC('x','f','2','0')
 
 /* a session's in-flight frame progresses: IDLE -> AWAIT_DBUF (Dbuf sent) ->
  * AWAIT_DEMT (frame copied, Demt sent) -> IDLE. One frame is in flight at a
@@ -47,6 +50,7 @@ typedef struct aw_dsession {
     uint8_t  uuid[16];
     void    *dec;            /* backend decoder handle                           */
     uint32_t codec, width, height;
+    uint32_t out_fmt;        /* the guest pool's CoreVideo format (Dpba)         */
     uint64_t next_mapping_id;
 
     /* parked frame (event-driven dfrm, H7) */
@@ -72,17 +76,19 @@ struct aw_engine {
 /* ---- binary-plist payloads (H4) ------------------------------------------ *
  * The guest's VideoToolbox parses these as bplist00 (contract-B §3). */
 
-/* Dpba: {PixelFormatType [420v], Width, Height, IOSurfaceProperties {},
+/* Dpba: {PixelFormatType [fmt], Width, Height, IOSurfaceProperties {},
  * BytesPerRowAlignment 64, PlaneAlignment 256,
  * PreferRealTimeCacheModeIfEveryoneDoes true}. PixelFormatType is an array of
- * one OSType NUMBER ('420v') — confirmed by L-GUEST-KEXT as the CoreVideo
- * kCVPixelBufferPixelFormatTypeKey convention (CFNumber); keep NUMBER unless the
- * shipping framework rejects it at dsta. */
-static size_t build_dpba_plist(uint8_t *out, size_t cap, uint32_t w, uint32_t h)
+ * one OSType NUMBER — confirmed by L-GUEST-KEXT as the CoreVideo
+ * kCVPixelBufferPixelFormatTypeKey convention (CFNumber). fmt is the format the
+ * decoder's pictures need, as Apple's host asks: '420v' / '420f' for 8 bits,
+ * 'x420' / 'xf20' for 10, by the first SPS's bit depth and range (Apple's host
+ * session measurements, reims docs/video/devices.md @3b3a5a7f^ "HEVC"). */
+static size_t build_dpba_plist(uint8_t *out, size_t cap, uint32_t fmt, uint32_t w, uint32_t h)
 {
     aw_bplist *b = aw_bplist_new();
     if (!b) return 0;
-    int fourcc = aw_bpl_int(b, (int64_t)AW_PIXFMT_420V);
+    int fourcc = aw_bpl_int(b, (int64_t)fmt);
     int v_pft  = aw_bpl_array(b, &fourcc, 1);
     int v_io   = aw_bpl_dict(b, NULL, NULL, 0);          /* IOSurfaceProperties {} */
     int keys[7] = {
@@ -504,7 +510,8 @@ static int32_t handle_closedec(aw_engine *e, const aw_msg_view *v)
 static void emit_dpba(aw_engine *e, aw_dsession *s)
 {
     uint8_t pls[256];
-    size_t pls_len = build_dpba_plist(pls, sizeof pls, s->width, s->height);
+    size_t pls_len = build_dpba_plist(pls, sizeof pls, s->out_fmt ? s->out_fmt : AW_PIXFMT_420V,
+                                      s->width, s->height);
     uint8_t buf[512];
     aw_builder b;
     aw_builder_init(&b, buf, sizeof buf);
@@ -549,6 +556,9 @@ static int32_t handle_dsta(aw_engine *e, aw_dsession *s, const aw_msg_view *v)
     }
 
     s->dec = dec; s->codec = codec; s->width = w; s->height = h; s->started = 1;
+    s->out_fmt = e->cfg.be->output_format ? e->cfg.be->output_format(dec) : 0;
+    if (s->out_fmt != AW_PIXFMT_420F && s->out_fmt != AW_PIXFMT_X420 && s->out_fmt != AW_PIXFMT_XF20)
+        s->out_fmt = AW_PIXFMT_420V;
 
     emit_dpba(e, s);                 /* Dpba BEFORE the dsta reply                */
 
@@ -719,14 +729,25 @@ static int32_t handle_guest_reply(aw_engine *e, aw_dsession *s,
             emit_dfrm_reply(e, s, &fv, AW_NOERR, s->pend_inf);
         }
 
-        if (got != 0) {              /* guest lent nothing usable: drop the frame */
+        vtpv_decoded_frame f; memset(&f, 0, sizeof f);
+        int dr = e->cfg.be->decode(s->dec, s->pend_au, s->pend_au_len, &f);
+
+        if (got != 0) {
+            /* The guest's lent buffer cannot take the frame (no surface, or one the
+             * host cannot reach). The unit was decoded above all the same (its picture
+             * may be a reference of later units); THIS frame fails now as Apple's host
+             * fails a frame it cannot output: Demt -12909 without a buffer, the lent
+             * buffer back with Dfub, rels of a real id - instead of leaving the guest
+             * to its 10 s reply timeout (D-GVA-LEND-FAIL-FAST, host half). */
+            static const uint8_t zero[16];
+            emit_demt(e, s, s->pend_frm, AW_ERR_MALFUNCTION, s->pend_inf, NULL);
+            if (memcmp(bu, zero, 16) != 0) emit_dfub(e, s, bu);
+            if (mapid) emit_rels(e, mapid);
+            if (e->cfg.put_buffer) e->cfg.put_buffer(e->cfg.buf_ctx, &ob);
             s->pend_state = AW_FRM_IDLE;
             start_next(e, s);
             return AW_NOERR;
         }
-
-        vtpv_decoded_frame f; memset(&f, 0, sizeof f);
-        int dr = e->cfg.be->decode(s->dec, s->pend_au, s->pend_au_len, &f);
         if (dr != 0) {
             /* Apple's host: a sample with no picture is emitted with
              * FrameDropped and no buffer; a frame that does not decode with the

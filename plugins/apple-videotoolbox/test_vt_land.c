@@ -94,6 +94,31 @@ int main(void)
         free(y); free(uv);
     }
 
+    /* LAND-FMT-01: NV12 into the 8-bit pools (and the legacy unknown format) */
+    CHECK(vt_land_bpp(VTPV_PIXFMT_NV12, VTPV_CV_420V) == 1, "NV12 -> 420v");
+    CHECK(vt_land_bpp(VTPV_PIXFMT_NV12, VTPV_CV_420F) == 1, "NV12 -> 420f");
+    CHECK(vt_land_bpp(VTPV_PIXFMT_NV12, 0) == 1, "NV12 -> legacy unknown");
+    /* LAND-FMT-02: P010 into the 10-bit pools, two bytes a sample */
+    CHECK(vt_land_bpp(VTPV_PIXFMT_P010, VTPV_CV_X420) == 2, "P010 -> x420");
+    CHECK(vt_land_bpp(VTPV_PIXFMT_P010, VTPV_CV_XF20) == 2, "P010 -> xf20");
+    /* LAND-FMT-03: mismatches fail (no lossy or misread landing) */
+    CHECK(vt_land_bpp(VTPV_PIXFMT_P010, VTPV_CV_420V) == -1, "P010 -> 420v refused");
+    CHECK(vt_land_bpp(VTPV_PIXFMT_P010, VTPV_CV_420F) == -1, "P010 -> 420f refused");
+    CHECK(vt_land_bpp(VTPV_PIXFMT_P010, 0) == -1, "P010 -> unknown refused");
+    CHECK(vt_land_bpp(VTPV_PIXFMT_NV12, VTPV_CV_X420) == -1, "NV12 -> x420 refused");
+    CHECK(vt_land_bpp(VTPV_PIXFMT_NV12, VTPV_CV_XF20) == -1, "NV12 -> xf20 refused");
+    CHECK(vt_land_bpp(VTPV_PIXFMT_NV12, 0x42475241u /* 'BGRA' */) == -1, "NV12 -> BGRA refused");
+    CHECK(vt_land_bpp(0, VTPV_CV_420V) == -1, "unknown frame format refused");
+    /* LAND-FMT-04: a 3840x2160 'x420' surface as the guest describes it (IOSurface getters:
+     * plane 0 3840x2160 rowBytes 7680, plane 1 1920x1080 pairs rowBytes 7680, 6075 pages):
+     * a 4K P010 picture fits whole at two bytes a sample. */
+    {
+        vt_land_geom x = { 6075 * PS, 0, 7680, 3840, 2160, 7680u * 2160u, 7680, 1920, 1080 };
+        CHECK(vt_land_fit(&x, 3840, 2160, 2, &r) == 0 && r.y_bytes == 7680 && r.y_rows == 2160 &&
+              r.uv_bytes == 7680 && r.uv_rows == 1080 && !r.cropped, "4K P010 into 4K x420: whole");
+        CHECK(vt_land_fit(&x, 3840, 2160, 1, &r) == 0 && r.y_bytes == 3840, "an NV12-sized fit is half the row");
+    }
+
     /* LAND-ROUTE-01..04 */
     CHECK(vt_resolve_route_for(0, 1, 0) == VT_ROUTE_DROP, "id 0 drops");
     CHECK(vt_resolve_route_for(7, 1, 1) == VT_ROUTE_BRIDGE, "bridge hit");

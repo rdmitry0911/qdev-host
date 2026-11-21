@@ -62,6 +62,7 @@ struct vtpv_lavc {
                                     * ~1.7 ms); other drivers (e.g. Intel, whose
                                     * derived memory is uncached) take the copying
                                     * read mapping */
+    int                hevc10;   /* the device decodes HEVC Main 10           */
     uint32_t           next_id;  /* backend-local surface ids                */
     vtpv_lavc_dec     *decs;     /* open decoders (surface id lookup)        */
 };
@@ -70,6 +71,8 @@ struct vtpv_lavc_dec {
     vtpv_lavc       *v;
     vtpv_lavc_dec   *next;
     uint32_t         codec;
+    int              bits;       /* 8 or 10: the session's sample depth        */
+    uint32_t         out_fmt;    /* the guest pool's CoreVideo format (VTPV_CV_*) */
     AVCodecContext  *ctx;
     AVPacket        *pkt;
     AVFrame         *out_frame;  /* libavcodec's display-order output (dropped) */
@@ -104,6 +107,8 @@ static void seterr(char *buf, size_t len, const char *fmt, ...)
     va_end(ap);
 }
 
+static int va_profile_vld(VADisplay dpy, VAProfile p, uint32_t *maxw, uint32_t *maxh);
+
 int vtpv_lavc_open(vtpv_lavc_hw hw, const char *device, vtpv_lavc **out,
                    char *errbuf, size_t errlen)
 {
@@ -118,6 +123,7 @@ int vtpv_lavc_open(vtpv_lavc_hw hw, const char *device, vtpv_lavc **out,
     v->hw = hw;
     v->hw_fmt = AV_PIX_FMT_NONE;
     v->next_id = 1;
+    v->hevc10 = 1;  /* software oracle; CUDA: NVDEC decodes HEVC Main 10 since Pascal */
     if (hw == VTPV_LAVC_HW_NONE) { *out = v; return VTPV_OK; }
 
     if (hw == VTPV_LAVC_HW_VAAPI) { type = AV_HWDEVICE_TYPE_VAAPI; v->hw_fmt = AV_PIX_FMT_VAAPI; }
@@ -140,7 +146,15 @@ int vtpv_lavc_open(vtpv_lavc_hw hw, const char *device, vtpv_lavc **out,
         AVHWDeviceContext *dc = (AVHWDeviceContext *)v->device->data;
         const AVVAAPIDeviceContext *hc = dc->hwctx;
         const char *vendor = vaQueryVendorString(hc->display);
+        int np = vaMaxNumProfiles(hc->display), i;
+        VAProfile *ps = np > 0 ? calloc((size_t)np, sizeof(*ps)) : NULL;
+        uint32_t mw = 0, mh = 0;
         v->map_direct = vendor && strstr(vendor, "radeonsi") != NULL;
+        v->hevc10 = 0;  /* only what the driver lists as a VLD profile */
+        if (ps && vaQueryConfigProfiles(hc->display, ps, &np) == VA_STATUS_SUCCESS)
+            for (i = 0; i < np; i++)
+                if (ps[i] == VAProfileHEVCMain10 && va_profile_vld(hc->display, ps[i], &mw, &mh)) v->hevc10 = 1;
+        free(ps);
     }
     *out = v;
     return VTPV_OK;
@@ -253,28 +267,34 @@ int vtpv_lavc_query_caps(vtpv_lavc *v, vtpv_caps *out, size_t out_cap)
 }
 
 /* ---- codec record checks --------------------------------------------- *
- * The output contract today is an 8-bit 4:2:0 '420v' guest pool, so streams
- * that need another output format are refused at open (the guest keeps its
- * software decoder for them) instead of being converted lossily. */
-static int record_is_8bit_420(uint32_t codec, const uint8_t *x, size_t n)
+ * The guest pool is biplanar 4:2:0: '420v'/'420f' (8-bit) or 'x420'/'xf20'
+ * (10-bit, P010 layout), the formats Apple's host asks for in Dpba. Streams
+ * that need anything else are refused at open (the guest keeps its software
+ * decoder for them) instead of being converted lossily. Returns the sample bit
+ * depth the record states (8 or 10), or 0 = refused. */
+static int record_bits_420(uint32_t codec, const uint8_t *x, size_t n)
 {
     if (codec == VTPV_CODEC_H264) {
         /* avcC: [0]=1 version, [1]=profile_idc. Profiles that may carry more
          * than 8-bit 4:2:0 (High 10/4:2:2/4:4:4, CAVLC 4:4:4) are refused; for
-         * High (100) the optional avcC tail states chroma/bit depth. */
+         * High (100) the optional avcC tail states chroma/bit depth. H.264 High 10
+         * stays refused: VA-API (radeonsi) has no VLD profile for it. */
         int prof;
         if (n < 7 || x[0] != 1) return 0;
         prof = x[1];
         if (prof == 110 || prof == 122 || prof == 244 || prof == 44) return 0;
-        return 1;
+        return 8;
     }
     if (codec == VTPV_CODEC_HEVC) {
         /* hvcC: [1] profile_space(2)|tier(1)|profile_idc(5); [16] low 2 bits
-         * chroma_format_idc; [17]/[18] low 3 bits bit depth minus 8. */
+         * chroma_format_idc; [17]/[18] low 3 bits bit depth minus 8. 4:2:0 at 8
+         * bits (Main) or 10 bits (Main 10), luma and chroma alike. */
+        int bl, bc;
         if (n < 23 || x[0] != 1) return 0;
         if ((x[16] & 3) != 1) return 0;
-        if ((x[17] & 7) != 0 || (x[18] & 7) != 0) return 0;
-        return 1;
+        bl = (x[17] & 7) + 8; bc = (x[18] & 7) + 8;
+        if (bl != bc || (bl != 8 && bl != 10)) return 0;
+        return bl;
     }
     return 0;
 }
@@ -359,7 +379,11 @@ int vtpv_lavc_open_decoder(vtpv_lavc *v, uint32_t codec, uint32_t width,
     if (!extradata || !extradata_len || extradata_len > VTPV_MAX_EXTRADATA_BYTES)
         return VTPV_ERR_MALFORMED;
     if (width > VTPV_MAX_DIM || height > VTPV_MAX_DIM) return VTPV_ERR_TOO_LARGE;
-    if (!record_is_8bit_420(codec, extradata, extradata_len)) return VTPV_ERR_UNSUPPORTED;
+    {
+        int bits = record_bits_420(codec, extradata, extradata_len);
+        if (!bits) return VTPV_ERR_UNSUPPORTED;
+        if (bits == 10 && !v->hevc10) return VTPV_ERR_UNSUPPORTED; /* no Main 10 VLD here */
+    }
 
     c = avcodec_find_decoder(id);
     if (!c) return VTPV_ERR_UNSUPPORTED;
@@ -367,6 +391,7 @@ int vtpv_lavc_open_decoder(vtpv_lavc *v, uint32_t codec, uint32_t width,
     if (!d) return VTPV_ERR_BACKEND;
     d->v = v;
     d->codec = codec;
+    d->bits = record_bits_420(codec, extradata, extradata_len);
     d->nal_len_size = record_nal_len_size(codec, extradata, extradata_len);
     d->ctx = avcodec_alloc_context3(c);
     d->pkt = av_packet_alloc();
@@ -401,6 +426,26 @@ int vtpv_lavc_open_decoder(vtpv_lavc *v, uint32_t codec, uint32_t width,
             d->ctx->hwaccel_flags |= AV_HWACCEL_FLAG_ALLOW_PROFILE_MISMATCH;
     }
     if (avcodec_open2(d->ctx, c, NULL) < 0) goto fail;
+    /* The pool format. HEVC: libavcodec exported the first SPS of the hvcC at
+     * open (hevcdec.c hevc_decode_extradata -> export_stream_params): its sample
+     * format must agree with the record's bit depth, and its range picks
+     * '420f'/'xf20' over '420v'/'x420' as Apple's host does. H.264's decoder
+     * exports nothing at open: '420v' (full-range H.264 = open debt). */
+    d->out_fmt = d->bits == 10 ? VTPV_CV_X420 : VTPV_CV_420V;
+    if (codec == VTPV_CODEC_HEVC) {
+        enum AVPixelFormat pf = d->ctx->pix_fmt;
+        int full = d->ctx->color_range == AVCOL_RANGE_JPEG;
+        if (pf != AV_PIX_FMT_NONE &&
+            (d->bits == 10 ? pf != AV_PIX_FMT_YUV420P10LE
+                           : (pf != AV_PIX_FMT_YUV420P && pf != AV_PIX_FMT_YUVJ420P))) {
+            avcodec_free_context(&d->ctx);
+            av_packet_free(&d->pkt); av_frame_free(&d->out_frame); av_frame_free(&d->sw_frame);
+            av_frame_free(&d->map_frame); av_frame_free(&d->own_out); av_frame_free(&d->pp_frame);
+            free(d);
+            return VTPV_ERR_UNSUPPORTED;      /* the SPS disagrees with the record */
+        }
+        if (full || pf == AV_PIX_FMT_YUVJ420P) d->out_fmt = d->bits == 10 ? VTPV_CV_XF20 : VTPV_CV_420F;
+    }
     d->next = v->decs;
     v->decs = d;
     *out = d;
@@ -457,6 +502,7 @@ static int sw_to_biplanar(vtpv_lavc_dec *d, const AVFrame *f, uint32_t w, uint32
             }
         }
     }
+    if (hi != (d->bits == 10)) return VTPV_ERR_UNSUPPORTED; /* not the session's depth */
     out->width = w; out->height = h;
     out->pixfmt = hi ? VTPV_PIXFMT_P010 : VTPV_PIXFMT_NV12;
     out->plane[0] = yp; out->stride[0] = ystride;
@@ -594,7 +640,8 @@ int vtpv_lavc_decode(vtpv_lavc_dec *d, const uint8_t *sample, size_t sample_len,
             }
             if (!cpu) {
                 rc = VTPV_ERR_BACKEND;
-            } else if (cpu->format == AV_PIX_FMT_NV12 || cpu->format == AV_PIX_FMT_P010LE) {
+            } else if ((d->bits == 10 && cpu->format == AV_PIX_FMT_P010LE) ||
+                       (d->bits != 10 && cpu->format == AV_PIX_FMT_NV12)) {
                 out->width = w; out->height = h;
                 out->pixfmt = cpu->format == AV_PIX_FMT_NV12 ? VTPV_PIXFMT_NV12 : VTPV_PIXFMT_P010;
                 out->plane[0] = cpu->data[0]; out->stride[0] = (size_t)cpu->linesize[0];
@@ -695,9 +742,13 @@ static int be_decode(void *dec, const uint8_t *sample, size_t sample_len,
 
 static void be_close_decoder(void *dec) { vtpv_lavc_close_decoder(dec); }
 
+static uint32_t be_output_format(void *dec) { return vtpv_lavc_output_format(dec); }
+
 static const vtpv_decoder_backend g_lavc_backend = {
-    be_query_caps, be_open_decoder, be_decode, be_close_decoder
+    be_query_caps, be_open_decoder, be_decode, be_close_decoder, be_output_format
 };
+
+uint32_t vtpv_lavc_output_format(const vtpv_lavc_dec *d) { return d ? d->out_fmt : 0; }
 
 const vtpv_decoder_backend *vtpv_lavc_backend(void) { return &g_lavc_backend; }
 
@@ -722,10 +773,11 @@ int vtpv_lavc_read_luma(vtpv_lavc *v, uint32_t surface_id, uint8_t *dst,
                         size_t dst_stride, uint32_t w, uint32_t h)
 {
     const vtpv_lavc_frame *f = find_surface(v, surface_id);
-    size_t r, row;
-    if (!f || !dst || f->pixfmt != VTPV_PIXFMT_NV12) return VTPV_ERR_BACKEND;
-    if (w > f->width || h > f->height || dst_stride < w) return VTPV_ERR_MALFORMED;
-    row = w;
+    size_t r, row, bpp;
+    if (!f || !dst || (f->pixfmt != VTPV_PIXFMT_NV12 && f->pixfmt != VTPV_PIXFMT_P010)) return VTPV_ERR_BACKEND;
+    bpp = f->pixfmt == VTPV_PIXFMT_P010 ? 2 : 1;
+    row = (size_t)w * bpp;
+    if (w > f->width || h > f->height || dst_stride < row) return VTPV_ERR_MALFORMED;
     for (r = 0; r < h; r++) memcpy(dst + dst_stride * r, f->plane[0] + f->stride[0] * r, row);
     return VTPV_OK;
 }
@@ -735,7 +787,8 @@ int vtpv_lavc_read_chroma(vtpv_lavc *v, uint32_t surface_id, uint8_t *dst,
 {
     const vtpv_lavc_frame *f = find_surface(v, surface_id);
     size_t r, row = ((size_t)w + 1) / 2 * 2, rows = ((size_t)h + 1) / 2;
-    if (!f || !dst || f->pixfmt != VTPV_PIXFMT_NV12) return VTPV_ERR_BACKEND;
+    if (!f || !dst || (f->pixfmt != VTPV_PIXFMT_NV12 && f->pixfmt != VTPV_PIXFMT_P010)) return VTPV_ERR_BACKEND;
+    if (f->pixfmt == VTPV_PIXFMT_P010) row *= 2;
     if (w > f->width || h > f->height || dst_stride < row) return VTPV_ERR_MALFORMED;
     for (r = 0; r < rows; r++) memcpy(dst + dst_stride * r, f->plane[1] + f->stride[1] * r, row);
     return VTPV_OK;
