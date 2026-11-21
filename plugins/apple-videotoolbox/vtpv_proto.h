@@ -81,6 +81,8 @@ enum {
     VTPV_ERR_NO_SLOTS    = -5, /* session table full                         */
     VTPV_ERR_BACKEND     = -6, /* the decode backend failed                  */
 };
+/* decode(): the access unit carried no coded picture (not an error).         */
+#define VTPV_DROPPED 1
 
 #pragma pack(push, 1)
 
@@ -187,7 +189,8 @@ typedef struct vtpv_decoder_backend {
                         const uint8_t *extradata, size_t extradata_len, void **dec);
 
     /* Decode one access unit (sample) into a surface described in *out.
-     * Returns 0 or a VTPV_ERR_* code. */
+     * Returns 0, VTPV_DROPPED (the unit carried no picture: the engine emits
+     * it as a dropped frame without a buffer), or a VTPV_ERR_* code. */
     int (*decode)(void *dec, const uint8_t *sample, size_t sample_len,
                   vtpv_decoded_frame *out);
 

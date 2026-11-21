@@ -17,8 +17,17 @@ VFU_INC := -I../../third_party/libvfio-user/include
 VA_CFLAGS := $(shell pkg-config --cflags libva libva-drm 2>/dev/null)
 VA_LIBS   := $(shell pkg-config --libs libva libva-drm 2>/dev/null)
 
+LAVC_CFLAGS := $(shell pkg-config --cflags libavcodec libavutil 2>/dev/null)
+LAVC_LIBS   := $(if $(filter 0,$(VT_LAVC)),,$(shell pkg-config --libs libavcodec libavutil 2>/dev/null))
+FMT_LIBS    := $(shell pkg-config --libs libavformat 2>/dev/null)
+
 BUILD := build
 HAVE_VA := $(if $(VA_LIBS),1,)
+HAVE_LAVC := $(if $(LAVC_LIBS),$(HAVE_VA),)
+ifeq ($(HAVE_LAVC),1)
+PLUGIN_LAVC_SRC := vtpv_lavc.c
+PLUGIN_LAVC_CFLAGS := -DVTPV_HAVE_LAVC $(LAVC_CFLAGS)
+endif
 
 .PHONY: all test plugin clean
 all: test
@@ -100,9 +109,17 @@ $(BUILD)/test-aw-replay: $(AW_CORE) $(BACKEND) test_aw_replay.c | $(BUILD)
 # The device links the NVDEC backend too (vtpv_nvdec.c); it loads libnvcuvid +
 # libcuda at run time with dlopen, so the .so needs only -ldl and still loads on
 # a host with no NVIDIA driver (NVDEC open then fails cleanly, VA-API is used).
-$(BUILD)/apple-videotoolbox.so: apple-videotoolbox.c $(AW_CORE) $(BACKEND) vtpv_nvdec.c $(BRIDGE_DIR)/pvg_mapper_bridge.h vt_scatter.h | $(BUILD)
-	$(CC) $(CFLAGS) -Wno-unused-parameter -fPIC -shared $(QDP_INC) $(VFU_INC) $(VA_CFLAGS) \
-	    -o $@ apple-videotoolbox.c $(AW_CORE) $(BACKEND) vtpv_nvdec.c $(VA_LIBS) -ldl
+# The stream decode core (vtpv_lavc) — libavcodec + VA-API/CUDA hwaccel, DPB
+# kept across frames (plan U1) — is linked in when libavcodec is found.
+$(BUILD)/test-lavc: vtpv_lavc.c vtpv_lavc.h test_lavc.c test_lavc_util.c test_lavc_util.h | $(BUILD)
+	$(CC) $(CFLAGS) $(VA_CFLAGS) $(LAVC_CFLAGS) -o $@ vtpv_lavc.c test_lavc.c test_lavc_util.c $(LAVC_LIBS) $(FMT_LIBS) $(VA_LIBS)
+
+$(BUILD)/test-aw-replay-lavc: $(AW_CORE) vtpv_lavc.c test_aw_replay_lavc.c test_lavc_util.c test_lavc_util.h | $(BUILD)
+	$(CC) $(CFLAGS) $(VA_CFLAGS) $(LAVC_CFLAGS) -o $@ $(AW_CORE) vtpv_lavc.c test_aw_replay_lavc.c test_lavc_util.c $(LAVC_LIBS) $(FMT_LIBS) $(VA_LIBS)
+
+$(BUILD)/apple-videotoolbox.so: apple-videotoolbox.c $(AW_CORE) $(BACKEND) vtpv_nvdec.c $(PLUGIN_LAVC_SRC) $(BRIDGE_DIR)/pvg_mapper_bridge.h vt_scatter.h | $(BUILD)
+	$(CC) $(CFLAGS) -Wno-unused-parameter -fPIC -shared $(QDP_INC) $(VFU_INC) $(VA_CFLAGS) $(PLUGIN_LAVC_CFLAGS) \
+	    -o $@ apple-videotoolbox.c $(AW_CORE) $(BACKEND) vtpv_nvdec.c $(PLUGIN_LAVC_SRC) $(VA_LIBS) $(if $(PLUGIN_LAVC_SRC),$(LAVC_LIBS)) -ldl
 
 $(BUILD)/test-plugin: test_plugin.c $(BUILD)/apple-videotoolbox.so | $(BUILD)
 	$(CC) $(CFLAGS) $(QDP_INC) $(VFU_INC) -o $@ test_plugin.c -ldl
@@ -139,6 +156,19 @@ ifeq ($(HAVE_VA),1)
 	 if [ $$rc = 77 ]; then echo "(milestone test skipped: no usable render node)"; \
 	 elif [ $$rc != 0 ]; then exit $$rc; fi
 	@echo "== plugin ABI smoke =="; $(BUILD)/test-plugin $(BUILD)/apple-videotoolbox.so
+ifeq ($(HAVE_LAVC),1)
+	@$(MAKE) --no-print-directory $(BUILD)/test-lavc $(BUILD)/test-aw-replay-lavc
+	@echo "== stream decode core (libavcodec + VA-API, decode order vs software oracle) =="; \
+	 $(BUILD)/test-lavc; rc=$$?; \
+	 if [ $$rc = 77 ]; then echo "(lavc test skipped: no usable render node)"; \
+	 elif [ $$rc != 0 ]; then exit $$rc; fi
+	@echo "== Apple-wire engine + stream core, multi-frame IPB/HEVC through dfrm/Dbuf/Demt =="; \
+	 $(BUILD)/test-aw-replay-lavc; rc=$$?; \
+	 if [ $$rc = 77 ]; then echo "(engine+lavc test skipped: no usable render node)"; \
+	 elif [ $$rc != 0 ]; then exit $$rc; fi
+else
+	@echo "(libavcodec not found: stream decode core not built, legacy backends only)"
+endif
 else
 	@echo "(libva not found via pkg-config: skipping VA-API backend + plugin tests)"
 endif

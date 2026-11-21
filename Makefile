@@ -57,6 +57,16 @@ VT_HDR := $(addprefix $(VT_DIR)/,vtpv_proto.h vtpv_vaapi.h vtpv_nvdec.h vtpv_h26
           plugins/uniq-vgpu/pvg_mapper_bridge.h
 VT_VA_CFLAGS := $(shell pkg-config --cflags libva libva-drm 2>/dev/null)
 VT_VA_LIBS   := $(shell pkg-config --libs libva libva-drm 2>/dev/null)
+# The stream decode core (vtpv_lavc: libavcodec + VA-API/CUDA hwaccel, keeps the
+# DPB across frames) is built in when libavcodec is found; without it the device
+# falls back to the legacy intra-only backends. VT_LAVC=0 forces it off.
+VT_LAVC_LIBS := $(if $(filter 0,$(VT_LAVC)),,$(shell pkg-config --libs libavcodec libavutil 2>/dev/null))
+ifneq ($(VT_LAVC_LIBS),)
+VT_SRC += $(VT_DIR)/vtpv_lavc.c
+VT_HDR += $(VT_DIR)/vtpv_lavc.h
+VT_VA_CFLAGS += -DVTPV_HAVE_LAVC $(shell pkg-config --cflags libavcodec libavutil 2>/dev/null)
+VT_VA_LIBS += $(VT_LAVC_LIBS)
+endif
 ifneq ($(VIDEOTOOLBOX),)
 PLUGINS += $(VT_DIR)/apple-videotoolbox.so
 endif

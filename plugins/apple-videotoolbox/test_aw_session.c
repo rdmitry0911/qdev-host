@@ -52,8 +52,12 @@ static int mock_open(void *c, uint32_t codec, uint32_t w, uint32_t h,
     if (g_open_fail) return VTPV_ERR_BACKEND;
     *dec = (void *)0xD0D0; return 0;
 }
+static int g_decode_drop_at = -1, g_decode_fail_at = -1; /* 0-based decode call index */
 static int mock_decode(void *dec, const uint8_t *s, size_t sl, vtpv_decoded_frame *o){
-    (void)dec;(void)s;(void)sl; g_decode_calls++;
+    (void)dec;(void)s;(void)sl;
+    int idx = g_decode_calls++;
+    if (idx == g_decode_drop_at) return VTPV_DROPPED;
+    if (idx == g_decode_fail_at) return VTPV_ERR_BACKEND;
     o->surface_id = 42; o->width = 352; o->height = 288; o->pixfmt = VTPV_PIXFMT_NV12;
     return 0;
 }
@@ -271,6 +275,97 @@ static void test_decode_exchange(void) {
     aw_engine_destroy(e);
 }
 
+/* async dfrm with an explicit ,frm and reply id */
+static size_t build_dfrm_n(uint8_t *m, const uint8_t *uuid, int64_t frm, uint64_t rid,
+                           const uint8_t *au, size_t aul) {
+    uint8_t sbf[256];
+    size_t sl = aw_sbuf_write(sbf, sizeof sbf, NULL, au, aul);
+    aw_builder b; aw_builder_init(&b, m, 512);
+    aw_build_header(&b, AW_MSG_DFRM, AW_FLAG_GUEST_REQ, uuid, rid);
+    aw_put_s64(&b, AW_KEY_FRM, frm);
+    aw_put_bytes(&b, AW_KEY_SBF, AW_VT_SBF, sbf, sl);
+    aw_put_u32(&b, AW_KEY_DFL, 1);
+    return aw_build_finalize(&b);
+}
+
+/* AW-PARK-01..03: a dfrm that arrives while a frame is in flight is parked and
+ * started (Dbuf) when the previous frame completes; frames are emitted one Demt
+ * per dfrm in decode order. A unit with no picture is emitted as FrameDropped
+ * without ,uui, a failed unit with the error and without ,uui; both return the
+ * lent buffer (Dfub + rels) and start the next parked unit (reference: Apple's
+ * host decoder, wire contract; guest Demt handler accepts a missing ,uui as no
+ * pixel buffer). */
+static void test_parked_frames(void) {
+    printf("-- parked dfrm FIFO, decode-order Demt, dropped/failed frames --\n");
+    aw_engine *e = mk(); uint8_t m[512]; aw_msg_view v;
+    uint8_t uuid[16]; memset(uuid, 0x55, 16);
+    static const uint8_t au[8] = { 0,0,0,4, 0x65, 1,2,3 };
+    int64_t frm = -1; int32_t err = 1; uint32_t inf = 0; uint8_t got[16];
+    int base = g_decode_calls;
+
+    aw_engine_deliver(e, m, msg0(m, AW_MSG_PDEC, AW_FLAG_GUEST_REQ, uuid));
+    aw_engine_deliver(e, m, build_dsta(m, uuid));
+    g_decode_drop_at = base + 1;   /* 2nd unit: no picture                       */
+    g_decode_fail_at = base + 2;   /* 3rd unit: does not decode                  */
+
+    ereset();
+    CHECK(aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 10, 501, au, sizeof au)) == AW_NOERR, "park: dfrm 10");
+    CHECK(aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 11, 502, au, sizeof au)) == AW_NOERR, "park: dfrm 11 accepted while 10 in flight");
+    CHECK(aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 12, 503, au, sizeof au)) == AW_NOERR, "park: dfrm 12 accepted");
+    CHECK(aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 13, 504, au, sizeof au)) == AW_NOERR, "park: dfrm 13 accepted");
+    CHECK(g_ne == 1 && e_type(0, &v) == AW_PARSE_OK && v.type == AW_MSG_DBUF &&
+          aw_get_s64(&v, AW_KEY_FRM, &frm) == AW_PARSE_OK && frm == 10, "park: only Dbuf(10) so far");
+
+    /* frame 10: Dbuf reply -> dfrm reply(501) + Demt(10, buffer); Demt reply -> rels + Dbuf(11) */
+    ereset();
+    aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0x9100));
+    CHECK(g_ne == 2 && e_type(0, &v) == AW_PARSE_OK && v.type == AW_MSG_DFRM && v.reply_id == 501, "park: dfrm reply 501");
+    CHECK(e_type(1, &v) == AW_PARSE_OK && v.type == AW_MSG_DEMT && aw_get_s64(&v, AW_KEY_FRM, &frm) == AW_PARSE_OK &&
+          frm == 10 && aw_get_uui(&v, AW_KEY_UUI, got) == AW_PARSE_OK, "park: Demt(10) with buffer");
+    ereset();
+    aw_engine_deliver(e, m, build_demt_reply(m, uuid));
+    CHECK(g_ne == 2 && e_is_rels(0), "park: rels after Demt(10) reply");
+    CHECK(e_type(1, &v) == AW_PARSE_OK && v.type == AW_MSG_DBUF && aw_get_s64(&v, AW_KEY_FRM, &frm) == AW_PARSE_OK &&
+          frm == 11, "park: Dbuf(11) started from the FIFO");
+
+    /* frame 11: no picture -> dfrm reply(502), Demt(11, err 0, FrameDropped, no ,uui), Dfub, rels, Dbuf(12) */
+    ereset();
+    aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0x9200));
+    CHECK(g_ne == 5, "drop: 5 emissions (got %d)", g_ne);
+    CHECK(e_type(0, &v) == AW_PARSE_OK && v.type == AW_MSG_DFRM && v.reply_id == 502, "drop: dfrm reply 502");
+    CHECK(e_type(1, &v) == AW_PARSE_OK && v.type == AW_MSG_DEMT && aw_get_s64(&v, AW_KEY_FRM, &frm) == AW_PARSE_OK && frm == 11 &&
+          aw_get_s32(&v, AW_KEY_ERR, &err) == AW_PARSE_OK && err == 0 &&
+          aw_get_u32(&v, AW_KEY_INF, &inf) == AW_PARSE_OK && (inf & 0x2u) &&
+          aw_get_uui(&v, AW_KEY_UUI, got) != AW_PARSE_OK, "drop: Demt(11) FrameDropped, err 0, no ,uui");
+    CHECK(e_type(2, &v) == AW_PARSE_OK && v.type == AW_MSG_DFUB, "drop: Dfub returns the lent buffer");
+    CHECK(e_is_rels(3), "drop: rels");
+    CHECK(e_type(4, &v) == AW_PARSE_OK && v.type == AW_MSG_DBUF && aw_get_s64(&v, AW_KEY_FRM, &frm) == AW_PARSE_OK &&
+          frm == 12, "drop: Dbuf(12) started");
+
+    /* frame 12: does not decode -> Demt(12, -12909, no ,uui), Dfub, rels, Dbuf(13) */
+    ereset();
+    aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0x9300));
+    CHECK(g_ne == 5 && e_type(1, &v) == AW_PARSE_OK && v.type == AW_MSG_DEMT &&
+          aw_get_s32(&v, AW_KEY_ERR, &err) == AW_PARSE_OK && err == AW_ERR_MALFUNCTION &&
+          aw_get_uui(&v, AW_KEY_UUI, got) != AW_PARSE_OK, "fail: Demt(12) -12909 without ,uui");
+    CHECK(e_type(4, &v) == AW_PARSE_OK && v.type == AW_MSG_DBUF && aw_get_s64(&v, AW_KEY_FRM, &frm) == AW_PARSE_OK &&
+          frm == 13, "fail: Dbuf(13) started");
+
+    /* frame 13 decodes; after its Demt reply nothing is left */
+    ereset();
+    aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0x9400));
+    CHECK(g_ne == 2 && e_type(1, &v) == AW_PARSE_OK && v.type == AW_MSG_DEMT, "park: Demt(13)");
+    ereset();
+    aw_engine_deliver(e, m, build_demt_reply(m, uuid));
+    CHECK(g_ne == 1 && e_is_rels(0), "park: FIFO empty after the last frame");
+
+    /* AW-PARK-04: units parked at session close are freed (ASan) */
+    aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 20, 601, au, sizeof au));
+    aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 21, 602, au, sizeof au));
+    g_decode_drop_at = g_decode_fail_at = -1;
+    aw_engine_destroy(e);
+}
+
 static void test_sbuf(void) {
     printf("-- sbuf (H3): sdat + native-scalar stia --\n");
     uint8_t buf[256];
@@ -307,6 +402,7 @@ int main(void) {
     test_listlike_routing();
     test_session_open_close();
     test_decode_exchange();
+    test_parked_frames();
     if (g_fail) { printf("FAILED: %d check(s)\n", g_fail); return 1; }
     printf("OK: all aw_session checks passed\n");
     return 0;

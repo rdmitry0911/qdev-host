@@ -50,9 +50,17 @@
 #include "qdp.h"
 #include "vtpv_vaapi.h"
 #include "vtpv_nvdec.h"
+#ifdef VTPV_HAVE_LAVC
+#include "vtpv_lavc.h"     /* stream decode core (libavcodec + VA-API/CUDA), plan U1 */
+#endif
 #include "vtpv_virtq.h"
 #include "aw_session.h"   /* the Apple contract-B wire session engine (H5/H6/H7) */
 #include "vt_scatter.h"   /* page-aware landing into a non-contiguous guest surface */
+#ifdef VTPV_HAVE_LAVC
+#define VT_LAVC_CLOSE(d) do { if ((d)->lavc) { vtpv_lavc_close((d)->lavc); (d)->lavc = NULL; } } while (0)
+#else
+#define VT_LAVC_CLOSE(d) do { (void)(d); } while (0)
+#endif
 #include "../uniq-vgpu/pvg_mapper_bridge.h" /* increment 2: resolve mapping_id -> gpa-ranges */
 
 /* ---- device constants ---------------------------------------------- */
@@ -147,6 +155,11 @@ typedef struct vt_dev {
 
     vtpv_vaapi              *va;
     vtpv_nvdec              *nvdec;
+#ifdef VTPV_HAVE_LAVC
+    vtpv_lavc               *lavc;     /* preferred: DPB-correct stream decode    */
+#else
+    void                    *lavc;
+#endif
     const vtpv_decoder_backend *be;
     aw_engine               *engine;   /* contract-B wire session engine          */
 
@@ -531,7 +544,15 @@ static int vt_copy_frame(void *ctx, const vtpv_decoded_frame *f, const aw_out_bu
     int rc;
     if (!b->y) return -1;
     /* land the full NV12 frame: Y plane, then the interleaved UV plane. Route to
-     * whichever backend is active (NVDEC on an NVIDIA host, else VA-API). */
+     * whichever backend is active (the libavcodec stream core, else the legacy
+     * intra-only NVDEC / VA-API backends). */
+#ifdef VTPV_HAVE_LAVC
+    if (d->lavc) {
+        rc = vtpv_lavc_read_luma(d->lavc, f->surface_id, b->y, b->y_stride, f->width, f->height);
+        if (rc == 0 && b->uv)
+            rc = vtpv_lavc_read_chroma(d->lavc, f->surface_id, b->uv, b->uv_stride, f->width, f->height);
+    } else
+#endif
     if (d->nvdec) {
         rc = vtpv_nvdec_read_luma(d->nvdec, f->surface_id, b->y, b->y_stride, f->width, f->height);
         if (rc == 0 && b->uv)
@@ -812,19 +833,44 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
     pthread_mutex_init(&d->m, NULL);
     d->device_features = VT_DEVICE_FEATURES;
 
-    /* Pick a decode backend: NVDEC on an NVIDIA GPU (CUDA opens it), else VA-API
-     * on the DRM render node, else the selection-only stub. `backend=nvdec|vaapi
-     * |auto` overrides (default auto = NVDEC first); `gpu=<cuda ordinal>` selects
-     * the NVIDIA GPU. */
+    /* Pick a decode backend. With libavcodec (VTPV_HAVE_LAVC) the stream core
+     * is used: CUDA/NVDEC on an NVIDIA GPU, else VA-API on the DRM render node;
+     * it keeps the DPB across frames (P/B pictures, HEVC). `backend=` selects:
+     * auto (default: NVDEC first), nvdec, vaapi (stream core on that hardware),
+     * nvdec-intra / vaapi-intra (the legacy one-frame-intra backends, kept for
+     * comparison). `gpu=<cuda ordinal>` selects the NVIDIA GPU. */
     {
-        const char *want = "auto", *gpu = NULL, *q;
-        int try_nvdec, try_vaapi;
-        if (args && (q = strstr(args, "backend="))) want = q + 8;
+        char want[16] = "auto";
+        const char *gpu = NULL, *q;
+        int try_nvdec, try_vaapi, legacy;
+        if (args && (q = strstr(args, "backend="))) {
+            size_t n = strcspn(q + 8, ", ");
+            if (n >= sizeof want) n = sizeof want - 1;
+            memcpy(want, q + 8, n); want[n] = 0;
+        }
         if (args && (q = strstr(args, "gpu=")))     gpu = q + 4;
+        legacy    = strstr(want, "-intra") != NULL;
         try_nvdec = strncmp(want, "vaapi", 5) != 0; /* auto or nvdec */
         try_vaapi = strncmp(want, "nvdec", 5) != 0; /* auto or vaapi */
-
-        if (try_nvdec) {
+#ifdef VTPV_HAVE_LAVC
+        if (!legacy) {
+            if (try_nvdec) {
+                char ord[16] = "0";
+                if (gpu) { size_t n = strcspn(gpu, ", "); if (n >= sizeof ord) n = sizeof ord - 1; memcpy(ord, gpu, n); ord[n] = 0; }
+                rc = vtpv_lavc_open(VTPV_LAVC_HW_CUDA, ord, &d->lavc, err, sizeof(err));
+                if (rc != 0) { vt_log(d, 2, "stream core: CUDA/NVDEC unavailable: %s", err); d->lavc = NULL; }
+            }
+            if (!d->lavc && try_vaapi) {
+                rc = vtpv_lavc_open(VTPV_LAVC_HW_VAAPI, node, &d->lavc, err, sizeof(err));
+                if (rc != 0) { vt_log(d, 1, "stream core: VA-API unavailable on %s: %s", node, err); d->lavc = NULL; }
+            }
+            if (d->lavc) d->be = vtpv_lavc_backend();
+        }
+#else
+        if (!legacy)
+            vt_log(d, 1, "built without libavcodec: using the legacy intra-only backends");
+#endif
+        if (!d->be && try_nvdec) {
             rc = vtpv_nvdec_open(gpu, &d->nvdec, &d->be, NULL, err, sizeof(err));
             if (rc != 0) {
                 vt_log(d, 2, "NVDEC backend unavailable: %s", err);
@@ -849,7 +895,8 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
         aw_session_cfg cfg;
         memset(&cfg, 0, sizeof cfg);
         cfg.be = d->be;
-        cfg.be_ctx = d->nvdec ? vtpv_nvdec_ctx(d->nvdec)
+        cfg.be_ctx = d->lavc ? (void *)d->lavc
+                   : d->nvdec ? vtpv_nvdec_ctx(d->nvdec)
                    : (d->va ? vtpv_vaapi_ctx(d->va) : NULL);
         cfg.emit = vt_emit; cfg.emit_ctx = d;
         cfg.resolve_buffer = vt_resolve_buffer;
@@ -859,6 +906,7 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
         d->engine = aw_engine_create(&cfg);
     }
     if (!d->engine) {
+        VT_LAVC_CLOSE(d);
         if (d->nvdec) vtpv_nvdec_close(d->nvdec);
         if (d->va) vtpv_vaapi_close(d->va);
         free(d);
@@ -901,12 +949,13 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
     *priv = d;
     vt_log(d, 2, "apple-videotoolbox %04x:%04x up (%u virtqueues, %s)",
            VT_PCI_VENDOR, VT_PCI_DEVICE, VT_QUEUES,
-           d->nvdec ? "NVDEC decode" : d->va ? "VA-API decode"
-                    : d->be ? "stub decode" : "no backend");
+           d->lavc ? "stream decode (libavcodec)" : d->nvdec ? "NVDEC intra decode"
+                    : d->va ? "VA-API intra decode" : d->be ? "stub decode" : "no backend");
     return 0;
 
 fail:
     aw_engine_destroy(d->engine);
+    VT_LAVC_CLOSE(d);
     if (d->nvdec) vtpv_nvdec_close(d->nvdec);
     if (d->va) vtpv_vaapi_close(d->va);
     free(d);
@@ -919,6 +968,7 @@ static void vt_teardown(void *priv)
     if (!d) return;
     if (g_dev == d) g_dev = NULL;
     aw_engine_destroy(d->engine);
+    VT_LAVC_CLOSE(d);
     if (d->nvdec) vtpv_nvdec_close(d->nvdec);
     if (d->va) vtpv_vaapi_close(d->va);
     pthread_mutex_destroy(&d->m);

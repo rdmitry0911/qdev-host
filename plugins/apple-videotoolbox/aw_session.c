@@ -19,10 +19,26 @@
 #define AW_EXT_HVCC   AW_4CC('h','v','c','C')
 #define AW_PIXFMT_420V AW_4CC('4','2','0','v')
 
-/* a session's in-flight frame (one at a time in this slice; up to ~3 is a later
- * refinement) progresses: IDLE -> AWAIT_DBUF (Dbuf sent) -> AWAIT_DEMT (frame
- * copied, Demt sent) -> IDLE. */
+/* a session's in-flight frame progresses: IDLE -> AWAIT_DBUF (Dbuf sent) ->
+ * AWAIT_DEMT (frame copied, Demt sent) -> IDLE. One frame is in flight at a
+ * time (frames are emitted in decode order, one Demt per dfrm, as Apple's host
+ * decoder does); a dfrm that arrives while one is in flight is parked in a
+ * FIFO and started when the previous frame completes. Its dfrm reply then goes
+ * after its own Dbuf reply, as for the first (Apple's host holds the dfrm reply
+ * the same way). */
 enum { AW_FRM_IDLE = 0, AW_FRM_AWAIT_DBUF, AW_FRM_AWAIT_DEMT };
+
+#define AW_PARK_MAX 16u
+#define AW_INFO_ASYNC        0x1u /* kVTDecodeInfo_Asynchronous                 */
+#define AW_INFO_FRAMEDROPPED 0x2u /* kVTDecodeInfo_FrameDropped                 */
+
+typedef struct aw_parked {
+    uint8_t  *au;
+    size_t    au_len;
+    int64_t   frm;
+    uint32_t  inf;
+    uint64_t  reply_id;
+} aw_parked;
 
 typedef struct aw_dsession {
     int      used;
@@ -41,6 +57,10 @@ typedef struct aw_dsession {
     uint32_t     pend_inf;   /* async flag echoed into the dfrm reply / Demt      */
     uint64_t     pend_dfrm_reply_id;
     aw_out_buffer pend_buf;  /* the lent buffer, held from Dbuf reply to rels     */
+
+    /* dfrm units waiting for the in-flight frame to complete (FIFO)          */
+    aw_parked    park[AW_PARK_MAX];
+    unsigned     park_head, park_n;
 } aw_dsession;
 
 struct aw_engine {
@@ -317,6 +337,8 @@ static void close_session(aw_engine *e, aw_dsession *s)
     if (s->pend_state == AW_FRM_AWAIT_DEMT && e->cfg.put_buffer)
         e->cfg.put_buffer(e->cfg.buf_ctx, &s->pend_buf); /* let a held buffer go */
     if (s->pend_au) free(s->pend_au);
+    for (unsigned i = 0; i < s->park_n; i++)
+        free(s->park[(s->park_head + i) % AW_PARK_MAX].au);
     if (s->dec && e->cfg.be && e->cfg.be->close_decoder)
         e->cfg.be->close_decoder(s->dec);
     memset(s, 0, sizeof(*s));
@@ -560,7 +582,7 @@ static void emit_demt(aw_engine *e, aw_dsession *s, int64_t frm, int32_t err,
     aw_put_s64(&b, AW_KEY_FRM, frm);
     aw_put_s32(&b, AW_KEY_ERR, err);
     aw_put_u32(&b, AW_KEY_INF, inf);
-    aw_put_uui(&b, AW_KEY_UUI, uuid);
+    if (uuid) aw_put_uui(&b, AW_KEY_UUI, uuid); /* no ,uui = no buffer (dropped/failed) */
     size_t n = aw_build_finalize(&b);
     if (n) emit(e, buf, n);
 }
@@ -596,17 +618,53 @@ static void emit_dfrm_reply(aw_engine *e, aw_dsession *s, const aw_msg_view *v,
     if (n) emit(e, buf, n);
 }
 
+/* Start a frame: make it the in-flight one and ask the guest for a buffer. */
+static void start_frame(aw_engine *e, aw_dsession *s, const uint8_t *au, size_t au_len,
+                        int64_t frm, uint32_t inf, uint64_t reply_id)
+{
+    s->pend_au_len = au_len;
+    if (au != s->pend_au) memcpy(s->pend_au, au, au_len);
+    s->pend_frm = frm;
+    s->pend_inf = inf;
+    s->pend_dfrm_reply_id = reply_id;
+    s->pend_state = AW_FRM_AWAIT_DBUF;
+    emit_dbuf(e, s, frm);            /* -> guest replies Dbuf with a lent buffer   */
+}
+
+static int reserve_au(aw_dsession *s, size_t au_len)
+{
+    if (s->pend_au_cap < au_len) {
+        uint8_t *n = realloc(s->pend_au, au_len);
+        if (!n) return -1;
+        s->pend_au = n; s->pend_au_cap = au_len;
+    }
+    return 0;
+}
+
+/* The in-flight frame completed: start the oldest parked unit, if any. */
+static void start_next(aw_engine *e, aw_dsession *s)
+{
+    if (s->pend_state != AW_FRM_IDLE || s->park_n == 0) return;
+    aw_parked *p = &s->park[s->park_head];
+    s->park_head = (s->park_head + 1) % AW_PARK_MAX;
+    s->park_n--;
+    if (reserve_au(s, p->au_len) == 0) {
+        memcpy(s->pend_au, p->au, p->au_len);
+        start_frame(e, s, s->pend_au, p->au_len, p->frm, p->inf, p->reply_id);
+    }
+    free(p->au);
+    p->au = NULL;
+}
+
 /* dfrm: park the access unit, emit Dbuf, and RETURN. The decode continues when
- * the guest's Dbuf reply arrives (handle_guest_reply). Async-only, one frame in
- * flight per session in this slice. */
+ * the guest's Dbuf reply arrives (handle_guest_reply). Async-only; one frame in
+ * flight per session, later units wait in the FIFO. */
 static int32_t handle_dfrm(aw_engine *e, aw_dsession *s, const aw_msg_view *v)
 {
     if (!s->started) {
         emit_dfrm_reply(e, s, v, AW_ERR_BAD_DATA, 0);   /* 311, nothing else       */
         return AW_NOERR;
     }
-    if (s->pend_state != AW_FRM_IDLE)
-        return AW_ERR_MALFUNCTION;   /* a second frame before the last finished   */
 
     const uint8_t *sbf; size_t sbf_len;
     if (aw_get_bytes(v, AW_KEY_SBF, AW_VT_SBF, &sbf, &sbf_len) != AW_PARSE_OK)
@@ -615,23 +673,27 @@ static int32_t handle_dfrm(aw_engine *e, aw_dsession *s, const aw_msg_view *v)
     if (aw_sbuf_read(sbf, sbf_len, &au, &au_len, NULL, NULL) < 0)
         return AW_ERR_MALFORMED;
 
-    /* keep the AU bytes until the Dbuf reply lets us decode into a lent buffer */
-    if (s->pend_au_cap < au_len) {
-        uint8_t *n = realloc(s->pend_au, au_len);
-        if (!n) return AW_ERR_MALFUNCTION;
-        s->pend_au = n; s->pend_au_cap = au_len;
-    }
-    memcpy(s->pend_au, au, au_len);
-    s->pend_au_len = au_len;
-
     int64_t frm64 = 0; (void)aw_get_s64(v, AW_KEY_FRM, &frm64);
     uint32_t dfl = 0; aw_get_u32(v, AW_KEY_DFL, &dfl);
-    s->pend_frm = frm64;
-    s->pend_inf = (dfl & 1u) ? 0x1u : 0u; /* kVTDecodeInfo_Asynchronous           */
-    s->pend_dfrm_reply_id = v->reply_id;
-    s->pend_state = AW_FRM_AWAIT_DBUF;
+    uint32_t inf = (dfl & 1u) ? AW_INFO_ASYNC : 0u;
 
-    emit_dbuf(e, s, frm64);          /* -> guest replies Dbuf with a lent buffer   */
+    if (s->pend_state != AW_FRM_IDLE) {
+        /* a frame is in flight: park this unit until it completes            */
+        if (s->park_n >= AW_PARK_MAX)
+            return AW_ERR_MALFUNCTION;
+        aw_parked *p = &s->park[(s->park_head + s->park_n) % AW_PARK_MAX];
+        p->au = malloc(au_len ? au_len : 1);
+        if (!p->au) return AW_ERR_MALFUNCTION;
+        memcpy(p->au, au, au_len);
+        p->au_len = au_len; p->frm = frm64; p->inf = inf; p->reply_id = v->reply_id;
+        s->park_n++;
+        return AW_NOERR;
+    }
+
+    /* keep the AU bytes until the Dbuf reply lets us decode into a lent buffer */
+    if (reserve_au(s, au_len) != 0) return AW_ERR_MALFUNCTION;
+    memcpy(s->pend_au, au, au_len);
+    start_frame(e, s, s->pend_au, au_len, frm64, inf, v->reply_id);
     return AW_NOERR;
 }
 
@@ -659,17 +721,26 @@ static int32_t handle_guest_reply(aw_engine *e, aw_dsession *s,
 
         if (got != 0) {              /* guest lent nothing usable: drop the frame */
             s->pend_state = AW_FRM_IDLE;
+            start_next(e, s);
             return AW_NOERR;
         }
 
         vtpv_decoded_frame f; memset(&f, 0, sizeof f);
         int dr = e->cfg.be->decode(s->dec, s->pend_au, s->pend_au_len, &f);
-        if (dr != 0) {               /* failed frame: Demt -12909, Dfub, rels     */
-            emit_demt(e, s, s->pend_frm, AW_ERR_MALFUNCTION, s->pend_inf, ob.uuid);
+        if (dr != 0) {
+            /* Apple's host: a sample with no picture is emitted with
+             * FrameDropped and no buffer; a frame that does not decode with the
+             * decoder's status and no buffer; the unused buffer goes back with
+             * Dfub, then rels. */
+            if (dr == VTPV_DROPPED)
+                emit_demt(e, s, s->pend_frm, AW_NOERR, s->pend_inf | AW_INFO_FRAMEDROPPED, NULL);
+            else
+                emit_demt(e, s, s->pend_frm, AW_ERR_MALFUNCTION, s->pend_inf, NULL);
             emit_dfub(e, s, ob.uuid);
             emit_rels(e, ob.mapping_id);
             if (e->cfg.put_buffer) e->cfg.put_buffer(e->cfg.buf_ctx, &ob);
             s->pend_state = AW_FRM_IDLE;
+            start_next(e, s);
             return AW_NOERR;
         }
 
@@ -685,6 +756,7 @@ static int32_t handle_guest_reply(aw_engine *e, aw_dsession *s,
         emit_rels(e, s->pend_buf.mapping_id);  /* the frame is done; release it    */
         if (e->cfg.put_buffer) e->cfg.put_buffer(e->cfg.buf_ctx, &s->pend_buf);
         s->pend_state = AW_FRM_IDLE;
+        start_next(e, s);
         return AW_NOERR;
     }
 
