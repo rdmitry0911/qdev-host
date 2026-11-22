@@ -203,7 +203,8 @@ int run_oracle(const stream *s, oracle *o)
         (void)rc;
         while (avcodec_receive_frame(ctx, f) == 0) {
             if (f->pts >= 0 && f->pts < MAXF &&
-                (f->format == AV_PIX_FMT_YUV420P || f->format == AV_PIX_FMT_YUV420P10LE)) {
+                (f->format == AV_PIX_FMT_YUV420P || f->format == AV_PIX_FMT_YUVJ420P /* full range 8-bit */ ||
+                 f->format == AV_PIX_FMT_YUV420P10LE)) {
                 if (f->format == AV_PIX_FMT_YUV420P10LE) {
                     md5_p010_from_planar(f, f->width, f->height, o->md5[f->pts]);
                     o->bits = 10;
