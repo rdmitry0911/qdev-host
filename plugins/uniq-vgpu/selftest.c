@@ -520,6 +520,15 @@ int main(int argc, char **argv)
     for (int i = 2; i + 1 < argc; i++) {
         if (!strcmp(argv[i], "--reload-noapi")) reload_noapi = argv[i + 1];
     }
+    /* --reload-mapper refuse|handover : step 10e-m (D-MAPPER-RELOAD) with a live iosfc_mapper
+     * mapping.  "refuse": the loaded library refuses will_suspend with live mappings (QMetal
+     * before the mapper hand-over): the reload must be refused (-EBUSY) and the old Session keep
+     * serving.  "handover": the library hands the mapper over: the reload succeeds and the new
+     * Session serves the mapping. */
+    const char *reload_mapper = NULL;
+    for (int i = 2; i + 1 < argc; i++) {
+        if (!strcmp(argv[i], "--reload-mapper")) reload_mapper = argv[i + 1];
+    }
     setvbuf(stdout, NULL, _IOLBF, 0);
 
     /* 1. plugin ABI */
@@ -1491,6 +1500,123 @@ int main(int argc, char **argv)
                     }
                     wr(PVG_REG_FIFO_ENABLE, 0);
                 }
+                r = ops->quiesce(priv); ops->dma_unregister(priv, &b); ops->resume(priv);
+                free(inst);
+            }
+            /* 10e-m. D-MAPPER-RELOAD (apple-virgl analysis/20261123-FIX-CANDIDATE-D-MAPPER-RELOAD.md): a
+             * transparent reload while the guest's IOSurface-mapper ring holds a live mapping (AppleGVA
+             * video; live warm-hzmain main v40/v41: "QMU_SUSPEND phase=will_suspend refused: 2 live
+             * iosfc_mapper mappings (D-MAPPER)" then "reload: guest GPU state lost").  Guest side as the
+             * UniqVGPU kext programs it (reference IOSurfaceParavirtMapperDevice::start order: FEATURES,
+             * RING_BASE, DESC_BASE, RING_WR=0, RING_RD=0, RING_SIZE) and a two-page first-form NV12
+             * descriptor for id 1 (below 4 GiB: BAR0 takes 4-byte accesses, an 8-byte access is the low
+             * dword then the high dword, and the mapper's 64-bit registers keep the low dword). */
+            if (reload_mapper) {
+                const bool want_handover = !strcmp(reload_mapper, "handover");
+                const uint64_t mring = A_IOVA + 0x2000000, mtable = mring + 0x1000, mdpage = mring + 0x2000,
+                               mroot = mring + 0x3000, msurf = mring + 0x10000;
+                const uint64_t mdesc1 = mdpage + 0x200;           /* id 1: descriptor 1 of page 0 (first form) */
+                const uint64_t fifo_gpa = B_IOVA + 0x100000, root_gpa = B_IOVA + 0x0f0000;
+                uint8_t *fifo = guest + B_FILE_OFF + 0x100000;
+                qdp_dma_region b = { B_IOVA, B_LEN, guest + B_FILE_OFF, memfd, B_FILE_OFF,
+                                     PROT_READ | PROT_WRITE };
+#define MPTE(gpa) ((uint32_t)(((gpa) >> 12) << 2) | 1u)
+#define MPUT32(gpa, v) do { uint32_t v_ = (v); memcpy(guest + (gpa), &v_, 4); } while (0)
+#define MGET32(gpa) ({ uint32_t v_; memcpy(&v_, guest + (gpa), 4); v_; })
+                memset(guest + mring, 0, 0x20000);
+                MPUT32(mtable, MPTE(mdpage));
+                MPUT32(mdesc1 + 0x00, MPTE(mroot));
+                MPUT32(mdesc1 + 0x04, 0x34323076u);               /* '420v' */
+                MPUT32(mdesc1 + 0x10, 2 * 4096);
+                MPUT32(mdesc1 + 0x14, (64u << 8) | 4);
+                MPUT32(mdesc1 + 0x18, (64u << 8) | 5);
+                MPUT32(mdesc1 + 0x1c, 64);
+                guest[mdesc1 + 0x24] = 2;
+                MPUT32(mdesc1 + 0x40 + 0x10, 64 * 64);
+                MPUT32(mdesc1 + 0x40 + 0x1c, 64);
+                MPUT32(mdesc1 + 0x80 + 0x08, 64 * 64);
+                MPUT32(mdesc1 + 0x80 + 0x10, 64 * 32);
+                MPUT32(mdesc1 + 0x80 + 0x1c, 64);
+                MPUT32(mroot + 0, MPTE(msurf));
+                MPUT32(mroot + 4, MPTE(msurf + 0x1000));
+#define MCMD(slot, cmd, id) do { uint32_t c_[4] = { (cmd), (id), 0x5555u, 0 }; \
+                    memcpy(guest + mring + 16u * (slot), c_, 16); wr(0x1248, (slot) + 1u); } while (0)
+#define MSTATUS(slot) MGET32(mring + 16u * (slot) + 8u)
+                char marker[64];
+                char *inst = mint_instance(reload_golden, sib, 95, root, marker, sizeof(marker));
+                CHECK(inst != NULL, "mapper reload: mint instance (marker=%s)", inst ? marker : "FAILED");
+                r = ops->quiesce(priv); ops->dma_register(priv, &b); ops->resume(priv);
+                if (inst) {
+                    wr(PVG_REG_FIFO_ENABLE, 0);
+                    memset(guest + B_FILE_OFF + 0x0f0000, 0, 0x1000);
+                    wr(PVG_REG_PROTOCOL_VERSION, 6);
+                    wr(PVG_REG_SHARED_STATE_PFN, (uint32_t)(root_gpa >> 12));
+                    wr(PVG_REG_FIFO_PFN, (uint32_t)(fifo_gpa >> 12));
+                    wr(PVG_REG_FIFO_OFFSET, 0x1000);
+                    wr(PVG_REG_FIFO_SIZE, 0x10000);
+                    wr(PVG_REG_FIFO_ENABLE, 1);
+                    for (uint32_t i = 0; i < 2; i++) {
+                        uint32_t nop[3] = { 0x03, 12, 0x7000 + i };
+                        memcpy(fifo + 0x1000 + 12 * i, nop, sizeof(nop));
+                    }
+                    wr(PVG_REG_FIFO_WRITE, 12);
+                    CHECK(wait_reg(PVG_REG_FIFO_READ, 12, 5.0), "mapper reload: root FIFO live (FIFO_READ %u)",
+                          rd(PVG_REG_FIFO_READ));
+                    (void)rd(0x1258);                                  /* FEATURES */
+                    wr(0x1230, (uint32_t)mring);                       /* RING_BASE */
+                    wr(0x1240, (uint32_t)mtable);                      /* DESC_BASE */
+                    wr(0x1248, 0);                                     /* RING_WR */
+                    wr(0x1250, 0);                                     /* RING_RD */
+                    wr(0x1238, 256);                                   /* RING_SIZE */
+                    MCMD(0, 1u, 1u);                                   /* MAP id 1 */
+                    CHECK(MSTATUS(0) == 0 && (MGET32(mdesc1) & 2u) != 0,
+                          "mapper reload: id 1 mapped before the reload (status 0x%x, word0 0x%x)",
+                          MSTATUS(0), MGET32(mdesc1));
+                    char before_path[512] = "";
+                    ops->backend_report(priv, rep, sizeof(rep));
+                    { char *p = strstr(rep, "path="); if (p) sscanf(p, "%511s", before_path); }
+                    int errs_before = get_int(&qmetal_errors);
+                    r = ops->quiesce(priv);
+                    int rr = ops->reload(priv, inst, 0);
+                    ops->resume(priv);
+                    usleep(50 * 1000);
+                    char after_path[512] = "";
+                    ops->backend_report(priv, rep, sizeof(rep));
+                    { char *p = strstr(rep, "path="); if (p) sscanf(p, "%511s", after_path); }
+                    if (want_handover) {
+                        char banner[256]; get_live_banner(banner, sizeof(banner));
+                        CHECK(r == 0 && rr == 0, "mapper reload (handover): reload with a live mapping succeeds (rc=%d/%d)",
+                              r, rr);
+                        CHECK(strstr(banner, marker) != NULL, "mapper reload (handover): NEW banner live: %s", banner);
+                        CHECK(get_int(&qmetal_errors) == errs_before, "mapper reload (handover): 0 new QMU [ERROR] lines (%d)",
+                              get_int(&qmetal_errors) - errs_before);
+                    } else {
+                        CHECK(rr == -EBUSY, "mapper reload (refuse): the refused suspend refuses the reload with -EBUSY "
+                              "(rc=%d)", rr);
+                        CHECK(!strcmp(before_path, after_path), "mapper reload (refuse): the old Session stays loaded (%s)",
+                              after_path);
+                    }
+                    CHECK(rd(PVG_REG_PROTOCOL_VERSION) == 6 && rd(PVG_REG_FIFO_READ) == 12,
+                          "mapper reload: device state kept (protocol %u, FIFO_READ %u)",
+                          rd(PVG_REG_PROTOCOL_VERSION), rd(PVG_REG_FIFO_READ));
+                    wr(PVG_REG_FIFO_WRITE, 24);
+                    CHECK(wait_reg(PVG_REG_FIFO_READ, 24, 5.0), "mapper reload: the root FIFO consumes new work "
+                          "(FIFO_READ %u)", rd(PVG_REG_FIFO_READ));
+                    MCMD(1, 2u, 1u);                                   /* UNMAP id 1 */
+                    CHECK(MSTATUS(1) == 0 && (MGET32(mdesc1) & 2u) == 0,
+                          "mapper reload: the Session after the reload still serves live id 1 (UNMAP status 0x%x, "
+                          "word0 0x%x)", MSTATUS(1), MGET32(mdesc1));
+                    MCMD(2, 1u, 1u);                                   /* MAP id 1 again */
+                    CHECK(MSTATUS(2) == 0 && (MGET32(mdesc1) & 2u) != 0,
+                          "mapper reload: the mapper ring keeps serving (MAP status 0x%x)", MSTATUS(2));
+                    MCMD(3, 2u, 1u);                                   /* leave nothing mapped */
+                    wr(PVG_REG_FIFO_ENABLE, 0);
+                }
+#undef MCMD
+#undef MSTATUS
+#undef MPTE
+#undef MPUT32
+#undef MGET32
                 r = ops->quiesce(priv); ops->dma_unregister(priv, &b); ops->resume(priv);
                 free(inst);
             }

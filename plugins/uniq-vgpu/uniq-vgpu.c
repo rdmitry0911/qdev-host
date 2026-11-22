@@ -3866,15 +3866,28 @@ static int pvg_backend_reload_body(PvgState *s, const char *new_path, int reset)
     if (s->qmu_dev && !reset && pvg_vt_can_suspend(pvg_qvt)) {
         void *owned = NULL;
         int q = pvg_qvt->session_will_suspend(s->qmu_dev);
-        if (q == 0) q = pvg_qvt->session_finish_suspend(s->qmu_dev, &owned, &blob_len);
+        if (q != 0) {
+            /* D-MAPPER-RELOAD: willSuspend refuses before it changes anything (QMetal returns ahead of
+             * _runState = EnteringSuspend and the FIFO quiesce, e.g. a pre-hand-over library with live
+             * iosfc_mapper mappings), so the old Session is intact and keeps serving the guest: the
+             * reload is refused, nothing is torn down (re-creating without the state would lose the
+             * guest's GPU and video state; apple-virgl evidence/runs/main-v41-20261122 RELOAD
+             * DISCRIMINATOR).  The caller replies "err reload: Device or resource busy"; use a cold
+             * restart to change the library. */
+            pvg_log(s, "[uniq-vgpu-ml][reload] suspend refused (%d) by the loaded library: reload of %s "
+                    "refused, the current Session continues unchanged (cold restart to change it)\n", q, new_path);
+            pthread_mutex_unlock(&s->backing_lock);
+            return -EBUSY;
+        }
+        q = pvg_qvt->session_finish_suspend(s->qmu_dev, &owned, &blob_len);
         if (q == 0 && owned) {
             blob = g_memdup2(owned, blob_len);        /* plugin-owned copy */
             pvg_qvt->suspend_state_free(owned);       /* released by the instance that made it */
         }
         if (q != 0 || !blob) {
-            /* QMetal refuses e.g. with live iosfc_mapper mappings (D-MAPPER) or a
-             * drain timeout; the readers may already be quiesced, so the old
-             * Session cannot simply continue: fall back to the legacy re-create. */
+            /* finishSuspend failed after willSuspend accepted (e.g. a drain timeout):
+             * the readers are already quiesced, so the old Session cannot simply
+             * continue: fall back to the legacy re-create. */
             pvg_log(s, "[uniq-vgpu-ml][reload][ERROR] suspend refused (%d): reload: guest GPU state lost\n", q);
             g_free(blob);
             blob = NULL;
