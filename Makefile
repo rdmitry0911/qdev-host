@@ -147,6 +147,7 @@ plugins/uniq-vgpu/selftest: plugins/uniq-vgpu/selftest.c qdp.h $(VFU_DEP)
 
 uniq-vgpu-selftest: plugins/uniq-vgpu/uniq-vgpu.so plugins/uniq-vgpu/selftest
 	plugins/uniq-vgpu/selftest plugins/uniq-vgpu/uniq-vgpu.so
+	UVG_DISP_D1_DEST=1 plugins/uniq-vgpu/selftest plugins/uniq-vgpu/uniq-vgpu.so
 	plugins/uniq-vgpu/selftest plugins/uniq-vgpu/uniq-vgpu.so --personality 0xeee1
 
 # Native unit test of the process-VM provider and the ordinary physical capture

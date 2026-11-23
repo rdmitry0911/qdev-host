@@ -93,6 +93,8 @@ static int qmu_reset_done, plugin_reset_ok, plugin_reset_err, line_seq, ord_plug
 /* teardownDisplays, host side: the plugin returned its display mode target before the PGDevice
  * reset and published the mode again after it ("phase=display_republished target=1 restart=0"). */
 static int display_republish_ok;
+/* DISP-D1 knob: the plugin's "[display] DISP-D1 dest=<0|1> dmabuf=<fd|-1>" line at scanout init (-2 = not seen) */
+static int d1_dest_seen = -2, d1_dmabuf_seen = -2;
 static char last_refusal[4096];
 /* ui_info refusals: the plugin's "[display][WARN] ui_info ... refused: <reason>" lines */
 static int ui_info_refusals;
@@ -157,6 +159,9 @@ static void host_log(void *host, int level, const char *fmt, ...)
     }
     if (strstr(line, "firmware PCI identity") && strstr(line, "armed (")) {
         ord_rearm = line_seq;
+    }
+    if (strstr(line, "[uniq-vgpu-ml][display] DISP-D1 dest=")) {
+        (void)sscanf(strstr(line, "dest="), "dest=%d dmabuf=%d", &d1_dest_seen, &d1_dmabuf_seen);
     }
     if (strstr(line, "[uniq-vgpu-ml][display][WARN] ui_info ") && strstr(line, " refused: ")) {
         ui_info_refusals++;
@@ -915,6 +920,25 @@ int main(int argc, char **argv)
               get_int(&frame_calls));
         CHECK(ops->get_cursor(priv, &cur) && !cur.visible && !cur.pixels,
               "cursor plane present, no glyph defined yet");
+        /* DISP-D1 knob (UVG_DISP_D1_DEST, default off): off = the pre-DISP-D1 scanout (no udmabuf over the memfd, so no
+         * import, forget or reservation can follow); on = the udmabuf exists whenever /dev/udmabuf can be opened. */
+        {
+            const char *k = getenv("UVG_DISP_D1_DEST");
+            int want = (k && strcmp(k, "1") == 0) ? 1 : 0;
+            int udev = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+            int dest, dmabuf;
+
+            if (udev >= 0) {
+                close(udev);
+            }
+            pthread_mutex_lock(&host_lock);
+            dest = d1_dest_seen;
+            dmabuf = d1_dmabuf_seen;
+            pthread_mutex_unlock(&host_lock);
+            CHECK(dest == want && (want ? (udev >= 0 ? dmabuf >= 0 : dmabuf == -1) : dmabuf == -1),
+                  "DISP-D1 knob UVG_DISP_D1_DEST=%s: plugin dest=%d dmabuf=%d (want dest=%d, %s)", k ? k : "unset",
+                  dest, dmabuf, want, want ? (udev >= 0 ? "udmabuf present" : "no /dev/udmabuf -> -1") : "no udmabuf");
+        }
     }
 
     /* 9b. UI size requests (qdp v3 ui_info, display-modes=follow): the mode
