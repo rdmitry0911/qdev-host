@@ -98,6 +98,14 @@ struct pvg_qmu_vt {
      * NULL on a libmlapi older than the port of the reset lifecycle; pvg_reset
      * then logs an [ERROR] (the guest's next boot would stall) and goes on. */
     __typeof__(qmu_session_reset_for_device_reset)                    *session_reset_for_device_reset;
+    /* Optional (DISP-D1, QMetal newer than 2522102b1): the frame's readback lands straight in the scanout
+     * buffer reserved for it. Typed here, not by __typeof__, so the plugin still builds against an older
+     * QMetal include; NULL on an instance that does not export them -> the BH read copies as before. */
+    int (*display_frame_attach_destination)(qmu_owned_display_frame *, void *bytes, size_t length,
+                                            uint32_t stride);
+    int (*display_frame_attach_destination_fd)(qmu_owned_display_frame *, void *bytes, size_t length,
+                                               uint32_t stride, int dmabuf_fd, uint64_t dmabuf_offset);
+    void (*display_forget_destinations)(struct qmu_vulkan_ctx *, const void *base, size_t length);
     /* Optional: the PGDevice suspend/resume state hand-over (apple-virgl plan
      * 20261118 Q4-Q6; DSGP v2 blob = reference serializeSuspendState format).
      * Plain pointer types, so the plugin builds against an older header; NULL
@@ -245,6 +253,8 @@ typedef struct PvgScanout {
     unsigned nslots;
     uint32_t width, height, stride;
     int front;                   /* last published buffer */
+    uint32_t reserved;           /* DISP-D1: buffers a frame in flight reads back into (bit per slot) */
+    int dmabuf_fd;               /* DISP-D1: udmabuf over the whole memfd (RADV import path), -1 if none */
     int held;                    /* buffer the host fetched last */
     uint64_t seq;
 } PvgScanout;

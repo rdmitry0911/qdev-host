@@ -50,6 +50,8 @@
 #include <elf.h>
 #include <link.h>
 #include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/udmabuf.h>
 #include <limits.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -135,6 +137,9 @@ bool pvg_qmu_vt_bind(struct pvg_qmu_vt *vt, void *handle, long lmid, const char 
         { "qmu_get_private_ordinary_task_memory_v1",          (void **)&vt->get_private_ordinary_task_memory_v1 },
         { "qmu_display_set_mode_list",                        (void **)&vt->display_set_mode_list },
         { "qmu_session_reset_for_device_reset",               (void **)&vt->session_reset_for_device_reset },
+        { "qmu_display_frame_attach_destination",             (void **)&vt->display_frame_attach_destination },
+        { "qmu_display_frame_attach_destination_fd",          (void **)&vt->display_frame_attach_destination_fd },
+        { "qmu_display_forget_destinations",                  (void **)&vt->display_forget_destinations },
         { "qmu_session_will_suspend",                         (void **)&vt->session_will_suspend },
         { "qmu_session_finish_suspend",                       (void **)&vt->session_finish_suspend },
         { "qmu_session_will_resume",                          (void **)&vt->session_will_resume },
@@ -587,6 +592,26 @@ static void pvg_irq_drop(PvgState *s)
  * A buffer is never written while it is the published front or the one the
  * host fetched last through get_scanout(), so the host, which reads the
  * buffer of its latest get_scanout() call, never sees a half-written frame. */
+/* DISP-D1: a udmabuf over the whole scanout memfd, so a device that cannot import the shared mapping as
+ * host memory (RADV) can import the same pages as a dma-buf. -1 when /dev/udmabuf is unavailable. */
+static int pvg_scanout_dmabuf(int memfd, size_t length)
+{
+    struct udmabuf_create create = { 0 };
+    int dev = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+    int fd;
+
+    if (dev < 0) {
+        return -1;
+    }
+    create.memfd = (uint32_t)memfd;
+    create.flags = UDMABUF_FLAGS_CLOEXEC;
+    create.offset = 0;
+    create.size = length;
+    fd = ioctl(dev, UDMABUF_CREATE, &create);
+    close(dev);
+    return fd < 0 ? -1 : fd;
+}
+
 static int pvg_scanout_init(PvgState *s, size_t max_frame)
 {
     PvgScanout *sc = &s->scan;
@@ -595,6 +620,7 @@ static int pvg_scanout_init(PvgState *s, size_t max_frame)
     pthread_mutex_init(&sc->lock, NULL);
     sc->front = -1;
     sc->held = -1;
+    sc->dmabuf_fd = -1;
     sc->nslots = PVG_SCANOUT_SLOTS;
     sc->fd = memfd_create("uniq-vgpu-scanout", MFD_CLOEXEC | MFD_ALLOW_SEALING);
     if (sc->fd < 0 || ftruncate(sc->fd, (off_t)(slot * sc->nslots)) < 0) {
@@ -608,6 +634,7 @@ static int pvg_scanout_init(PvgState *s, size_t max_frame)
         return -errno;
     }
     sc->slot_size = slot;
+    sc->dmabuf_fd = pvg_scanout_dmabuf(sc->fd, slot * sc->nslots);
     return 0;
 }
 
@@ -631,6 +658,19 @@ static bool pvg_scanout_ensure(PvgState *s, size_t frame_size)
         pvg_log(s, "[uniq-vgpu-ml][display][ERROR] scanout map: %s\n", strerror(errno));
         return false;
     }
+    /* DISP-D1: QMetal may hold host-pointer imports of the old mapping; frames still in flight keep theirs
+     * (their completion is dropped by the start-mode guard: a grow is a mode change). */
+    if (pvg_qvt->display_forget_destinations && s->qmu_dev) {
+        struct qmu_vulkan_ctx *vk = qmu_session_get_vulkan(s->qmu_dev);
+
+        if (vk) {
+            pvg_qvt->display_forget_destinations(vk, sc->map, sc->slot_size * sc->nslots);
+        }
+    }
+    if (sc->dmabuf_fd >= 0) {
+        close(sc->dmabuf_fd);   /* QMetal's imports keep their own references */
+    }
+    sc->dmabuf_fd = pvg_scanout_dmabuf(sc->fd, slot * sc->nslots);
     pthread_mutex_lock(&sc->lock);
     munmap(sc->map, sc->slot_size * sc->nslots);
     sc->map = map;
@@ -648,11 +688,39 @@ static int pvg_scanout_back(PvgState *s)
     int idx = 0;
 
     pthread_mutex_lock(&sc->lock);
-    while (idx == sc->front || idx == sc->held) {
+    while (idx == sc->front || idx == sc->held || (sc->reserved & (1u << idx))) {
         idx++;
     }
     pthread_mutex_unlock(&sc->lock);
+    g_assert(idx < (int)sc->nslots);
     return idx;
+}
+
+/* DISP-D1: a free buffer (not front, held or reserved) for a frame in flight, or -1. */
+static int pvg_scanout_reserve(PvgState *s)
+{
+    PvgScanout *sc = &s->scan;
+    int idx = -1;
+
+    pthread_mutex_lock(&sc->lock);
+    for (int i = 0; i < (int)sc->nslots; i++) {
+        if (i != sc->front && i != sc->held && !(sc->reserved & (1u << i))) {
+            sc->reserved |= 1u << i;
+            idx = i;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&sc->lock);
+    return idx;
+}
+
+static void pvg_scanout_unreserve(PvgState *s, int idx)
+{
+    PvgScanout *sc = &s->scan;
+
+    pthread_mutex_lock(&sc->lock);
+    sc->reserved &= ~(1u << idx);
+    pthread_mutex_unlock(&sc->lock);
 }
 
 static uint8_t *pvg_scanout_buffer(PvgState *s, int idx)
@@ -768,6 +836,7 @@ typedef struct PvgFrameJob {
     bool chain_needed;
     /* borrowed from the enclosing envelope through the leaf's return */
     qmu_owned_display_frame *terminal_frame;
+    int dest_slot1;           /* DISP-D1: 1 + scanout buffer this frame reads back into; 0 = none */
     uint8_t *pixels;          /* compatibility producers only */
     uint32_t width, height, stride;
 } PvgFrameJob;
@@ -786,6 +855,10 @@ static void pvg_frame_completed(void *ctx, int frame_expected);
 
 static void pvg_free_frame_job(PvgFrameJob *job)
 {
+    if (job && job->dest_slot1 && job->state) {
+        pvg_scanout_unreserve(job->state, job->dest_slot1 - 1);   /* dropped before its publish */
+        job->dest_slot1 = 0;
+    }
     if (job) {
         g_free(job->pixels);
         g_free(job);
@@ -903,6 +976,34 @@ static void pvg_owned_display_done(void *ctx, qmu_owned_display_frame *owned_ter
     pvg_loop_enqueue(s, envelope);
 }
 
+/* DISP-D1, device loop: reserve the scanout buffer this frame will be published from and let QMetal read
+ * the frame back straight into it (reference apple-gfx: the VMM chooses where getBytes lands). Any refusal
+ * leaves the frame on the copy path. */
+static void pvg_attach_scanout_destination(PvgState *s, qmu_owned_display_frame *prepared,
+                                           PvgFrameJob *frame)
+{
+    size_t frame_size;
+    int idx;
+
+    if ((!pvg_qvt->display_frame_attach_destination_fd && !pvg_qvt->display_frame_attach_destination) ||
+        !prepared || !s->fb_width || !s->fb_height || s->fb_stride != s->fb_width * 4u) {
+        return;
+    }
+    frame_size = (size_t)s->fb_height * s->fb_stride;
+    if (!pvg_scanout_ensure(s, frame_size) || (idx = pvg_scanout_reserve(s)) < 0) {
+        return;
+    }
+    if ((pvg_qvt->display_frame_attach_destination_fd
+         ? pvg_qvt->display_frame_attach_destination_fd(prepared, pvg_scanout_buffer(s, idx),
+               s->scan.slot_size, s->fb_stride, s->scan.dmabuf_fd, (uint64_t)idx * s->scan.slot_size)
+         : pvg_qvt->display_frame_attach_destination(prepared, pvg_scanout_buffer(s, idx),
+               s->scan.slot_size, s->fb_stride)) == 1) {
+        frame->dest_slot1 = idx + 1;
+    } else {
+        pvg_scanout_unreserve(s, idx);
+    }
+}
+
 /* fork agfx_kick_display_render, device loop */
 static void pvg_kick_display_render(PvgState *s, struct qmu_vulkan_ctx *vk)
 {
@@ -926,6 +1027,7 @@ static void pvg_kick_display_render(PvgState *s, struct qmu_vulkan_ctx *vk)
     rc = qmu_vk_prepare_owned_display_frame(vk, s->display_target, pvg_owned_display_done,
                                             job->completion, &job->prepared_frame);
     if (rc > 0) {
+        pvg_attach_scanout_destination(s, job->prepared_frame, frame);
         if (pvg_log_should_emit(&s->render_worker_log_count)) {
             pvg_log(s, "[uniq-vgpu-ml] kick_display_render: prepared_output pending_frames=%d"
                     " mmio_wait=%d\n", pvg_atomic_read(&s->pending_frames), 0);
@@ -1130,7 +1232,8 @@ static bool pvg_apply_staged_frame(PvgState *s, PvgFrameJob *job)
         if (!pvg_scanout_ensure(s, frame_size)) {
             return false;
         }
-        idx = pvg_scanout_back(s);
+        /* DISP-D1: the reserved buffer already holds the frame; the read below then copies nothing */
+        idx = job->dest_slot1 ? job->dest_slot1 - 1 : pvg_scanout_back(s);
         /* returns only after a real read, or a nil-receiver no-op */
         (void)qmu_display_copy_selected_current_target(job->terminal_frame,
             s->display_target, pvg_scanout_buffer(s, idx), width, height, stride,
@@ -1162,6 +1265,10 @@ static bool pvg_apply_staged_frame(PvgState *s, PvgFrameJob *job)
     }
     /* nil read: the displayed bytes stay as they are (fork: console bytes) */
     pvg_scanout_publish(s, copy_pixels ? idx : -1);
+    if (job->dest_slot1) {
+        pvg_scanout_unreserve(s, job->dest_slot1 - 1);   /* now the front (or, on a nil read, free again) */
+        job->dest_slot1 = 0;
+    }
 
     s->frame_count++;
     pc = pvg_atomic_fetch_inc(&s->present_count) + 1;
