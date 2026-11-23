@@ -592,6 +592,21 @@ static void pvg_irq_drop(PvgState *s)
  * A buffer is never written while it is the published front or the one the
  * host fetched last through get_scanout(), so the host, which reads the
  * buffer of its latest get_scanout() call, never sees a half-written frame. */
+/* DISP-D1 knob (coordinator 2026-11-23, after the Intel A/B FAIL): UVG_DISP_D1_DEST=1 turns the scanout readback
+ * destination on; unset or anything else = off = the pre-DISP-D1 path (no udmabuf, no forget, no attach, no reservation).
+ * The launcher's device class sets it where its gate passed (discrete AMD). Read once per process. */
+static int pvg_disp_d1_dest_enabled(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *v = getenv("UVG_DISP_D1_DEST");
+
+        cached = (v && v[0] == '1' && v[1] == '\0') ? 1 : 0;
+    }
+    return cached;
+}
+
 /* DISP-D1: a udmabuf over the whole scanout memfd, so a device that cannot import the shared mapping as
  * host memory (RADV) can import the same pages as a dma-buf. -1 when /dev/udmabuf is unavailable. */
 static int pvg_scanout_dmabuf(int memfd, size_t length)
@@ -634,7 +649,9 @@ static int pvg_scanout_init(PvgState *s, size_t max_frame)
         return -errno;
     }
     sc->slot_size = slot;
-    sc->dmabuf_fd = pvg_scanout_dmabuf(sc->fd, slot * sc->nslots);
+    sc->dmabuf_fd = pvg_disp_d1_dest_enabled() ? pvg_scanout_dmabuf(sc->fd, slot * sc->nslots) : -1;
+    pvg_log(s, "[uniq-vgpu-ml][display] DISP-D1 dest=%d dmabuf=%d (UVG_DISP_D1_DEST)\n",
+            pvg_disp_d1_dest_enabled(), sc->dmabuf_fd);
     return 0;
 }
 
@@ -660,7 +677,7 @@ static bool pvg_scanout_ensure(PvgState *s, size_t frame_size)
     }
     /* DISP-D1: QMetal may hold host-pointer imports of the old mapping; frames still in flight keep theirs
      * (their completion is dropped by the start-mode guard: a grow is a mode change). */
-    if (pvg_qvt->display_forget_destinations && s->qmu_dev) {
+    if (pvg_disp_d1_dest_enabled() && pvg_qvt->display_forget_destinations && s->qmu_dev) {
         struct qmu_vulkan_ctx *vk = qmu_session_get_vulkan(s->qmu_dev);
 
         if (vk) {
@@ -670,7 +687,7 @@ static bool pvg_scanout_ensure(PvgState *s, size_t frame_size)
     if (sc->dmabuf_fd >= 0) {
         close(sc->dmabuf_fd);   /* QMetal's imports keep their own references */
     }
-    sc->dmabuf_fd = pvg_scanout_dmabuf(sc->fd, slot * sc->nslots);
+    sc->dmabuf_fd = pvg_disp_d1_dest_enabled() ? pvg_scanout_dmabuf(sc->fd, slot * sc->nslots) : -1;
     pthread_mutex_lock(&sc->lock);
     munmap(sc->map, sc->slot_size * sc->nslots);
     sc->map = map;
@@ -985,7 +1002,8 @@ static void pvg_attach_scanout_destination(PvgState *s, qmu_owned_display_frame 
     size_t frame_size;
     int idx;
 
-    if ((!pvg_qvt->display_frame_attach_destination_fd && !pvg_qvt->display_frame_attach_destination) ||
+    if (!pvg_disp_d1_dest_enabled() ||
+        (!pvg_qvt->display_frame_attach_destination_fd && !pvg_qvt->display_frame_attach_destination) ||
         !prepared || !s->fb_width || !s->fb_height || s->fb_stride != s->fb_width * 4u) {
         return;
     }
