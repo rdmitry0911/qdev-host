@@ -255,9 +255,8 @@ int main(int argc, char **argv) {
      * and the guest delivered its own never-written output IOSurface = stale RAM
      * aliasing the input bitstream (the misleading "0.5% luma residual"). Gate it
      * so that class of disconnected delivery can never again pass as success:
-     * resolve must fail, no frame is landed (copied==0), and NO Demt (decode-
-     * complete) is emitted - the engine drops the frame after only the early
-     * dfrm reply. */
+     * resolve must fail, no frame is landed (copied==0), and no successful Demt
+     * is emitted (a Demt -12909 without a buffer, D-GVA-LEND-FAIL-FAST). */
     {
         uint8_t uuid0[16]; memset(uuid0, 0x3c, 16);
 
@@ -290,13 +289,20 @@ int main(int argc, char **argv) {
         CHECK(st == AW_NOERR, "mapid0: Dbuf(no-surface) reply accepted (status=%d)", st);
         CHECK(bc.copied == 0, "mapid0: NO decode landed (gpa 0 refused, not delivered)");
         {
-            int saw_demt = 0;
+            /* Since D-GVA-LEND-FAIL-FAST the frame fails as Apple's host fails a frame it
+             * cannot output (AW-LEND-01/02 in test_aw_session): a Demt with -12909 and NO
+             * buffer - still never a false success. */
+            int saw_ok_demt = 0, saw_fail_demt = 0;
             for (int i = 0; i < g_ne && i < MAXE; i++) {
-                aw_msg_view mv;
-                if (aw_parse(g_e[i], g_el[i], &mv) == AW_PARSE_OK && mv.type == AW_MSG_DEMT)
-                    saw_demt = 1;
+                aw_msg_view mv; int32_t err = 0; uint8_t u[16];
+                if (aw_parse(g_e[i], g_el[i], &mv) == AW_PARSE_OK && mv.type == AW_MSG_DEMT) {
+                    aw_get_s32(&mv, AW_KEY_ERR, &err);
+                    if (err == 0 || aw_get_uui(&mv, AW_KEY_UUI, u) == AW_PARSE_OK) saw_ok_demt = 1;
+                    else saw_fail_demt = 1;
+                }
             }
-            CHECK(!saw_demt, "mapid0: NO Demt emitted (frame dropped honestly, not a false success)");
+            CHECK(!saw_ok_demt && saw_fail_demt,
+                  "mapid0: Demt -12909 without a buffer (frame failed honestly, not a false success)");
         }
 
         /* close the session */
