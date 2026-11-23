@@ -316,29 +316,35 @@ static void test_parked_frames(void) {
     g_decode_drop_at = base + 1;   /* 2nd unit: no picture                       */
     g_decode_fail_at = base + 2;   /* 3rd unit: does not decode                  */
 
+    /* The guest sends each dfrm once the previous one is replied to (an async
+     * reply goes right after the Dbuf reply), so the next unit arrives while the
+     * previous frame waits for its Demt reply, and is parked until then.
+     * (D-GVA-SYNC-DFRM: a dfrm that arrives while a reply is still owed is a frame
+     * the guest gave up on - AW-SYNC-04..06.) */
     ereset();
     CHECK(aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 10, 501, au, sizeof au)) == AW_NOERR, "park: dfrm 10");
-    CHECK(aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 11, 502, au, sizeof au)) == AW_NOERR, "park: dfrm 11 accepted while 10 in flight");
-    CHECK(aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 12, 503, au, sizeof au)) == AW_NOERR, "park: dfrm 12 accepted");
-    CHECK(aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 13, 504, au, sizeof au)) == AW_NOERR, "park: dfrm 13 accepted");
     CHECK(g_ne == 1 && e_type(0, &v) == AW_PARSE_OK && v.type == AW_MSG_DBUF &&
           aw_get_s64(&v, AW_KEY_FRM, &frm) == AW_PARSE_OK && frm == 10, "park: only Dbuf(10) so far");
 
-    /* frame 10: Dbuf reply -> dfrm reply(501) + Demt(10, buffer); Demt reply -> rels + Dbuf(11) */
+    /* frame 10: Dbuf reply -> dfrm reply(501) + Demt(10, buffer); dfrm 11 parked; Demt reply -> rels + Dbuf(11) */
     ereset();
     aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0x9100));
     CHECK(g_ne == 2 && e_type(0, &v) == AW_PARSE_OK && v.type == AW_MSG_DFRM && v.reply_id == 501, "park: dfrm reply 501");
     CHECK(e_type(1, &v) == AW_PARSE_OK && v.type == AW_MSG_DEMT && aw_get_s64(&v, AW_KEY_FRM, &frm) == AW_PARSE_OK &&
           frm == 10 && aw_get_uui(&v, AW_KEY_UUI, got) == AW_PARSE_OK, "park: Demt(10) with buffer");
     ereset();
+    CHECK(aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 11, 502, au, sizeof au)) == AW_NOERR && g_ne == 0,
+          "park: dfrm 11 parked while 10 awaits its Demt reply");
+    ereset();
     aw_engine_deliver(e, m, build_demt_reply(m, uuid));
     CHECK(g_ne == 2 && e_is_rels(0), "park: rels after Demt(10) reply");
     CHECK(e_type(1, &v) == AW_PARSE_OK && v.type == AW_MSG_DBUF && aw_get_s64(&v, AW_KEY_FRM, &frm) == AW_PARSE_OK &&
           frm == 11, "park: Dbuf(11) started from the FIFO");
 
-    /* frame 11: no picture -> dfrm reply(502), Demt(11, err 0, FrameDropped, no ,uui), Dfub, rels, Dbuf(12) */
+    /* frame 11: no picture -> dfrm reply(502), Demt(11, err 0, FrameDropped, no ,uui), Dfub, rels; dfrm 12 -> Dbuf(12) */
     ereset();
     aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0x9200));
+    aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 12, 503, au, sizeof au));
     CHECK(g_ne == 5, "drop: 5 emissions (got %d)", g_ne);
     CHECK(e_type(0, &v) == AW_PARSE_OK && v.type == AW_MSG_DFRM && v.reply_id == 502, "drop: dfrm reply 502");
     CHECK(e_type(1, &v) == AW_PARSE_OK && v.type == AW_MSG_DEMT && aw_get_s64(&v, AW_KEY_FRM, &frm) == AW_PARSE_OK && frm == 11 &&
@@ -350,9 +356,10 @@ static void test_parked_frames(void) {
     CHECK(e_type(4, &v) == AW_PARSE_OK && v.type == AW_MSG_DBUF && aw_get_s64(&v, AW_KEY_FRM, &frm) == AW_PARSE_OK &&
           frm == 12, "drop: Dbuf(12) started");
 
-    /* frame 12: does not decode -> Demt(12, -12909, no ,uui), Dfub, rels, Dbuf(13) */
+    /* frame 12: does not decode -> Demt(12, -12909, no ,uui), Dfub, rels; dfrm 13 -> Dbuf(13) */
     ereset();
     aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0x9300));
+    aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 13, 504, au, sizeof au));
     CHECK(g_ne == 5 && e_type(1, &v) == AW_PARSE_OK && v.type == AW_MSG_DEMT &&
           aw_get_s32(&v, AW_KEY_ERR, &err) == AW_PARSE_OK && err == AW_ERR_MALFUNCTION &&
           aw_get_uui(&v, AW_KEY_UUI, got) != AW_PARSE_OK, "fail: Demt(12) -12909 without ,uui");
@@ -369,6 +376,7 @@ static void test_parked_frames(void) {
 
     /* AW-PARK-04: units parked at session close are freed (ASan) */
     aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 20, 601, au, sizeof au));
+    aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0x9500));
     aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 21, 602, au, sizeof au));
     g_decode_drop_at = g_decode_fail_at = -1;
     aw_engine_destroy(e);
@@ -522,12 +530,12 @@ static void test_lend_failure(void) {
     aw_engine_deliver(e, m, msg0(m, AW_MSG_PDEC, AW_FLAG_GUEST_REQ, uuid));
     aw_engine_deliver(e, m, build_dsta(m, uuid));
     aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 30, 701, au, sizeof au));
-    aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 31, 702, au, sizeof au));
     int dec0 = g_decode_calls, copy0 = g_copy_calls;
 
     g_resolve_fail = 1;
     ereset();
     CHECK(aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0x9500)) == AW_NOERR, "lend-fail: Dbuf reply status 0");
+    aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 31, 702, au, sizeof au)); /* after the reply */
     CHECK(g_decode_calls == dec0 + 1, "lend-fail: the unit is still decoded (DPB kept)");
     CHECK(g_copy_calls == copy0, "lend-fail: nothing copied");
     CHECK(g_ne == 5, "lend-fail: dfrm reply, Demt, Dfub, rels, Dbuf(31) (got %d)", g_ne);
@@ -578,15 +586,22 @@ static int p1_scenario(int ahead, int *decodes_before_reply) {
     STEP(aw_engine_deliver(e, m, msg0(m, AW_MSG_PDEC, AW_FLAG_GUEST_REQ, uuid)));
     STEP(aw_engine_deliver(e, m, build_dsta(m, uuid)));
     g_decode_drop_at = base + 1; g_decode_fail_at = base + 2;
-    for (int i = 0; i < 5; i++) STEP(aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 40 + i, 801 + i, au, sizeof au)));
+    /* each dfrm after the previous reply, as the guest sends them; 41 parked behind 40's Demt */
+#define DFRM(i) STEP(aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 40 + (i), 801 + (i), au, sizeof au)))
+    DFRM(0);
     STEP(aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0xA100)));   /* 40 ok            */
+    DFRM(1);
     STEP(aw_engine_deliver(e, m, build_demt_reply(m, uuid)));
     STEP(aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0xA200)));   /* 41 dropped       */
+    DFRM(2);
     STEP(aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0xA300)));   /* 42 fails         */
+    DFRM(3);
     g_resolve_fail = 1;
     STEP(aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0xA400)));   /* 43 lend unusable */
     g_resolve_fail = 0;
+    DFRM(4);
     STEP(aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0)));        /* 44 lent nothing  */
+#undef DFRM
     g_decode_drop_at = g_decode_fail_at = -1;
     int decodes = g_decode_calls - base;
     aw_engine_destroy(e);
@@ -650,11 +665,234 @@ static void test_p1_decode_ahead(void) {
         aw_engine_deliver(e, m, msg0(m, AW_MSG_PDEC, AW_FLAG_GUEST_REQ, uuid));
         aw_engine_deliver(e, m, build_dsta(m, uuid));
         aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 70, 1101, au, sizeof au));
-        aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 71, 1102, au, sizeof au));   /* parked too */
-        CHECK(aw_engine_run_deferred(e) == 1 && g_held == 1, "P1-06: in-flight unit decoded ahead, parked unit waits");
+        CHECK(aw_engine_run_deferred(e) == 1 && g_held == 1, "P1-06: in-flight unit decoded ahead");
+        aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0xD100));             /* -> AWAIT_DEMT */
+        aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 71, 1102, au, sizeof au));   /* parked */
+        CHECK(aw_engine_run_deferred(e) == 0 && g_held == 1, "P1-06: parked unit waits, picture held");
         int c0 = g_close_calls;
         aw_engine_destroy(e);
         CHECK(g_close_calls == c0 + 1 && g_held == 0, "P1-06: destroy closes the decoder holding the picture (ASan: parked unit freed)");
+    }
+}
+
+
+/* ---- AW-SYNC-01..08 (D-GVA-SYNC-DFRM) -------------------------------------
+ * Reference (contract-B, reims docs/video/devices.md "The decoder session",
+ * measured on Apple's host session, M3 Max, macOS 27.0.1, 2026-10-24):
+ *   dfrm without the async flag: Dbuf, its reply, Demt (,inf 0), its reply, rels,
+ *   then the dfrm reply (,err 0, ,inf 0). With it (,dfl 1): Dbuf, its reply, the
+ *   dfrm reply (,inf 1), Demt (,inf 1), its reply, rels.
+ *   A frame that fails / has no picture: Demt without a buffer, Dfub, rels, and
+ *   (sync) the reply last.
+ * The guest waits for each dfrm reply before it sends the next (reims core.md
+ * "Decoding ahead"); a dfrm that arrives while a reply is owed is a frame the
+ * guest gave up on: decoded, replied to, not emitted; no Dbuf asked for it, a
+ * late Dbuf reply answered with Dfub + rels (reims devices.md "Where we differ
+ * from Apple", decoder.rs guest_gave_up). An x86_64 guest's sync waits expire at
+ * once (devices.md "What an x86_64 guest has"; our 25C56 bytes, apple-virgl
+ * analysis/20261123-D-GVA-AERIAL-HEVC10.md §4.2), which AW-SYNC-08 models. */
+static size_t build_dfrm_f(uint8_t *m, const uint8_t *uuid, int64_t frm, uint64_t rid,
+                           const uint8_t *au, size_t aul, uint32_t dfl) {
+    uint8_t sbf[256];
+    size_t sl = aw_sbuf_write(sbf, sizeof sbf, NULL, au, aul);
+    aw_builder b; aw_builder_init(&b, m, 512);
+    aw_build_header(&b, AW_MSG_DFRM, AW_FLAG_GUEST_REQ, uuid, rid);
+    aw_put_s64(&b, AW_KEY_FRM, frm);
+    aw_put_bytes(&b, AW_KEY_SBF, AW_VT_SBF, sbf, sl);
+    aw_put_u32(&b, AW_KEY_DFL, dfl);
+    return aw_build_finalize(&b);
+}
+static size_t build_dbuf_reply_id(uint8_t *m, const uint8_t *uuid, uint64_t mapid, uint64_t rid) {
+    uint64_t ids[AW_SUBS_IDS] = { mapid, 0, 0, 0, 0 };
+    size_t sl = aw_subs_write(m, 256, ids);
+    uint8_t bu[16]; memset(bu, 0xB0, 16);
+    aw_builder b; aw_builder_init(&b, m + sl, 256 - sl);
+    aw_build_header(&b, AW_MSG_DBUF, AW_FLAG_GUEST_REPLY, uuid, rid);
+    aw_put_s32(&b, AW_KEY_ERR, 0);
+    aw_put_uui(&b, AW_KEY_UUI, bu);
+    return sl + aw_build_finalize(&b);
+}
+static size_t build_demt_reply_id(uint8_t *m, const uint8_t *uuid, uint64_t rid) {
+    aw_builder b; aw_builder_init(&b, m, 256);
+    aw_build_header(&b, AW_MSG_DEMT, AW_FLAG_GUEST_REPLY, uuid, rid);
+    aw_put_s32(&b, AW_KEY_ERR, 0);
+    return aw_build_finalize(&b);
+}
+static int is_msg(int i, uint32_t type, aw_msg_view *v) {
+    return i < g_ne && !e_is_rels(i) && e_type(i, v) == AW_PARSE_OK && v->type == type;
+}
+static int is_dfrm_reply(int i, uint64_t rid, uint32_t want_inf) {
+    aw_msg_view v; int32_t err = 1; uint32_t inf = 0xff;
+    return is_msg(i, AW_MSG_DFRM, &v) && v.flags == AW_FLAG_HOST_REPLY && v.reply_id == rid &&
+           aw_get_s32(&v, AW_KEY_ERR, &err) == AW_PARSE_OK && err == 0 &&
+           aw_get_u32(&v, AW_KEY_INF, &inf) == AW_PARSE_OK && inf == want_inf;
+}
+static aw_engine *open_started(uint8_t *uuid, uint8_t fill) {
+    aw_engine *e = mk(); uint8_t m[512];
+    memset(uuid, fill, 16);
+    aw_engine_deliver(e, m, msg0(m, AW_MSG_PDEC, AW_FLAG_GUEST_REQ, uuid));
+    aw_engine_deliver(e, m, build_dsta(m, uuid));
+    return e;
+}
+
+static void test_sync_dfrm(void) {
+    printf("-- D-GVA-SYNC-DFRM: sync order, Demt ,inf, given-up frames --\n");
+    static const uint8_t au[8] = { 0,0,0,4, 0x65, 1,2,3 };
+    uint8_t m[512], uuid[16], got[16]; aw_msg_view v; uint32_t inf = 0xff; int32_t err = 1;
+
+    /* AW-SYNC-01: a sync frame: Dbuf; reply -> Demt(,inf 0) alone; reply -> rels, then the dfrm reply (inf 0) */
+    {
+        aw_engine *e = open_started(uuid, 0x61);
+        ereset();
+        aw_engine_deliver(e, m, build_dfrm_f(m, uuid, 1, 1201, au, sizeof au, 0));
+        CHECK(g_ne == 1 && is_msg(0, AW_MSG_DBUF, &v), "SYNC-01: Dbuf first");
+        uint64_t dbuf_id = v.reply_id;
+        ereset();
+        aw_engine_deliver(e, m, build_dbuf_reply_id(m, uuid, 0xE100, dbuf_id));
+        CHECK(g_ne == 1 && is_msg(0, AW_MSG_DEMT, &v) && aw_get_u32(&v, AW_KEY_INF, &inf) == AW_PARSE_OK && inf == 0 &&
+              aw_get_uui(&v, AW_KEY_UUI, got) == AW_PARSE_OK, "SYNC-01: Dbuf reply -> Demt (,inf 0, buffer), no dfrm reply yet (got %d)", g_ne);
+        uint64_t demt_id = v.reply_id;
+        ereset();
+        aw_engine_deliver(e, m, build_demt_reply_id(m, uuid, demt_id));
+        CHECK(g_ne == 2 && e_is_rels(0) && is_dfrm_reply(1, 1201, 0), "SYNC-01: Demt reply -> rels, then dfrm reply (err 0, inf 0)");
+        aw_engine_destroy(e);
+    }
+    /* AW-SYNC-02: an async frame: dfrm reply (inf 1) before Demt (inf 1) */
+    {
+        aw_engine *e = open_started(uuid, 0x62);
+        aw_engine_deliver(e, m, build_dfrm_f(m, uuid, 1, 1301, au, sizeof au, 1));
+        ereset();
+        aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0xE200));
+        CHECK(g_ne == 2 && is_dfrm_reply(0, 1301, 1) && is_msg(1, AW_MSG_DEMT, &v) &&
+              aw_get_u32(&v, AW_KEY_INF, &inf) == AW_PARSE_OK && inf == 1, "SYNC-02: async: dfrm reply (inf 1), Demt (inf 1)");
+        ereset();
+        aw_engine_deliver(e, m, build_demt_reply(m, uuid));
+        CHECK(g_ne == 1 && e_is_rels(0), "SYNC-02: async: Demt reply -> rels only");
+        aw_engine_destroy(e);
+    }
+    /* AW-SYNC-03: sync frames that fail, have no picture, or cannot be lent: Demt (no buffer), Dfub, rels, reply last */
+    {
+        aw_engine *e = open_started(uuid, 0x63);
+        int base = g_decode_calls;
+        g_decode_fail_at = base; g_decode_drop_at = base + 1;
+        aw_engine_deliver(e, m, build_dfrm_f(m, uuid, 1, 1401, au, sizeof au, 0));
+        ereset();
+        aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0xE300));
+        CHECK(g_ne == 4 && is_msg(0, AW_MSG_DEMT, &v) && aw_get_s32(&v, AW_KEY_ERR, &err) == AW_PARSE_OK &&
+              err == AW_ERR_MALFUNCTION && aw_get_u32(&v, AW_KEY_INF, &inf) == AW_PARSE_OK && inf == 0 &&
+              aw_get_uui(&v, AW_KEY_UUI, got) != AW_PARSE_OK && is_msg(1, AW_MSG_DFUB, &v) && e_is_rels(2) &&
+              is_dfrm_reply(3, 1401, 0), "SYNC-03: failed: Demt -12909 (inf 0), Dfub, rels, reply last");
+        aw_engine_deliver(e, m, build_dfrm_f(m, uuid, 2, 1402, au, sizeof au, 0));
+        ereset();
+        aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0xE301));
+        CHECK(g_ne == 4 && is_msg(0, AW_MSG_DEMT, &v) && aw_get_u32(&v, AW_KEY_INF, &inf) == AW_PARSE_OK && inf == 0x2 &&
+              is_msg(1, AW_MSG_DFUB, &v) && e_is_rels(2) && is_dfrm_reply(3, 1402, 0),
+              "SYNC-03: no picture: Demt FrameDropped (inf 0x2), Dfub, rels, reply last");
+        g_decode_fail_at = g_decode_drop_at = -1;
+        aw_engine_deliver(e, m, build_dfrm_f(m, uuid, 3, 1403, au, sizeof au, 0));
+        g_resolve_fail = 1; ereset();
+        aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0xE302));
+        g_resolve_fail = 0;
+        CHECK(g_ne == 4 && is_msg(0, AW_MSG_DEMT, &v) && is_msg(1, AW_MSG_DFUB, &v) && e_is_rels(2) &&
+              is_dfrm_reply(3, 1403, 0), "SYNC-03: unlendable: Demt, Dfub, rels, reply last");
+        aw_engine_destroy(e);
+    }
+    /* AW-SYNC-04: given up while its Dbuf waits: the next dfrm replies to it (decoded, not emitted) and
+     * starts; the late Dbuf reply is answered Dfub + rels, nothing decoded or copied; the next frame goes on */
+    {
+        aw_engine *e = open_started(uuid, 0x64);
+        ereset();
+        aw_engine_deliver(e, m, build_dfrm_f(m, uuid, 1, 1501, au, sizeof au, 0));
+        is_msg(0, AW_MSG_DBUF, &v); uint64_t dbuf1 = v.reply_id;
+        int d0 = g_decode_calls, c0 = g_copy_calls;
+        ereset();
+        CHECK(aw_engine_deliver(e, m, build_dfrm_f(m, uuid, 2, 1502, au, sizeof au, 0)) == AW_NOERR, "SYNC-04: dfrm 2 accepted");
+        CHECK(g_ne == 2 && is_dfrm_reply(0, 1501, 0) && is_msg(1, AW_MSG_DBUF, &v), "SYNC-04: reply(1) then Dbuf(2) (got %d)", g_ne);
+        uint64_t dbuf2 = v.reply_id; int64_t frm = -1;
+        CHECK(aw_get_s64(&v, AW_KEY_FRM, &frm) == AW_PARSE_OK && frm == 2 && dbuf2 != dbuf1, "SYNC-04: Dbuf names frame 2");
+        CHECK(g_decode_calls == d0 + 1 && g_copy_calls == c0, "SYNC-04: the given-up unit is decoded, not copied");
+        ereset();
+        CHECK(aw_engine_deliver(e, m, build_dbuf_reply_id(m, uuid, 0xE400, dbuf1)) == AW_NOERR, "SYNC-04: late Dbuf reply status 0");
+        uint64_t rid[4]; unsigned nr = 0;
+        CHECK(g_ne == 2 && is_msg(0, AW_MSG_DFUB, &v) && e_is_rels(1) && aw_rels_read(g_e[1], g_el[1], rid, 4, &nr) == AW_PARSE_OK &&
+              nr == 1 && rid[0] == 0xE400, "SYNC-04: late Dbuf reply -> Dfub + rels of its lent id");
+        CHECK(g_decode_calls == d0 + 1 && g_copy_calls == c0, "SYNC-04: nothing decoded or copied for it");
+        ereset();
+        aw_engine_deliver(e, m, build_dbuf_reply_id(m, uuid, 0xE401, dbuf2));
+        CHECK(g_ne == 1 && is_msg(0, AW_MSG_DEMT, &v) && aw_get_s64(&v, AW_KEY_FRM, &frm) == AW_PARSE_OK && frm == 2,
+              "SYNC-04: frame 2 still emitted into its own buffer");
+        aw_engine_destroy(e);
+    }
+    /* AW-SYNC-05: given up while its Demt waits (sync): the next dfrm releases it (rels), replies, starts;
+     * the late Demt reply is taken without effect */
+    {
+        aw_engine *e = open_started(uuid, 0x65);
+        aw_engine_deliver(e, m, build_dfrm_f(m, uuid, 1, 1601, au, sizeof au, 0));
+        ereset();
+        aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0xE500));
+        is_msg(0, AW_MSG_DEMT, &v); uint64_t demt1 = v.reply_id;
+        int p0 = g_putbuf_calls;
+        ereset();
+        aw_engine_deliver(e, m, build_dfrm_f(m, uuid, 2, 1602, au, sizeof au, 0));
+        uint64_t rid[4]; unsigned nr = 0;
+        CHECK(g_ne == 3 && e_is_rels(0) && aw_rels_read(g_e[0], g_el[0], rid, 4, &nr) == AW_PARSE_OK && rid[0] == 0xE500 &&
+              is_dfrm_reply(1, 1601, 0) && is_msg(2, AW_MSG_DBUF, &v), "SYNC-05: rels(1), reply(1), Dbuf(2) (got %d)", g_ne);
+        CHECK(g_putbuf_calls == p0 + 1, "SYNC-05: the host lets the buffer go");
+        ereset();
+        CHECK(aw_engine_deliver(e, m, build_demt_reply_id(m, uuid, demt1)) == AW_NOERR && g_ne == 0,
+              "SYNC-05: late Demt reply taken, nothing emitted");
+        aw_engine_destroy(e);
+    }
+    /* AW-SYNC-06: async units parked behind a Demt: a parked unit with a later one behind it was given up
+     * on: decoded and replied, not emitted; only the last starts */
+    {
+        aw_engine *e = open_started(uuid, 0x66);
+        aw_engine_deliver(e, m, build_dfrm_f(m, uuid, 1, 1701, au, sizeof au, 1));
+        aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0xE600));     /* reply(1) + Demt(1) */
+        ereset();
+        for (int i = 2; i <= 4; i++)
+            aw_engine_deliver(e, m, build_dfrm_f(m, uuid, i, 1700 + i, au, sizeof au, 1));
+        CHECK(g_ne == 0, "SYNC-06: 2..4 parked");
+        int d0 = g_decode_calls; ereset();
+        aw_engine_deliver(e, m, build_demt_reply(m, uuid));
+        int64_t frm = -1;
+        CHECK(g_ne == 4 && e_is_rels(0) && is_dfrm_reply(1, 1702, 1) && is_dfrm_reply(2, 1703, 1) &&
+              is_msg(3, AW_MSG_DBUF, &v) && aw_get_s64(&v, AW_KEY_FRM, &frm) == AW_PARSE_OK && frm == 4,
+              "SYNC-06: rels, reply(2), reply(3), Dbuf(4) (got %d)", g_ne);
+        CHECK(g_decode_calls == d0 + 2, "SYNC-06: 2 and 3 decoded (references kept)");
+        aw_engine_destroy(e);
+    }
+    /* AW-SYNC-07: the park bound refuses nothing: past AW_PARK_MAX the oldest parked unit is given up */
+    {
+        aw_engine *e = open_started(uuid, 0x67);
+        aw_engine_deliver(e, m, build_dfrm_f(m, uuid, 1, 1801, au, sizeof au, 1));
+        aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0xE700));
+        int ok = 1; ereset();
+        for (int i = 0; i < 20; i++)
+            ok &= aw_engine_deliver(e, m, build_dfrm_f(m, uuid, 2 + i, 1802 + i, au, sizeof au, 1)) == AW_NOERR;
+        CHECK(ok, "SYNC-07: 20 dfrms behind a Demt all accepted");
+        CHECK(g_ne == 4 && is_dfrm_reply(0, 1802, 1) && is_dfrm_reply(3, 1805, 1),
+              "SYNC-07: the 4 oldest past the bound given up (got %d)", g_ne);
+        aw_engine_destroy(e);
+    }
+    /* AW-SYNC-08: an unpatched x86_64 guest's sync stream: dfrm after dfrm, no Dbuf ever answered. Every dfrm
+     * is accepted and replied (one frame behind), each unit decoded once in order, no refusal, no deadlock */
+    {
+        aw_engine *e = open_started(uuid, 0x68);
+        int d0 = g_decode_calls, ok = 1, replies = 0, dbufs = 0;
+        for (int i = 0; i < 50; i++) {
+            ereset();
+            ok &= aw_engine_deliver(e, m, build_dfrm_f(m, uuid, i, 1900 + i, au, sizeof au, 0)) == AW_NOERR;
+            for (int k = 0; k < g_ne; k++) {
+                if (is_dfrm_reply(k, 1900 + i - 1, 0)) replies++;
+                else if (is_msg(k, AW_MSG_DBUF, &v)) dbufs++;
+            }
+            if (aw_engine_run_deferred(e) > 1) ok = 0;   /* P1 may decode the newest ahead */
+        }
+        CHECK(ok, "SYNC-08: 50 sync dfrms accepted");
+        CHECK(replies == 49 && dbufs == 50, "SYNC-08: 49 replies, 50 Dbufs (got %d, %d)", replies, dbufs);
+        CHECK(g_decode_calls == d0 + 50, "SYNC-08: each unit decoded once (%d)", g_decode_calls - d0);
+        aw_engine_destroy(e);
     }
 }
 
@@ -664,6 +902,7 @@ int main(void) {
     test_session_open_close();
     test_decode_exchange();
     test_parked_frames();
+    test_sync_dfrm();
     test_properties();
     test_dpba_format();
     test_lend_failure();

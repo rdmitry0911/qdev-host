@@ -11,6 +11,7 @@
 #   make clean
 
 CC      ?= cc
+SHELL   := /bin/bash
 CFLAGS  ?= -O2 -g -Wall -Wextra -std=c11
 QDP_INC := -I../..
 VFU_INC := -I../../third_party/libvfio-user/include

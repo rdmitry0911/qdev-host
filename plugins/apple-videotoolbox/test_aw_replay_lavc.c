@@ -4,8 +4,11 @@
  * avcC/hvcC, async dfrm with ,sbf), the session engine, the vtpv_lavc backend on
  * the VA-API render node, landing into lent buffers, Demt out. The guest side is
  * simulated: it answers every Dbuf with a lent buffer (subs mapping id + ,uui)
- * and every Demt with a reply, and it sends the next dfrm before the previous
- * frame finished (the engine parks it).
+ * and every Demt with a reply, and, as the guest does, it sends the next dfrm
+ * once the previous one is replied to (an async reply comes right after the
+ * Dbuf reply), so it arrives while the previous frame waits for its Demt reply
+ * and the engine parks it (D-GVA-SYNC-DFRM: a dfrm sent while a reply is still
+ * owed is a frame the guest gave up on).
  *
  *  ENG-REPLAY-01  live-captured guest bytes (2026-11-17 stride run: the guest's
  *                 real 23-byte avcC + its avcC-framed I_PCM sample + its luma
@@ -156,8 +159,15 @@ static void landed_md5(uint64_t mapid, uint8_t out[16], uint8_t *luma_copy, size
         for (r = 0; r < g_h; r++) memcpy(luma_copy + (size_t)g_w * r, p + g_stride * r, g_w);
 }
 
+/* the next unit the simulated guest sends once a dfrm reply comes (-1: none) */
+static int g_send_next = -1, g_n_units;
+static const uint8_t *const *g_units; static const size_t *g_unit_len;
+static size_t build_dfrm(uint8_t *m, size_t cap, const uint8_t *uuid, int64_t frm,
+                         uint64_t rid, const uint8_t *au, size_t aul);
+
 /* Service the engine's emissions like the guest: Dbuf -> lend a buffer,
- * Demt -> record + reply. Replies may produce new emissions; loop. */
+ * Demt -> record + reply, a dfrm reply -> send the next dfrm (if any). Replies
+ * may produce new emissions; loop. */
 static void service(aw_engine *e, const uint8_t *uuid, seen *s, uint64_t *last_map)
 {
     static uint8_t q[MAXE][2048];
@@ -179,6 +189,12 @@ static void service(aw_engine *e, const uint8_t *uuid, seen *s, uint64_t *last_m
                 aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, mapid));
             } else if (v.type == AW_MSG_DFRM && v.flags == AW_FLAG_HOST_REPLY) {
                 s->n_dfrm_reply++;
+                if (g_send_next >= 0 && g_send_next < g_n_units) {
+                    static uint8_t dm[5u << 20];   /* a unit may be large */
+                    int k = g_send_next++;
+                    aw_engine_deliver(e, dm, build_dfrm(dm, sizeof dm, uuid, 1000 + k, 200 + (uint64_t)k,
+                                                        g_units[k], g_unit_len[k]));
+                }
             } else if (v.type == AW_MSG_DEMT && v.flags == AW_FLAG_HOST_REQ) {
                 int64_t frm = -1; int32_t err = 0; uint32_t inf = 0; uint8_t u[16];
                 aw_get_s64(&v, AW_KEY_FRM, &frm);
@@ -246,16 +262,13 @@ static void run_stream(const char *name, const stream *st, uint32_t codec4cc)
               aw_get_s32(&v, AW_KEY_ERR, &err) == AW_PARSE_OK && err == 0, "%s: dsta accepted (Dpba + reply)", name);
     }
     g_ne = 0;
-    /* send units in pairs: the second arrives while the first is in flight */
-    for (i = 0; i < st->n; i += 2) {
-        CHECK(aw_engine_deliver(e, m, build_dfrm(m, sizeof m, uuid, 1000 + i, 200 + (uint64_t)i,
-                                                 st->pkt[i], st->pkt_len[i])) == AW_NOERR, "%s: dfrm %d", name, i);
-        if (i + 1 < st->n)
-            CHECK(aw_engine_deliver(e, m, build_dfrm(m, sizeof m, uuid, 1000 + i + 1, 201 + (uint64_t)i,
-                                                     st->pkt[i + 1], st->pkt_len[i + 1])) == AW_NOERR,
-                  "%s: dfrm %d (parked)", name, i + 1);
-        service(e, uuid, &s, &last);
-    }
+    /* the first unit; each next one goes once the previous dfrm is replied to, while that frame still
+     * waits for its Demt reply (parked, then started) */
+    g_units = (const uint8_t *const *)st->pkt; g_unit_len = st->pkt_len; g_n_units = st->n; g_send_next = 1;
+    CHECK(aw_engine_deliver(e, m, build_dfrm(m, sizeof m, uuid, 1000, 200, st->pkt[0], st->pkt_len[0])) == AW_NOERR,
+          "%s: dfrm 0", name);
+    service(e, uuid, &s, &last);
+    g_send_next = -1;
     CHECK(s.n_demt == st->n, "%s: %d Demt for %d dfrm", name, s.n_demt, st->n);
     CHECK(s.n_dfrm_reply == st->n, "%s: %d dfrm replies", name, s.n_dfrm_reply);
     CHECK(s.n_err == 0 && s.n_dropped == 0, "%s: %d errors, %d dropped", name, s.n_err, s.n_dropped);
