@@ -379,6 +379,53 @@ static void test_capture_pieces(unsigned k)
     g_free(s);
 }
 
+/* ------------------------------------------------- guest-RAM region bounds (ML-SGR-2) */
+/* qmu_guest_ram_region_v1.h: the bounds of the region holding a GPA, taken without a pin and
+ * without a log.  QMetal maps a 4 MiB chunk only when it lies inside the answer; the 4 GiB A/B
+ * (2026-11-23) logged "map_gpa ... crosses the end of its DMA region" from a chunk probe. */
+static void test_guest_ram_region(void)
+{
+    PvgState *s = g_new0(PvgState, 1);
+    const uint64_t page = pvg_page_size(), len = (uint64_t)RAM_PAGES * page, chunk = 4ull << 20;
+    uint64_t base = 7, length = 9, chunk_start;
+    PvgRegion *r;
+    unsigned refs;
+
+    fprintf(stderr, "== guest-RAM region bounds\n");
+    pvg_memory_init(&s->mem);
+    CHECK(pvg_guest_ram_region(s, RAM_IOVA, &base, &length) == 0);  /* nothing registered */
+    register_ram(s);
+    r = ram_region(s);
+    CHECK(r && r->map);
+    refs = region_refs(s, r);
+    CHECK(pvg_guest_ram_region(s, RAM_IOVA + page, &base, &length) == 1);
+    CHECK(base == RAM_IOVA && length == len);
+    CHECK(region_refs(s, r) == refs);                                /* no pin */
+    base = 7; length = 9;
+    CHECK(pvg_guest_ram_region(s, RAM_IOVA - page, &base, &length) == 0);
+    CHECK(pvg_guest_ram_region(s, RAM_IOVA + len, &base, &length) == 0);
+    CHECK(base == 7 && length == 9);                                 /* untouched on a miss */
+    CHECK(pvg_guest_ram_region(NULL, RAM_IOVA, &base, &length) == 0);
+    CHECK(pvg_guest_ram_region(s, RAM_IOVA, NULL, &length) == 0);
+
+    /* The chunk holding the last RAM page crosses the region end: the bounds say so and the
+     * query logged nothing; the old probe (a map of the whole chunk) is refused AND logged. */
+    chunk_start = (RAM_IOVA + len - page) / chunk * chunk;
+    CHECK(pvg_guest_ram_region(s, chunk_start < RAM_IOVA ? RAM_IOVA : chunk_start, &base, &length) == 1);
+    CHECK(!(base <= chunk_start && chunk_start + chunk <= base + length));
+    CHECK(pvg_atomic_read(&s->mem.refused) == 0);
+    CHECK(pvg_map_gpa(s, chunk_start, chunk, 0) == NULL);
+    CHECK(pvg_atomic_read(&s->mem.refused) == 1);
+    CHECK(region_refs(s, r) == refs);
+
+    pvg_memory_dma_unregister(s, ram_region_desc(-1));
+    CHECK(pvg_guest_ram_region(s, RAM_IOVA + page, &base, &length) == 0);
+    CHECK(live_regions(s) == 0);
+    g_ptr_array_free(s->mem.live, true);
+    g_free(s->mem.tab);
+    g_free(s);
+}
+
 int main(void)
 {
     const unsigned ks[] = { 1, 16, 256 };
@@ -391,6 +438,7 @@ int main(void)
             test_capture_pieces(ks[i]);
         }
     }
+    test_guest_ram_region();
     fprintf(stderr, "pvg_process_vm_test: %d checks passed, %d failed, %d skipped groups\n",
             passes, failures, skips);
     printf("%s\n", failures ? "FAIL" : "PASS");

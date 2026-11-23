@@ -31,6 +31,7 @@
 #include "qdp.h"
 #include "qmu/qmetal_unified.h"
 #include "qmu/qmu_owned_display_frame.h"
+#include "qmu-private/qmu_guest_ram_region_v1.h"
 #include "qmu-private/qmu_mapped_transport_v1.h"
 #include "qmu-private/qmu_ordinary_physical_capture_v2.h"
 #include "qmu-private/qmu_ordinary_physical_comparison_v1.h"
@@ -77,6 +78,7 @@ struct pvg_qmu_vt {
     __typeof__(qmu_session_release_host_work)                         *session_release_host_work;
     __typeof__(qmu_session_retain_host_work)                          *session_retain_host_work;
     __typeof__(qmu_get_private_mapped_transport_v1)                   *get_private_mapped_transport_v1;
+    __typeof__(qmu_get_private_guest_ram_region_v1)                   *get_private_guest_ram_region_v1;
     __typeof__(qmu_get_private_ordinary_physical_capture_v2)          *get_private_ordinary_physical_capture_v2;
     __typeof__(qmu_get_private_ordinary_physical_comparison_v1)       *get_private_ordinary_physical_comparison_v1;
     __typeof__(qmu_get_private_ordinary_task_memory_v1)               *get_private_ordinary_task_memory_v1;
@@ -152,6 +154,7 @@ bool pvg_qmu_vt_bind(struct pvg_qmu_vt *vt, void *handle, long lmid, const char 
 #define qmu_session_release_host_work                        (pvg_qvt->session_release_host_work)
 #define qmu_session_retain_host_work                         (pvg_qvt->session_retain_host_work)
 #define qmu_get_private_mapped_transport_v1                  (pvg_qvt->get_private_mapped_transport_v1)
+#define qmu_get_private_guest_ram_region_v1                  (pvg_qvt->get_private_guest_ram_region_v1)
 #define qmu_get_private_ordinary_physical_capture_v2         (pvg_qvt->get_private_ordinary_physical_capture_v2)
 #define qmu_get_private_ordinary_physical_comparison_v1      (pvg_qvt->get_private_ordinary_physical_comparison_v1)
 #define qmu_get_private_ordinary_task_memory_v1              (pvg_qvt->get_private_ordinary_task_memory_v1)
@@ -307,6 +310,8 @@ typedef struct PvgState {
     uint32_t ordinary_task_memory_install_result;
     const struct qmu_private_mapped_transport_v1 *mapped_transport_peer;
     bool mapped_transport_installed;
+    const struct qmu_private_guest_ram_region_v1 *guest_ram_region_peer;
+    bool guest_ram_region_installed;
 
     PvgMemory mem;
 
@@ -460,6 +465,8 @@ int pvg_iosfc_unmap_memory(void *ctx, void *hva, uint64_t len);
 uint64_t pvg_topology_sequence(void *ctx);
 void *pvg_map_retained(void *ctx, uint64_t gpa, size_t size, int writable,
                        uint64_t *sequence);
+/* qmu_guest_ram_region_v1.h: bounds of the mappable region holding gpa; no pin, no log */
+int pvg_guest_ram_region(void *ctx, uint64_t gpa, uint64_t *base, uint64_t *length);
 
 /* ------------------------------------------------------------ pvg-process-vm.c */
 AgfxEeeeProviderState *agfx_eeee_provider_state_create(void);

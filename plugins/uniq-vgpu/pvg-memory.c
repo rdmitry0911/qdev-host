@@ -168,6 +168,31 @@ static PvgRegion *pvg_memory_span(PvgState *s, uint64_t gpa, uint64_t size,
     return r;
 }
 
+/* qmu_guest_ram_region_v1.h (ML-SGR-2): the whole range of the DMA region
+ * holding gpa when pvg_map could map inside it (it has a host mapping).  A
+ * snapshot under the read section: no pin, no map, never logged, so QMetal can
+ * keep a chunk map inside one region instead of probing (and being refused,
+ * logged as an ERROR) across a region end. */
+int pvg_guest_ram_region(void *ctx, uint64_t gpa, uint64_t *base, uint64_t *length)
+{
+    PvgState *s = ctx;
+    PvgRegion *r;
+    int found = 0;
+
+    if (!s || !base || !length) {
+        return 0;
+    }
+    pvg_memory_read_enter(s);
+    r = pvg_memory_lookup_locked(s, gpa);
+    if (r && r->map) {
+        *base = r->iova;
+        *length = r->len;
+        found = 1;
+    }
+    pvg_memory_read_leave(s);
+    return found;
+}
+
 /* fork agfx_memory_map_gpa: one pin per successful map */
 static void *pvg_map(PvgState *s, const char *what, uint64_t gpa, uint64_t size,
                      int writable, bool log)

@@ -129,6 +129,7 @@ bool pvg_qmu_vt_bind(struct pvg_qmu_vt *vt, void *handle, long lmid, const char 
     /* Optional private peers: absent on older builds -> stored NULL. */
     struct { const char *name; void **slot; } o[] = {
         { "qmu_get_private_mapped_transport_v1",              (void **)&vt->get_private_mapped_transport_v1 },
+        { "qmu_get_private_guest_ram_region_v1",              (void **)&vt->get_private_guest_ram_region_v1 },
         { "qmu_get_private_ordinary_physical_capture_v2",     (void **)&vt->get_private_ordinary_physical_capture_v2 },
         { "qmu_get_private_ordinary_physical_comparison_v1",  (void **)&vt->get_private_ordinary_physical_comparison_v1 },
         { "qmu_get_private_ordinary_task_memory_v1",          (void **)&vt->get_private_ordinary_task_memory_v1 },
@@ -1935,6 +1936,17 @@ static int pvg_negotiate_peers(PvgState *s)
         }
         s->mapped_transport_peer = api;
     }
+    if (qmu_get_private_guest_ram_region_v1) {
+        const struct qmu_private_guest_ram_region_v1 *api = qmu_get_private_guest_ram_region_v1();
+
+        if (!api || api->version != QMU_PRIVATE_GUEST_RAM_REGION_V1_VERSION ||
+            api->struct_size != sizeof(*api) || !api->install) {
+            pvg_log(s, "[uniq-vgpu-ml] [ERROR] realize: Mismatched private guest-RAM region "
+                    "peer\n");
+            return -ENOTSUP;
+        }
+        s->guest_ram_region_peer = api;
+    }
     return 0;
 }
 
@@ -2123,6 +2135,27 @@ static void pvg_install_mapped_transport(PvgState *s)
         s->mapped_transport_peer->install(s->qmu_dev, &provider) == QMU_MAPPED_TRANSPORT_INSTALLED;
     if (!s->mapped_transport_installed) {
         pvg_log(s, "[uniq-vgpu-ml][WARN] uniq-vgpu-ml: mapped transport rejected; callback path\n");
+    }
+}
+
+/* ML-SGR-2: region bounds for QMetal's guest-RAM chunk maps.  Optional: an
+ * absent getter or a rejection only keeps QMetal's chunk cache off. */
+static void pvg_install_guest_ram_region(PvgState *s)
+{
+    struct qmu_guest_ram_region_provider_v1 provider = {
+        .version = QMU_PRIVATE_GUEST_RAM_REGION_V1_VERSION,
+        .struct_size = sizeof(provider),
+        .ctx = s,
+        .region = pvg_guest_ram_region,
+    };
+
+    if (!s->guest_ram_region_peer) {
+        return;
+    }
+    s->guest_ram_region_installed =
+        s->guest_ram_region_peer->install(s->qmu_dev, &provider) == QMU_GUEST_RAM_REGION_INSTALLED;
+    if (!s->guest_ram_region_installed) {
+        pvg_log(s, "[uniq-vgpu-ml][WARN] uniq-vgpu-ml: guest-RAM region provider rejected\n");
     }
 }
 
@@ -2715,6 +2748,7 @@ static int pvg_create_session(PvgState *s)
     qmu_log_set_callback(pvg_qmu_log_callback, s);
     qmu_set_debug_level(s->qmu_dev, (int)s->debug_level);
     pvg_install_mapped_transport(s);
+    pvg_install_guest_ram_region(s);
     return 0;
 }
 
@@ -3451,6 +3485,8 @@ static void pvg_reload_teardown(PvgState *s)
     s->eeee_provider_state = NULL;
     s->mapped_transport_peer = NULL;
     s->mapped_transport_installed = false;
+    s->guest_ram_region_peer = NULL;
+    s->guest_ram_region_installed = false;
     /* display target already released above; force a fresh one on re-publish */
     s->display_published = false;
     pvg_atomic_set(&s->pending_frames, 0);
