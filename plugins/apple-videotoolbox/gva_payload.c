@@ -4,7 +4,11 @@
  * avcC/hvcC + length-prefixed samples, as VideoToolbox gets them from a movie)
  * and the software oracle's MD5 per decode index (packed cropped NV12).
  *
- *   gva-payload <dir> h264|hevc|hevc10 <w> <h> <n>
+ *   gva-payload <dir> h264|hevc|hevc10 <w> <h> <n> [mincu16]
+ *
+ * mincu16 (HEVC): x265 min-cu-size=16, so a size that is not a multiple of 16 is
+ * coded padded with a conformance window (1080 lines coded 1088, as Apple's
+ * encoders and the reference's 1080 Main 10 stream have it; CT-P010-08).
  *
  * hevc10 = HEVC Main 10 (libx265 yuv420p10le): the oracle MD5s are of packed cropped
  * P010 ('x420': each 10-bit sample in the high bits of a little-endian 16-bit word)
@@ -27,13 +31,15 @@ int main(int argc, char **argv)
     char p[1024];
     FILE *f;
     int i, k, w, h, n, hevc, ten;
-    if (argc < 6) { fprintf(stderr, "usage: %s <dir> h264|hevc|hevc10 <w> <h> <n>\n", argv[0]); return 2; }
+    if (argc < 6) { fprintf(stderr, "usage: %s <dir> h264|hevc|hevc10 <w> <h> <n> [mincu16]\n", argv[0]); return 2; }
+    int mincu16 = argc > 6 && !strcmp(argv[6], "mincu16");
     ten = !strcmp(argv[2], "hevc10");
     hevc = ten || !strcmp(argv[2], "hevc");
     w = atoi(argv[3]); h = atoi(argv[4]); n = atoi(argv[5]);
     if (n > MAXF) n = MAXF;
     if (make_stream(hevc ? "libx265" : "libx264",
-                    hevc ? "bframes=3:keyint=8:scenecut=0:log-level=error"
+                    hevc ? (mincu16 ? "bframes=3:keyint=8:scenecut=0:min-cu-size=16:log-level=error"
+                                    : "bframes=3:keyint=8:scenecut=0:log-level=error")
                          : "bframes=2:ref=3:keyint=12:min-keyint=12:scenecut=0",
                     ten ? AV_PIX_FMT_YUV420P10LE : AV_PIX_FMT_YUV420P, w, h, n,
                     ten ? "pl265m10" : hevc ? "pl265" : "pl264", &s) != 0) return 1;

@@ -74,6 +74,7 @@ struct vtpv_lavc_dec {
     uint32_t         codec;
     int              bits;       /* 8 or 10: the session's sample depth        */
     uint32_t         out_fmt;    /* the guest pool's CoreVideo format (VTPV_CV_*) */
+    uint32_t         coded_w, coded_h; /* HEVC: the first SPS's coded size; 0 = unknown */
     AVCodecContext  *ctx;
     AVPacket        *pkt;
     AVFrame         *out_frame;  /* libavcodec's display-order output (dropped) */
@@ -446,6 +447,13 @@ int vtpv_lavc_open_decoder(vtpv_lavc *v, uint32_t codec, uint32_t width,
             return VTPV_ERR_UNSUPPORTED;      /* the SPS disagrees with the record */
         }
         if (full || pf == AV_PIX_FMT_YUVJ420P) d->out_fmt = d->bits == 10 ? VTPV_CV_XF20 : VTPV_CV_420F;
+        /* CT-P010-08: the same export gives the SPS's coded size
+         * (pic_width/height_in_luma_samples) as coded_width/coded_height, and
+         * the conformance-window-cropped size as width/height. */
+        if (pf != AV_PIX_FMT_NONE && d->ctx->coded_width > 0 && d->ctx->coded_height > 0) {
+            d->coded_w = (uint32_t)d->ctx->coded_width;
+            d->coded_h = (uint32_t)d->ctx->coded_height;
+        }
     }
     d->next = v->decs;
     v->decs = d;
@@ -744,12 +752,20 @@ static int be_decode(void *dec, const uint8_t *sample, size_t sample_len,
 static void be_close_decoder(void *dec) { vtpv_lavc_close_decoder(dec); }
 
 static uint32_t be_output_format(void *dec) { return vtpv_lavc_output_format(dec); }
+static int be_coded_size(void *dec, uint32_t *cw, uint32_t *ch) { return vtpv_lavc_coded_size(dec, cw, ch); }
 
 static const vtpv_decoder_backend g_lavc_backend = {
-    be_query_caps, be_open_decoder, be_decode, be_close_decoder, be_output_format
+    be_query_caps, be_open_decoder, be_decode, be_close_decoder, be_output_format, be_coded_size
 };
 
 uint32_t vtpv_lavc_output_format(const vtpv_lavc_dec *d) { return d ? d->out_fmt : 0; }
+int vtpv_lavc_coded_size(const vtpv_lavc_dec *d, uint32_t *cw, uint32_t *ch)
+{
+    if (!d || !d->coded_w || !d->coded_h) return -1;
+    if (cw) *cw = d->coded_w;
+    if (ch) *ch = d->coded_h;
+    return 0;
+}
 
 int vtpv_lavc_set_hevc10(vtpv_lavc *v, int on)
 {

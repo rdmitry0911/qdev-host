@@ -955,7 +955,7 @@ static int fake_decode(void *dec, const uint8_t *s, size_t sl,
 { (void)dec; (void)s; (void)sl; (void)o; return -1; }
 static void fake_close(void *dec) { (void)dec; }
 static const vtpv_decoder_backend fake_h264_be = {
-    fake_query_caps, fake_open_decoder, fake_decode, fake_close, NULL
+    fake_query_caps, fake_open_decoder, fake_decode, fake_close, NULL, NULL
 };
 
 /* ---- qdp_device_ops ------------------------------------------------- */

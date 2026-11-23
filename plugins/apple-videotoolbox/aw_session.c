@@ -70,6 +70,7 @@ typedef struct aw_dsession {
     void    *dec;            /* backend decoder handle                           */
     uint32_t codec, width, height;
     uint32_t out_fmt;        /* the guest pool's CoreVideo format (Dpba)         */
+    uint32_t ext_r, ext_b;   /* Dpba ExtendedPixelsRight/Bottom (CT-P010-08)     */
     uint64_t next_mapping_id;
 
     /* parked frame (event-driven dfrm, H7) */
@@ -119,15 +120,24 @@ struct aw_engine {
  * kCVPixelBufferPixelFormatTypeKey convention (CFNumber). fmt is the format the
  * decoder's pictures need, as Apple's host asks: '420v' / '420f' for 8 bits,
  * 'x420' / 'xf20' for 10, by the first SPS's bit depth and range (Apple's host
- * session measurements, reims docs/video/devices.md @3b3a5a7f^ "HEVC"). */
-static size_t build_dpba_plist(uint8_t *out, size_t cap, uint32_t fmt, uint32_t w, uint32_t h)
+ * session measurements, reims docs/video/devices.md @3b3a5a7f^ "HEVC").
+ *
+ * CT-P010-08: ExtendedPixelsRight / ExtendedPixelsBottom = the stream's coded
+ * size minus the description's, each present only when nonzero. Apple's host
+ * (AVD, M3 Max 2026-10-24, reims docs/video/devices.md "The decoder session" and
+ * "HEVC"; core.md "1088 coded minus 1080 displayed"): ExtendedPixelsBottom 8 for
+ * 1920x1080 Main 10 (1088 coded); no ExtendedPixels keys at 1280x720, 640x360 and
+ * 128x96 HEVC, whose coded size equals the displayed one. ext_r/ext_b come from
+ * the backend's coded size (HEVC SPS); 0 = key absent. */
+static size_t build_dpba_plist(uint8_t *out, size_t cap, uint32_t fmt, uint32_t w, uint32_t h,
+                               uint32_t ext_r, uint32_t ext_b)
 {
     aw_bplist *b = aw_bplist_new();
     if (!b) return 0;
     int fourcc = aw_bpl_int(b, (int64_t)fmt);
     int v_pft  = aw_bpl_array(b, &fourcc, 1);
     int v_io   = aw_bpl_dict(b, NULL, NULL, 0);          /* IOSurfaceProperties {} */
-    int keys[7] = {
+    int keys[9] = {
         aw_bpl_string(b, "PixelFormatType"),
         aw_bpl_string(b, "Width"),
         aw_bpl_string(b, "Height"),
@@ -136,7 +146,7 @@ static size_t build_dpba_plist(uint8_t *out, size_t cap, uint32_t fmt, uint32_t 
         aw_bpl_string(b, "PlaneAlignment"),
         aw_bpl_string(b, "PreferRealTimeCacheModeIfEveryoneDoes"),
     };
-    int vals[7] = {
+    int vals[9] = {
         v_pft,
         aw_bpl_int(b, (int)w),
         aw_bpl_int(b, (int)h),
@@ -145,7 +155,10 @@ static size_t build_dpba_plist(uint8_t *out, size_t cap, uint32_t fmt, uint32_t 
         aw_bpl_int(b, 256),
         aw_bpl_bool(b, 1),
     };
-    int root = aw_bpl_dict(b, keys, vals, 7);
+    int nk = 7;
+    if (ext_r) { keys[nk] = aw_bpl_string(b, "ExtendedPixelsRight");  vals[nk++] = aw_bpl_int(b, (int)ext_r); }
+    if (ext_b) { keys[nk] = aw_bpl_string(b, "ExtendedPixelsBottom"); vals[nk++] = aw_bpl_int(b, (int)ext_b); }
+    int root = aw_bpl_dict(b, keys, vals, nk);
     size_t n = (root >= 0) ? aw_bplist_finalize(b, root, out, cap) : 0;
     aw_bplist_free(b);
     return n;
@@ -545,10 +558,10 @@ static int32_t handle_closedec(aw_engine *e, const aw_msg_view *v)
  * its flags/UUID/ordering correct and a placeholder =pls body. */
 static void emit_dpba(aw_engine *e, aw_dsession *s)
 {
-    uint8_t pls[256];
+    uint8_t pls[512];                /* 9 keys with ExtendedPixels: ~300 bytes */
     size_t pls_len = build_dpba_plist(pls, sizeof pls, s->out_fmt ? s->out_fmt : AW_PIXFMT_420V,
-                                      s->width, s->height);
-    uint8_t buf[512];
+                                      s->width, s->height, s->ext_r, s->ext_b);
+    uint8_t buf[768];
     aw_builder b;
     aw_builder_init(&b, buf, sizeof buf);
     aw_build_header(&b, AW_MSG_DPBA, AW_FLAG_HOST_REQ, s->uuid, next_req_id(e));
@@ -595,6 +608,12 @@ static int32_t handle_dsta(aw_engine *e, aw_dsession *s, const aw_msg_view *v)
     s->out_fmt = e->cfg.be->output_format ? e->cfg.be->output_format(dec) : 0;
     if (s->out_fmt != AW_PIXFMT_420F && s->out_fmt != AW_PIXFMT_X420 && s->out_fmt != AW_PIXFMT_XF20)
         s->out_fmt = AW_PIXFMT_420V;
+    s->ext_r = s->ext_b = 0;
+    uint32_t cw = 0, ch = 0;
+    if (e->cfg.be->coded_size && e->cfg.be->coded_size(dec, &cw, &ch) == 0) {
+        if (cw > w) s->ext_r = cw - w;
+        if (ch > h) s->ext_b = ch - h;
+    }
 
     emit_dpba(e, s);                 /* Dpba BEFORE the dsta reply                */
 

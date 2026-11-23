@@ -94,6 +94,10 @@ void vtpv_lavc_flush(vtpv_lavc_dec *d);
  * '420v' / '420f' for 8 bits, 'x420' / 'xf20' (P010 layout) for 10, by the
  * first SPS's range (HEVC) - what the host asks for in Dpba. */
 uint32_t vtpv_lavc_output_format(const vtpv_lavc_dec *d);
+/* CT-P010-08: the coded size of the first SPS (HEVC; before the conformance
+ * window), as exported at open. 0 with cw and ch filled, or -1 when unknown (H.264,
+ * whose decoder exports nothing at open). */
+int vtpv_lavc_coded_size(const vtpv_lavc_dec *d, uint32_t *cw, uint32_t *ch);
 /* HEVC Main 10 admission (D-GVA-P010): on = 1 keeps what the device decodes (the
  * default after open), on = 0 refuses Main 10 records at open (the guest keeps its
  * software decoder, as before P010). It never admits Main 10 on a device that does

@@ -471,7 +471,7 @@ static void va_close_decoder(void *dec)
 }
 
 static const vtpv_decoder_backend g_va_backend = {
-    va_query_caps, va_open_decoder, va_decode, va_close_decoder, NULL /* NV12 only: '420v' */
+    va_query_caps, va_open_decoder, va_decode, va_close_decoder, NULL /* NV12 only: '420v' */, NULL
 };
 
 /* ---- open / close / readback --------------------------------------- */

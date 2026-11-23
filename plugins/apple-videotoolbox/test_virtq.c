@@ -52,7 +52,7 @@ static int mock_caps(void *ctx, vtpv_caps *out, size_t cap)
     c[0].reserved = 0; c[0].max_width = 4096; c[0].max_height = 4096; c[0].out_pixfmt = VTPV_PIXFMT_NV12;
     return 1;
 }
-static const vtpv_decoder_backend mock_be = { mock_caps, NULL, NULL, NULL, NULL };
+static const vtpv_decoder_backend mock_be = { mock_caps, NULL, NULL, NULL, NULL, NULL };
 
 /* ---- the emit sink: place a completion on the completion vq --------- */
 typedef struct { vtpv_virtq *cmp; int emits; uint16_t last_head; uint32_t last_written; } emit_ctx;

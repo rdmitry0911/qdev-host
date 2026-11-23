@@ -68,9 +68,14 @@ static void mock_close(void *dec){ (void)dec; g_close_calls++; g_held = 0; }
 static uint32_t g_out_fmt; /* what the mock decoder says its pictures need (0 = default) */
 static uint32_t mock_outfmt(void *dec){ (void)dec; return g_out_fmt; }
 static const vtpv_decoder_backend MOCK = {
-    mock_query, mock_open, mock_decode, mock_close, mock_outfmt };
+    mock_query, mock_open, mock_decode, mock_close, mock_outfmt, NULL };
 static const vtpv_decoder_backend MOCK_NOFMT = {
-    mock_query, mock_open, mock_decode, mock_close, NULL };
+    mock_query, mock_open, mock_decode, mock_close, NULL, NULL };
+static uint32_t g_coded_w, g_coded_h; static int g_coded_rc = -1; /* mock coded size (CT-P010-08) */
+static int mock_coded(void *dec, uint32_t *cw, uint32_t *ch){
+    (void)dec; if (g_coded_rc) return g_coded_rc; *cw = g_coded_w; *ch = g_coded_h; return 0; }
+static const vtpv_decoder_backend MOCK_CODED = {
+    mock_query, mock_open, mock_decode, mock_close, mock_outfmt, mock_coded };
 
 /* ---- mock guest buffer provider (resolve a lent surface) ------------ */
 static int g_resolve_calls, g_copy_calls, g_putbuf_calls, g_resolve_fail;
@@ -514,6 +519,86 @@ static void test_dpba_format(void) {
     g_out_fmt = 0;
 }
 
+/* A test-side bplist00 reader (Apple's binary property list format: trailer =
+ * last 32 bytes {.., offset int size @6, object ref size @7, num objects @8..15,
+ * top object @16..23, offset table offset @24..31}; dict 0xDn = n key refs then
+ * n value refs; ASCII string 0x5n, or 0x5F + an int object for 15 or more
+ * characters; int 0x1n = 2^n big-endian bytes). Independent
+ * of aw_bplist.c, which writes. Looks up an integer by key in the root dict:
+ * 1 found (*val), 0 key absent, -1 malformed. */
+static uint64_t bp_be(const uint8_t *p, int n){ uint64_t v = 0; for (int i = 0; i < n; i++) v = v << 8 | p[i]; return v; }
+static int bplist_root_int(const uint8_t *b, size_t len, const char *key, int64_t *val)
+{
+    if (len < 40 || memcmp(b, "bplist00", 8)) return -1;
+    const uint8_t *t = b + len - 32;
+    int osz = t[6], rsz = t[7];
+    uint64_t nobj = bp_be(t + 8, 8), top = bp_be(t + 16, 8), oto = bp_be(t + 24, 8);
+    if (!osz || !rsz || top >= nobj || oto + nobj * (uint64_t)osz > len - 32) return -1;
+    #define OBJ(i) (b + bp_be(b + oto + (uint64_t)(i) * osz, osz))
+    const uint8_t *d = OBJ(top);
+    if ((d[0] & 0xF0) != 0xD0 || (d[0] & 0x0F) == 0x0F) return -1;
+    int n = d[0] & 0x0F;
+    for (int i = 0; i < n; i++) {
+        const uint8_t *k = OBJ(bp_be(d + 1 + i * rsz, rsz));
+        size_t kl = strlen(key), sl; const uint8_t *sp;
+        if ((k[0] & 0xF0) != 0x50) continue;
+        if ((k[0] & 0x0F) != 0x0F) { sl = k[0] & 0x0F; sp = k + 1; }       /* length in the marker */
+        else {                                                             /* 0x5F, then an int object */
+            if ((k[1] & 0xF0) != 0x10) return -1;
+            int ib = 1 << (k[1] & 0x0F); sl = (size_t)bp_be(k + 2, ib); sp = k + 2 + ib;
+        }
+        if (sl != kl || memcmp(sp, key, kl)) continue;
+        const uint8_t *v = OBJ(bp_be(d + 1 + (n + i) * rsz, rsz));
+        if ((v[0] & 0xF0) != 0x10) return -1;
+        *val = (int64_t)bp_be(v + 1, 1 << (v[0] & 0x0F));
+        return 1;
+    }
+    #undef OBJ
+    return 0;
+}
+
+/* AW-EXT-01..06 (CT-P010-08): Dpba ExtendedPixelsRight/Bottom = coded size minus
+ * the description's, each key present only when nonzero. Reference: Apple's
+ * host (AVD) on the M3 Max, 2026-10-24 (reims docs/video/devices.md "The decoder
+ * session": ExtendedPixelsBottom 8 for 1920x1080 Main 10, 1088 coded; "HEVC": no
+ * ExtendedPixels keys at 1280x720 / 640x360 / 128x96, coded = displayed). The
+ * description here is 352x288 (build_dsta). */
+static void test_dpba_extended(void) {
+    printf("-- Dpba ExtendedPixels from the coded size --\n");
+    static const struct { const vtpv_decoder_backend *be; int rc; uint32_t cw, ch; int64_t r, b; const char *name; } cases[] = {
+        { &MOCK_CODED, 0, 352, 296, 0, 8, "AW-EXT-01 coded 8 rows taller -> Bottom 8 only" },
+        { &MOCK_CODED, 0, 352, 288, 0, 0, "AW-EXT-02 coded = description -> no keys" },
+        { &MOCK_CODED, 0, 368, 296, 16, 8, "AW-EXT-03 coded wider and taller -> Right 16, Bottom 8" },
+        { &MOCK_CODED, 0, 320, 240, 0, 0, "AW-EXT-04 coded smaller than the description -> no keys" },
+        { &MOCK_CODED, -1, 0, 0, 0, 0, "AW-EXT-05 coded size unknown -> no keys" },
+        { &MOCK,       0, 0, 0, 0, 0, "AW-EXT-06 backend without coded_size -> no keys" },
+    };
+    for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        aw_session_cfg cfg; memset(&cfg, 0, sizeof cfg);
+        cfg.be = cases[i].be; cfg.emit = cap_emit;
+        cfg.resolve_buffer = mock_resolve; cfg.copy_frame = mock_copy; cfg.put_buffer = mock_putbuf;
+        aw_engine *e = aw_engine_create(&cfg);
+        uint8_t m[512]; aw_msg_view v; uint8_t uuid[16]; memset(uuid, 0x70 + (int)i, 16);
+        g_coded_rc = cases[i].rc; g_coded_w = cases[i].cw; g_coded_h = cases[i].ch; g_out_fmt = VTPV_CV_X420;
+        aw_engine_deliver(e, m, msg0(m, AW_MSG_PDEC, AW_FLAG_GUEST_REQ, uuid));
+        ereset();
+        aw_engine_deliver(e, m, build_dsta(m, uuid));
+        CHECK(g_ne == 2 && e_type(0, &v) == AW_PARSE_OK && v.type == AW_MSG_DPBA, "%s: Dpba emitted", cases[i].name);
+        const uint8_t *pls; size_t pl; int64_t x = -1;
+        CHECK(aw_get_bytes(&v, AW_KEY_PBA, AW_VT_PLS, &pls, &pl) == AW_PARSE_OK, "%s: ,pba present", cases[i].name);
+        CHECK(bplist_root_int(pls, pl, "Width", &x) == 1 && x == 352, "%s: Width 352 (got %lld)", cases[i].name, (long long)x);
+        CHECK(bplist_root_int(pls, pl, "Height", &x) == 1 && x == 288, "%s: Height 288 (got %lld)", cases[i].name, (long long)x);
+        int fr = bplist_root_int(pls, pl, "ExtendedPixelsRight", &x);
+        CHECK(cases[i].r ? (fr == 1 && x == cases[i].r) : fr == 0, "%s: ExtendedPixelsRight (found %d, %lld)", cases[i].name, fr, (long long)x);
+        int fb = bplist_root_int(pls, pl, "ExtendedPixelsBottom", &x);
+        CHECK(cases[i].b ? (fb == 1 && x == cases[i].b) : fb == 0, "%s: ExtendedPixelsBottom (found %d, %lld)", cases[i].name, fb, (long long)x);
+        CHECK(bplist_root_int(pls, pl, "BytesPerRowAlignment", &x) == 1 && x == 64, "%s: other keys kept", cases[i].name);
+        CHECK(dpba_pixfmt(&v) == VTPV_CV_X420, "%s: PixelFormatType kept", cases[i].name);
+        aw_engine_destroy(e);
+    }
+    g_coded_rc = -1; g_out_fmt = 0;
+}
+
 /* AW-LEND-01..02 (D-GVA-LEND-FAIL-FAST, host half): a lent buffer the host
  * cannot resolve fails THAT frame at once - the unit is still decoded (its
  * picture may be a reference of later units), then Demt -12909 without a
@@ -905,6 +990,7 @@ int main(void) {
     test_sync_dfrm();
     test_properties();
     test_dpba_format();
+    test_dpba_extended();
     test_lend_failure();
     test_p1_decode_ahead();
     if (g_fail) { printf("FAILED: %d check(s)\n", g_fail); return 1; }

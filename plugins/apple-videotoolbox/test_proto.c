@@ -87,7 +87,7 @@ static int mock_decode(void *dec, const uint8_t *s, size_t slen,
 static void mock_close(void *dec) { g_close_calls++; free(dec); }
 
 static const vtpv_decoder_backend mock_be = {
-    mock_query_caps, mock_open, mock_decode, mock_close, NULL
+    mock_query_caps, mock_open, mock_decode, mock_close, NULL, NULL
 };
 
 /* ---- message builders ---------------------------------------------- */

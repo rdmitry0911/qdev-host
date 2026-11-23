@@ -211,6 +211,14 @@ typedef struct vtpv_decoder_backend {
     /* Optional: the CoreVideo pixel format (VTPV_CV_*) of the guest pool this
      * decoder's pictures need, known after open_decoder. NULL or 0 = '420v'. */
     uint32_t (*output_format)(void *dec);
+
+    /* Optional (CT-P010-08): the stream's coded size, known after open_decoder,
+     * when the first parameter set gives one (HEVC: the SPS's
+     * pic_width/height_in_luma_samples before the conformance window). Returns 0
+     * and fills cw and ch, or nonzero when unknown (H.264, other codecs). The engine
+     * turns a coded size larger than the description into Dpba
+     * ExtendedPixelsRight/Bottom, as Apple's host does. */
+    int (*coded_size)(void *dec, uint32_t *cw, uint32_t *ch);
 } vtpv_decoder_backend;
 
 /* ---- the protocol handler ------------------------------------------ */

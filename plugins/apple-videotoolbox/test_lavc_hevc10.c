@@ -44,6 +44,36 @@ int main(void)
         CHECK(rc == VTPV_OK && f.pixfmt == VTPV_PIXFMT_P010 && f.width == 320 && f.height == 240, "on: decodes to P010 (rc %d)", rc);
         vtpv_lavc_close_decoder(d);
     }
+    /* LAVC-EXT-01..03 (CT-P010-08): the coded size of the first SPS, exported at
+     * open. x265 pads to its minimum CU: with min-cu-size=16 a 232-line picture is
+     * coded as 240 lines with a conformance window of 8 (as a 1080-line stream
+     * coded 1088 is); at 240 lines (min CU 8) coded = displayed. */
+    {
+        stream c16;
+        uint32_t cw = 0, ch = 0;
+        CHECK(make_stream("libx265", "bframes=0:keyint=4:min-cu-size=16:log-level=error", AV_PIX_FMT_YUV420P10LE,
+                          320, 232, 2, "c16", &c16) == 0, "Main 10 stream 320x232, min CU 16");
+        rc = vtpv_lavc_open_decoder(v, VTPV_CODEC_HEVC, 320, 232, c16.extradata, c16.extradata_len, &d);
+        CHECK(rc == VTPV_OK && d, "LAVC-EXT-01: opens (rc %d)", rc);
+        if (d) {
+            CHECK(vtpv_lavc_coded_size(d, &cw, &ch) == 0 && cw == 320 && ch == 240,
+                  "LAVC-EXT-01: coded 320x240 under a 320x232 picture (got %ux%u)", cw, ch);
+            vtpv_lavc_close_decoder(d); d = NULL;
+        }
+        stream_free(&c16);
+        rc = vtpv_lavc_open_decoder(v, VTPV_CODEC_HEVC, 320, 240, m10.extradata, m10.extradata_len, &d);
+        CHECK(rc == VTPV_OK && d && vtpv_lavc_coded_size(d, &cw, &ch) == 0 && cw == 320 && ch == 240,
+              "LAVC-EXT-02: coded = displayed 320x240 (got %ux%u)", cw, ch);
+        if (d) { vtpv_lavc_close_decoder(d); d = NULL; }
+        stream h264;
+        if (make_stream("libx264", "keyint=4", AV_PIX_FMT_YUV420P, 320, 232, 2, "h", &h264) == 0) {
+            rc = vtpv_lavc_open_decoder(v, VTPV_CODEC_H264, 320, 232, h264.extradata, h264.extradata_len, &d);
+            CHECK(rc == VTPV_OK && d && vtpv_lavc_coded_size(d, &cw, &ch) != 0,
+                  "LAVC-EXT-03: H.264 coded size unknown at open (hold: no ExtendedPixels)");
+            if (d) { vtpv_lavc_close_decoder(d); d = NULL; }
+            stream_free(&h264);
+        } else printf("note: no libx264, LAVC-EXT-03 skipped\n");
+    }
     vtpv_lavc_close(v);
     stream_free(&m10); stream_free(&m8);
     if (g_fail) { printf("FAILED: %d of %d checks\n", g_fail, g_checks); return 1; }
