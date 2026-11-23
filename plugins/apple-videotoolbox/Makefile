@@ -141,6 +141,10 @@ $(BUILD)/test-vt-land-lavc: vtpv_lavc.c vt_land.c vt_scatter.c test_vt_land_lavc
 $(BUILD)/test-lavc-payload: vtpv_lavc.c vtpv_lavc.h vt_scatter.c vt_scatter.h vt_land.c vt_land.h test_lavc_payload.c | $(BUILD)
 	$(CC) $(CFLAGS) $(VA_CFLAGS) $(LAVC_CFLAGS) -o $@ vtpv_lavc.c vt_scatter.c vt_land.c test_lavc_payload.c $(LAVC_LIBS) $(VA_LIBS)
 
+# HEVC Main 10 admission knob (plugin hevc10=0|1, D-GVA-P010): software core + libx265.
+$(BUILD)/test-lavc-hevc10: vtpv_lavc.c vtpv_lavc.h test_lavc_hevc10.c test_lavc_util.c test_lavc_util.h | $(BUILD)
+	$(CC) $(CFLAGS) $(VA_CFLAGS) $(LAVC_CFLAGS) -o $@ vtpv_lavc.c test_lavc_hevc10.c test_lavc_util.c $(LAVC_LIBS) $(FMT_LIBS) $(VA_LIBS)
+
 # E2E payload writer (guest multi-frame decode check: record + samples + oracle MD5s).
 #   make build/gva-payload && ./build/gva-payload <dir> h264|hevc|hevc10 <w> <h> <n>
 $(BUILD)/gva-payload: gva_payload.c test_lavc_util.c test_lavc_util.h | $(BUILD)
@@ -188,7 +192,11 @@ ifeq ($(HAVE_VA),1)
 	@echo "== plugin ABI smoke =="; $(BUILD)/test-plugin $(BUILD)/apple-videotoolbox.so
 ifeq ($(HAVE_LAVC),1)
 	@$(MAKE) --no-print-directory $(BUILD)/test-lavc $(BUILD)/test-aw-replay-lavc $(BUILD)/test-lavc-land \
-	   $(BUILD)/test-lavc-payload $(BUILD)/gva-payload $(BUILD)/test-vt-land-lavc
+	   $(BUILD)/test-lavc-payload $(BUILD)/gva-payload $(BUILD)/test-vt-land-lavc $(BUILD)/test-lavc-hevc10
+	@echo "== HEVC Main 10 admission knob (hevc10=0 refuses as before P010, 1 takes the x420 path) =="; \
+	 $(BUILD)/test-lavc-hevc10 2>&1 | grep -v '^\[lib'; rc=$${PIPESTATUS[0]}; \
+	 if [ $$rc = 77 ]; then echo "(hevc10 knob test skipped: no encoder)"; \
+	 elif [ $$rc != 0 ]; then exit $$rc; fi
 	@echo "== landing bounds on a decoded picture taller than its description (GVA-LAND-BOUNDS) =="; \
 	 $(BUILD)/test-vt-land-lavc > $(BUILD)/test-vt-land-lavc.out 2>&1; rc=$$?; grep -v '^\[lib' $(BUILD)/test-vt-land-lavc.out; \
 	 if [ $$rc = 77 ]; then echo "(land-bounds lavc test skipped: no encoder)"; \

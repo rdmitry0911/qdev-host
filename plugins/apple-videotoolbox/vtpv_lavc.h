@@ -94,6 +94,12 @@ void vtpv_lavc_flush(vtpv_lavc_dec *d);
  * '420v' / '420f' for 8 bits, 'x420' / 'xf20' (P010 layout) for 10, by the
  * first SPS's range (HEVC) - what the host asks for in Dpba. */
 uint32_t vtpv_lavc_output_format(const vtpv_lavc_dec *d);
+/* HEVC Main 10 admission (D-GVA-P010): on = 1 keeps what the device decodes (the
+ * default after open), on = 0 refuses Main 10 records at open (the guest keeps its
+ * software decoder, as before P010). It never admits Main 10 on a device that does
+ * not decode it. Applies to decoders opened afterwards. Returns the effective
+ * state (1 = Main 10 opens). */
+int  vtpv_lavc_set_hevc10(vtpv_lavc *v, int on);
 void vtpv_lavc_close_decoder(vtpv_lavc_dec *d);
 
 /* Copy a frame's cropped planes into destination planes (row by row): luma

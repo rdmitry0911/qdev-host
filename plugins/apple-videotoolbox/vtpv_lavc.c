@@ -63,6 +63,7 @@ struct vtpv_lavc {
                                     * derived memory is uncached) take the copying
                                     * read mapping */
     int                hevc10;   /* the device decodes HEVC Main 10           */
+    int                hevc10_off; /* the integrator refused Main 10 (plugin hevc10=0) */
     uint32_t           next_id;  /* backend-local surface ids                */
     vtpv_lavc_dec     *decs;     /* open decoders (surface id lookup)        */
 };
@@ -382,7 +383,7 @@ int vtpv_lavc_open_decoder(vtpv_lavc *v, uint32_t codec, uint32_t width,
     {
         int bits = record_bits_420(codec, extradata, extradata_len);
         if (!bits) return VTPV_ERR_UNSUPPORTED;
-        if (bits == 10 && !v->hevc10) return VTPV_ERR_UNSUPPORTED; /* no Main 10 VLD here */
+        if (bits == 10 && (!v->hevc10 || v->hevc10_off)) return VTPV_ERR_UNSUPPORTED; /* no Main 10 VLD here, or refused */
     }
 
     c = avcodec_find_decoder(id);
@@ -749,6 +750,13 @@ static const vtpv_decoder_backend g_lavc_backend = {
 };
 
 uint32_t vtpv_lavc_output_format(const vtpv_lavc_dec *d) { return d ? d->out_fmt : 0; }
+
+int vtpv_lavc_set_hevc10(vtpv_lavc *v, int on)
+{
+    if (!v) return 0;
+    v->hevc10_off = !on;
+    return v->hevc10 && !v->hevc10_off;
+}
 
 const vtpv_decoder_backend *vtpv_lavc_backend(void) { return &g_lavc_backend; }
 

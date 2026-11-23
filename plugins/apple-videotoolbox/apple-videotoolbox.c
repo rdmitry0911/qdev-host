@@ -228,6 +228,13 @@ static void vt_log(vt_dev *d, int level, const char *fmt, ...)
         fprintf(stderr, "apple-videotoolbox: %s\n", buf);
 }
 
+/* HEVC Main 10 admission when the plugin args do not say (`hevc10=`): off until the
+ * 4K Main 10 playback rate reaches real time on every host class (D-GVA-P010:
+ * warm-hzmain Raphael VA-API 19.4 fps hardware vs 29.2 fps software, 2026-11-22). */
+#ifndef VT_HEVC10_DEFAULT
+#define VT_HEVC10_DEFAULT 0
+#endif
+
 /* ---- guest memory via the DMA regions (called under d->m) ----------- */
 static void *vt_map(void *ctx, uint64_t iova, uint64_t len)
 {
@@ -999,7 +1006,16 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
                 rc = vtpv_lavc_open(VTPV_LAVC_HW_VAAPI, node, &d->lavc, err, sizeof(err));
                 if (rc != 0) { vt_log(d, 1, "stream core: VA-API unavailable on %s: %s", node, err); d->lavc = NULL; }
             }
-            if (d->lavc) d->be = vtpv_lavc_backend();
+            if (d->lavc) {
+                /* `hevc10=0|1` (D-GVA-P010): HEVC Main 10 into 'x420'/'xf20' pools where the
+                 * device decodes it. Default VT_HEVC10_DEFAULT; 0 refuses Main 10 at dsta
+                 * (the guest decodes it in software, the pre-P010 behaviour). */
+                int h10 = VT_HEVC10_DEFAULT;
+                if (args && (q = strstr(args, "hevc10="))) h10 = q[7] == '1';
+                h10 = vtpv_lavc_set_hevc10(d->lavc, h10);
+                vt_log(d, 2, "stream core: HEVC Main 10 %s", h10 ? "on ('x420'/'xf20' pools)" : "off (refused at dsta)");
+                d->be = vtpv_lavc_backend();
+            }
         }
 #else
         if (!legacy)
