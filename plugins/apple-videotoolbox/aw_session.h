@@ -98,6 +98,14 @@ int32_t aw_engine_deliver(aw_engine *e, const uint8_t *msg, size_t len);
 
 unsigned aw_engine_open_sessions(const aw_engine *e);
 
+/* D-GVA-PIPELINE P1 (decode-ahead): decode each in-flight unit whose Dbuf has been
+ * emitted and whose Dbuf reply has not arrived yet, keeping the result for that
+ * reply. Emits nothing (the wire order is unchanged). The device calls it after the
+ * drain that emitted the Dbuf has delivered it to the guest, so the decode overlaps
+ * the guest's lend. Returns the number of units decoded. A session closed (mdec /
+ * dinv / engine destroy) while a picture is held drops it with its decoder. */
+unsigned aw_engine_run_deferred(aw_engine *e);
+
 /* ---- QuickTime ImageDescription (=fds) helpers (contract-B §5 / WIRE §5.2) --
  * 86-byte big-endian header, then extension atoms (avcC/hvcC), then a zero u32. */
 

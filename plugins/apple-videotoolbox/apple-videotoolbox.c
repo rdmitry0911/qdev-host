@@ -737,6 +737,8 @@ static void vt_process_submission(vt_dev *d)
 {
     vtpv_virtq *sq = &d->queues[0];
     unsigned budget = 2 * VT_QUEUE_MAX; /* bound the drain */
+    unsigned rounds = 0;
+again:
     static uint8_t msg[VTPV_MAX_SAMPLE_BYTES + 4096];
     while (budget-- && vtpv_virtq_has_avail(sq, vt_map, d) == 1) {
         size_t len = 0; uint16_t head = 0;
@@ -758,6 +760,12 @@ static void vt_process_submission(vt_dev *d)
     }
     vt_raise(d, 0);        /* the queue-0 chains are now free on the used ring */
     vt_flush_pending(d);   /* deliver any replies/requests this drain queued on q1 */
+    /* D-GVA-PIPELINE P1: the Dbufs of this drain are delivered and the dfrm chains
+     * retired; decode those units now, while the guest lends their buffers. The
+     * guest's Dbuf replies that arrived meanwhile are then picked up here. */
+    if (d->engine && aw_engine_run_deferred(d->engine) && rounds++ < 4 &&
+        vtpv_virtq_has_avail(sq, vt_map, d) == 1)
+        goto again;
 }
 
 /* ---- BAR0: virtio-modern common config + notify --------------------- */

@@ -53,6 +53,7 @@ static int mock_open(void *c, uint32_t codec, uint32_t w, uint32_t h,
     if (g_open_fail) return VTPV_ERR_BACKEND;
     *dec = (void *)0xD0D0; return 0;
 }
+static int g_held;  /* the mock backend's current picture (P1: held across the lend) */
 static int g_decode_drop_at = -1, g_decode_fail_at = -1; /* 0-based decode call index */
 static int mock_decode(void *dec, const uint8_t *s, size_t sl, vtpv_decoded_frame *o){
     (void)dec;(void)s;(void)sl;
@@ -60,9 +61,10 @@ static int mock_decode(void *dec, const uint8_t *s, size_t sl, vtpv_decoded_fram
     if (idx == g_decode_drop_at) return VTPV_DROPPED;
     if (idx == g_decode_fail_at) return VTPV_ERR_BACKEND;
     o->surface_id = 42; o->width = 352; o->height = 288; o->pixfmt = VTPV_PIXFMT_NV12;
+    g_held = 1;
     return 0;
 }
-static void mock_close(void *dec){ (void)dec; g_close_calls++; }
+static void mock_close(void *dec){ (void)dec; g_close_calls++; g_held = 0; }
 static uint32_t g_out_fmt; /* what the mock decoder says its pictures need (0 = default) */
 static uint32_t mock_outfmt(void *dec){ (void)dec; return g_out_fmt; }
 static const vtpv_decoder_backend MOCK = {
@@ -559,6 +561,103 @@ static void test_lend_failure(void) {
     aw_engine_destroy(e);
 }
 
+/* AW-P1-01..06 (D-GVA-PIPELINE P1 decode-ahead). Oracle = the engine without decode-ahead (the accepted
+ * v44 behaviour): the emitted host->guest byte stream must be IDENTICAL with aw_engine_run_deferred called
+ * after every emitting step (decode during the lend) and without it (decode on the Dbuf reply), over a
+ * scenario with parked units, a dropped unit, a failed unit, an unusable lent buffer and a lend of no
+ * surface. Plus the held picture across session close and engine destroy (live reload). */
+static uint8_t g_wire[64][2048]; static size_t g_wirel[64]; static int g_nwire;
+static void wire_take(void) { for (int i = 0; i < g_ne && g_nwire < 64; i++) { memcpy(g_wire[g_nwire], g_e[i], g_el[i]); g_wirel[g_nwire++] = g_el[i]; } ereset(); }
+static int p1_scenario(int ahead, int *decodes_before_reply) {
+    aw_engine *e = mk(); uint8_t m[512];
+    uint8_t uuid[16]; memset(uuid, 0x5a, 16);
+    static const uint8_t au[8] = { 0,0,0,4, 0x65, 1,2,3 };
+    int base = g_decode_calls, ahead_hits = 0;
+    g_nwire = 0; ereset();
+#define STEP(expr) do { (void)(expr); if (ahead) { int b = g_decode_calls; aw_engine_run_deferred(e); ahead_hits += g_decode_calls - b; } wire_take(); } while (0)
+    STEP(aw_engine_deliver(e, m, msg0(m, AW_MSG_PDEC, AW_FLAG_GUEST_REQ, uuid)));
+    STEP(aw_engine_deliver(e, m, build_dsta(m, uuid)));
+    g_decode_drop_at = base + 1; g_decode_fail_at = base + 2;
+    for (int i = 0; i < 5; i++) STEP(aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 40 + i, 801 + i, au, sizeof au)));
+    STEP(aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0xA100)));   /* 40 ok            */
+    STEP(aw_engine_deliver(e, m, build_demt_reply(m, uuid)));
+    STEP(aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0xA200)));   /* 41 dropped       */
+    STEP(aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0xA300)));   /* 42 fails         */
+    g_resolve_fail = 1;
+    STEP(aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0xA400)));   /* 43 lend unusable */
+    g_resolve_fail = 0;
+    STEP(aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0)));        /* 44 lent nothing  */
+    g_decode_drop_at = g_decode_fail_at = -1;
+    int decodes = g_decode_calls - base;
+    aw_engine_destroy(e);
+#undef STEP
+    if (decodes_before_reply) *decodes_before_reply = ahead_hits;
+    return decodes;
+}
+static void test_p1_decode_ahead(void) {
+    printf("-- P1 decode-ahead: wire-identical, held picture across close / destroy --\n");
+    static uint8_t ref[64][2048]; static size_t refl[64]; int nref;
+    int hits0 = -1, hits1 = -1;
+    int d0 = p1_scenario(0, &hits0);
+    nref = g_nwire; for (int i = 0; i < nref; i++) { memcpy(ref[i], g_wire[i], g_wirel[i]); refl[i] = g_wirel[i]; }
+    int d1 = p1_scenario(1, &hits1);
+    int same = nref == g_nwire;
+    for (int i = 0; same && i < nref; i++) same = refl[i] == g_wirel[i] && !memcmp(ref[i], g_wire[i], refl[i]);
+    CHECK(nref > 20, "P1-01: the scenario emits a real stream (%d messages)", nref);
+    CHECK(same, "P1-01: emitted byte stream identical with and without decode-ahead (%d vs %d messages)", nref, g_nwire);
+    CHECK(d0 == 5 && d1 == 5, "P1-02: every unit decoded exactly once either way (%d / %d)", d0, d1);
+    CHECK(hits0 == 0 && hits1 == 5, "P1-03: with decode-ahead all 5 units decode before their Dbuf reply (%d)", hits1);
+
+    /* P1-04: the lend comes back before the deferred decode ran: decoded on the reply, and a later
+     * run_deferred decodes nothing more */
+    {
+        aw_engine *e = mk(); uint8_t m[512]; aw_msg_view v;
+        uint8_t uuid[16]; memset(uuid, 0x5b, 16);
+        static const uint8_t au[8] = { 0,0,0,4, 0x65, 1,2,3 };
+        aw_engine_deliver(e, m, msg0(m, AW_MSG_PDEC, AW_FLAG_GUEST_REQ, uuid));
+        aw_engine_deliver(e, m, build_dsta(m, uuid));
+        aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 50, 901, au, sizeof au));
+        int b = g_decode_calls; ereset();
+        aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0xB100));
+        CHECK(g_decode_calls == b + 1 && g_ne == 2 && e_type(1, &v) == AW_PARSE_OK && v.type == AW_MSG_DEMT,
+              "P1-04: reply before the deferred decode: decoded on the reply, Demt");
+        CHECK(aw_engine_run_deferred(e) == 0 && g_decode_calls == b + 1, "P1-04: nothing left to decode ahead");
+        aw_engine_destroy(e);
+    }
+    /* P1-05: session closed (mdec) while a decoded picture is held: the decoder (and its picture) goes,
+     * a late Dbuf reply for it is refused without decode or copy */
+    {
+        aw_engine *e = mk(); uint8_t m[512];
+        uint8_t uuid[16]; memset(uuid, 0x5c, 16);
+        static const uint8_t au[8] = { 0,0,0,4, 0x65, 1,2,3 };
+        aw_engine_deliver(e, m, msg0(m, AW_MSG_PDEC, AW_FLAG_GUEST_REQ, uuid));
+        aw_engine_deliver(e, m, build_dsta(m, uuid));
+        aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 60, 1001, au, sizeof au));
+        CHECK(aw_engine_run_deferred(e) == 1 && g_held == 1, "P1-05: picture decoded ahead and held");
+        int c0 = g_close_calls, cp0 = g_copy_calls, dc0 = g_decode_calls; ereset();
+        aw_engine_deliver(e, m, msg0(m, AW_MSG_MDEC, AW_FLAG_GUEST_REQ, uuid));
+        CHECK(g_close_calls == c0 + 1 && g_held == 0, "P1-05: close released the decoder and its held picture");
+        CHECK(aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, 0xC100)) == AW_ERR_UNKNOWN_UUID &&
+              g_copy_calls == cp0 && g_decode_calls == dc0, "P1-05: late Dbuf reply refused, no decode, no copy");
+        CHECK(aw_engine_run_deferred(e) == 0, "P1-05: nothing pending after close");
+        aw_engine_destroy(e);
+    }
+    /* P1-06: engine destroyed with a held picture (device teardown / live plugin reload) */
+    {
+        aw_engine *e = mk(); uint8_t m[512];
+        uint8_t uuid[16]; memset(uuid, 0x5d, 16);
+        static const uint8_t au[8] = { 0,0,0,4, 0x65, 1,2,3 };
+        aw_engine_deliver(e, m, msg0(m, AW_MSG_PDEC, AW_FLAG_GUEST_REQ, uuid));
+        aw_engine_deliver(e, m, build_dsta(m, uuid));
+        aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 70, 1101, au, sizeof au));
+        aw_engine_deliver(e, m, build_dfrm_n(m, uuid, 71, 1102, au, sizeof au));   /* parked too */
+        CHECK(aw_engine_run_deferred(e) == 1 && g_held == 1, "P1-06: in-flight unit decoded ahead, parked unit waits");
+        int c0 = g_close_calls;
+        aw_engine_destroy(e);
+        CHECK(g_close_calls == c0 + 1 && g_held == 0, "P1-06: destroy closes the decoder holding the picture (ASan: parked unit freed)");
+    }
+}
+
 int main(void) {
     test_sbuf();
     test_listlike_routing();
@@ -568,6 +667,7 @@ int main(void) {
     test_properties();
     test_dpba_format();
     test_lend_failure();
+    test_p1_decode_ahead();
     if (g_fail) { printf("FAILED: %d check(s)\n", g_fail); return 1; }
     printf("OK: all aw_session checks passed\n");
     return 0;

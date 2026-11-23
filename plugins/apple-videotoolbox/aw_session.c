@@ -30,6 +30,7 @@
  * after its own Dbuf reply, as for the first (Apple's host holds the dfrm reply
  * the same way). */
 enum { AW_FRM_IDLE = 0, AW_FRM_AWAIT_DBUF, AW_FRM_AWAIT_DEMT };
+enum { AW_PRE_NONE = 0, AW_PRE_PENDING, AW_PRE_DONE };
 
 #define AW_PARK_MAX 16u
 #define AW_INFO_ASYNC        0x1u /* kVTDecodeInfo_Asynchronous                 */
@@ -61,6 +62,14 @@ typedef struct aw_dsession {
     uint32_t     pend_inf;   /* async flag echoed into the dfrm reply / Demt      */
     uint64_t     pend_dfrm_reply_id;
     aw_out_buffer pend_buf;  /* the lent buffer, held from Dbuf reply to rels     */
+    /* D-GVA-PIPELINE P1 decode-ahead: the in-flight unit is decoded right after its
+     * Dbuf went out (aw_engine_run_deferred, called by the device once the drain that
+     * emitted the Dbuf has delivered it), so the decode overlaps the guest's lend
+     * round trip. The picture stays the backend's (valid until the session's next
+     * decode, a flush or close_decoder); the engine only keeps the result. */
+    int          pre_state;  /* AW_PRE_NONE / AW_PRE_PENDING / AW_PRE_DONE          */
+    int          pre_dr;     /* the backend decode status of the held picture     */
+    vtpv_decoded_frame pre_f;
 
     /* dfrm units waiting for the in-flight frame to complete (FIFO)          */
     aw_parked    park[AW_PARK_MAX];
@@ -638,7 +647,27 @@ static void start_frame(aw_engine *e, aw_dsession *s, const uint8_t *au, size_t 
     s->pend_inf = inf;
     s->pend_dfrm_reply_id = reply_id;
     s->pend_state = AW_FRM_AWAIT_DBUF;
+    s->pre_state = AW_PRE_PENDING;   /* decode it once the Dbuf is on its way (P1)  */
     emit_dbuf(e, s, frm);            /* -> guest replies Dbuf with a lent buffer   */
+}
+
+/* D-GVA-PIPELINE P1: decode every in-flight unit whose Dbuf is out and whose lend
+ * has not come back yet. Nothing is emitted here: the frame's messages still go out
+ * on the Dbuf reply, in the same order as without decode-ahead. */
+unsigned aw_engine_run_deferred(aw_engine *e)
+{
+    unsigned n = 0;
+    if (!e || !e->cfg.be || !e->cfg.be->decode) return 0;
+    for (unsigned i = 0; i < AW_MAX_SESSIONS; i++) {
+        aw_dsession *s = &e->sess[i];
+        if (!s->used || !s->started || s->pend_state != AW_FRM_AWAIT_DBUF || s->pre_state != AW_PRE_PENDING)
+            continue;
+        memset(&s->pre_f, 0, sizeof s->pre_f);
+        s->pre_dr = e->cfg.be->decode(s->dec, s->pend_au, s->pend_au_len, &s->pre_f);
+        s->pre_state = AW_PRE_DONE;
+        n++;
+    }
+    return n;
 }
 
 static int reserve_au(aw_dsession *s, size_t au_len)
@@ -730,7 +759,13 @@ static int32_t handle_guest_reply(aw_engine *e, aw_dsession *s,
         }
 
         vtpv_decoded_frame f; memset(&f, 0, sizeof f);
-        int dr = e->cfg.be->decode(s->dec, s->pend_au, s->pend_au_len, &f);
+        int dr;
+        if (s->pre_state == AW_PRE_DONE) {          /* decoded ahead during the lend (P1) */
+            f = s->pre_f; dr = s->pre_dr;
+        } else {                                    /* the lend came back first: decode now */
+            dr = e->cfg.be->decode(s->dec, s->pend_au, s->pend_au_len, &f);
+        }
+        s->pre_state = AW_PRE_NONE;
 
         if (got != 0) {
             /* The guest's lent buffer cannot take the frame (no surface, or one the
