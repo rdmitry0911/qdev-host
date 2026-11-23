@@ -650,8 +650,6 @@ static int pvg_scanout_init(PvgState *s, size_t max_frame)
     }
     sc->slot_size = slot;
     sc->dmabuf_fd = pvg_disp_d1_dest_enabled() ? pvg_scanout_dmabuf(sc->fd, slot * sc->nslots) : -1;
-    pvg_log(s, "[uniq-vgpu-ml][display] DISP-D1 dest=%d dmabuf=%d (UVG_DISP_D1_DEST)\n",
-            pvg_disp_d1_dest_enabled(), sc->dmabuf_fd);
     return 0;
 }
 
@@ -3035,6 +3033,9 @@ static int pvg_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env, 
     pvg_loop_run_sync(s, pvg_initial_mode_call, &mode);
     pvg_pin_libraries();
     s->realized = true;
+    /* DISP-D1 knob state, once, where the host log is routed (the scanout is set up earlier in realize) */
+    pvg_log(s, "[uniq-vgpu-ml][display] DISP-D1 dest=%d dmabuf=%d (UVG_DISP_D1_DEST)\n",
+            pvg_disp_d1_dest_enabled(), s->scan.dmabuf_fd);
     pvg_log(s, "[uniq-vgpu-ml] Device realized successfully\n");
     /* No guest access is possible before setup returns: open the window. */
     pthread_mutex_lock(&s->irq_lock);
