@@ -958,6 +958,7 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
     vt_dev *d;
     char err[256] = {0};
     const char *node = "/dev/dri/renderD128";
+    char node_buf[256];
     int rc;
 
     if (env->size < offsetof(qdp_host_env, host_ops) + sizeof(env->host_ops) ||
@@ -966,7 +967,13 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
 
     if (args) {
         const char *p = strstr(args, "render_node=");
-        if (p) node = p + strlen("render_node=");
+        if (p) {
+            /* the value ends at the next ',' (gpu=, hevc10= may follow it in the same args) */
+            size_t n = strcspn(p + strlen("render_node="), ", ");
+            if (n >= sizeof node_buf) n = sizeof node_buf - 1;
+            memcpy(node_buf, p + strlen("render_node="), n); node_buf[n] = 0;
+            node = node_buf;
+        }
     }
 
     d = calloc(1, sizeof(*d));
