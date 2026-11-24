@@ -37,6 +37,7 @@
 #include <gio/gio.h>
 #include <gio/gunixfdlist.h>
 #include "qdp.h"
+#include "scanout-flip.h" /* IDLE-PATH-1a */
 #include "dbus/dbus-display1.h"
 #include "kms-sink.h"
 #include "ui-info-reply.h"
@@ -315,14 +316,17 @@ struct sink {
     void (*scanout)(sink_t *s);                                       /* mode changed or disabled */
     void (*update)(sink_t *s, int x, int y, int w, int h);            /* damage */
     void *priv;
+    /* IDLE-PATH-1a: the plugin moved to another slot of the SAME mode (scanout-flip.h FLIP): only sinks that bind a specific
+     * buffer (ScanoutMap listeners, zero-copy KMS) re-point; NULL = nothing to do (they copy from disp.pix on update) */
+    void (*flip)(sink_t *s);
 };
 
 static GPtrArray *listeners;   /* listener_t*, Display1 listeners (defined below) */
 static struct {
-    qdp_scanout cur;        /* current mode (enabled == false: blank) */
-    uint8_t *map;           /* mapping of the framebuffer (page aligned base) */
-    size_t   map_len;
-    uint8_t *pix;           /* first pixel of the scanout */
+    qdp_scanout cur;        /* current scanout (enabled == false: blank) */
+    qdp_scanout_maps maps;  /* IDLE-PATH-1a: the mapped slots of the current mode (scanout-flip.h), one map per slot */
+    uint8_t *pix;           /* first pixel of the current slot */
+    uint64_t flips;         /* slot flips taken without a mode change */
     uint8_t *shadow;        /* last pixels sent (width*4*height, packed); none with plugin damage */
     bool shadow_stale;
     GPtrArray *sinks;
@@ -331,30 +335,34 @@ static struct {
 static void disp_presented(uint64_t seq);
 static bool ctl_shots_pending(void);
 
+static void *disp_mmap(void *ud, int fd, size_t aligned, size_t len)
+{
+    (void)ud;
+    uint8_t *m = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, aligned);
+    if (m == MAP_FAILED) { LOG("mmap scanout: %s", strerror(errno)); return NULL; }
+    return m;
+}
+static void disp_munmap(void *ud, void *base, size_t len) { (void)ud; munmap(base, len); }
+static void disp_maps_init(void)
+{
+    if (!disp.maps.map) { disp.maps.map = disp_mmap; disp.maps.unmap = disp_munmap; disp.maps.page = sysconf(_SC_PAGESIZE); }
+}
+
 static void disp_unmap(void)
 {
-    if (disp.map) munmap(disp.map, disp.map_len);
-    disp.map = NULL; disp.pix = NULL; disp.map_len = 0;
+    disp_maps_init();
+    qdp_scanout_maps_clear(&disp.maps);
+    disp.pix = NULL;
     g_free(disp.shadow); disp.shadow = NULL;
 }
 
 static bool disp_map(const qdp_scanout *s)
 {
-    long page = sysconf(_SC_PAGESIZE);
-    size_t aligned = s->offset & ~(page - 1);
-    size_t len = (s->offset - aligned) + (size_t)s->stride * s->height;
-    uint8_t *m = mmap(NULL, len, PROT_READ, MAP_SHARED, s->fd, aligned);
-    if (m == MAP_FAILED) { LOG("mmap scanout: %s", strerror(errno)); return false; }
-    disp.map = m; disp.map_len = len; disp.pix = m + (s->offset - aligned);
-    if (!PLUGIN_DAMAGE) disp.shadow = g_malloc0((size_t)s->width * 4 * s->height);
+    disp_maps_init();
+    disp.pix = qdp_scanout_maps_get(&disp.maps, s);
+    if (!disp.pix) return false;
+    if (!PLUGIN_DAMAGE && !disp.shadow) disp.shadow = g_malloc0((size_t)s->width * 4 * s->height);
     return true;
-}
-
-static bool mode_changed(const qdp_scanout *a, const qdp_scanout *b)
-{
-    return a->enabled != b->enabled || a->fd != b->fd || a->offset != b->offset ||
-           a->width != b->width || a->height != b->height || a->stride != b->stride ||
-           a->pixman_format != b->pixman_format;
 }
 
 /* Compare the live framebuffer with the shadow; return the damage rectangle. */
@@ -389,11 +397,23 @@ static void disp_notify_scanout(void)
     }
 }
 
-/* Take a new scanout from the plugin; on a mode change tell the sinks. Returns
- * true when the mode changed (the next update must then cover everything). */
+/* Take a new scanout from the plugin; on a mode change tell the sinks. Returns true when the mode changed (the next
+ * update must then cover everything).  IDLE-PATH-1a (scanout-flip.h; reference QEMU apple-gfx.m: the console surface is set
+ * once per mode, frames update it): a FLIP to another slot of the same mode re-points disp.pix (each slot mapped once per
+ * mode), keeps the shadow, logs nothing and only re-points the sinks that bind a buffer; it is not a mode change. */
 static bool disp_set_mode(const qdp_scanout *now)
 {
-    if (!mode_changed(now, &disp.cur)) return false;
+    const enum qdp_scanout_change ch = qdp_scanout_classify(&disp.cur, now);
+    if (ch == QDP_SC_SAME) return false;
+    if (ch == QDP_SC_FLIP && disp_map(now)) {
+        disp.cur = *now;
+        disp.flips++;
+        for (guint i = 0; i < disp.sinks->len; i++) {
+            sink_t *s = g_ptr_array_index(disp.sinks, i);
+            if (s->flip) s->flip(s);
+        }
+        return false;
+    }
     disp_unmap();
     disp.cur = *now;
     if (now->enabled && !disp_map(now)) disp.cur.enabled = false;
@@ -489,10 +509,10 @@ static void print_stats(bool reset)
         tstat.ticks ? tstat.cmp_sum / tstat.ticks * 1e3 : 0.0, tstat.cmp_max * 1e3,
         ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6, ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6);
     if (abi >= 2)
-        LOG("stats: v2: frames %" PRIu64 " (frame_ready %" PRIu64 "), seq %" PRIu64 ", irqs %" PRIu64 " (dropped %" PRIu64 "), dma %u regions %" PRIu64 " MiB, quiesce %" PRIu64 ", cursor %" PRIu64 "/%" PRIu64,
+        LOG("stats: v2: frames %" PRIu64 " (frame_ready %" PRIu64 "), seq %" PRIu64 ", irqs %" PRIu64 " (dropped %" PRIu64 "), dma %u regions %" PRIu64 " MiB, quiesce %" PRIu64 ", cursor %" PRIu64 "/%" PRIu64 ", flips %" PRIu64,
             hstat.frames, __atomic_load_n(&hstat.frame_calls, __ATOMIC_RELAXED), disp.seq,
             __atomic_load_n(&hstat.irq_ok, __ATOMIC_RELAXED), __atomic_load_n(&hstat.irq_drop, __ATOMIC_RELAXED),
-            g_hash_table_size(dma_map), dma_bytes >> 20, hstat.quiesce, hstat.cursor_sent, __atomic_load_n(&hstat.cursor_calls, __ATOMIC_RELAXED));
+            g_hash_table_size(dma_map), dma_bytes >> 20, hstat.quiesce, hstat.cursor_sent, __atomic_load_n(&hstat.cursor_calls, __ATOMIC_RELAXED), disp.flips);
     if (kms) kms_stats(kms, stderr, reset);
     if (reset) memset(&tstat, 0, sizeof(tstat));
 }
@@ -508,6 +528,11 @@ static void kms_sink_scanout(sink_t *s)
 static void kms_sink_update(sink_t *s, int x, int y, int w, int h)
 {
     kms_update(kms, disp.pix, disp.cur.stride, x, y, w, h);
+}
+/* IDLE-PATH-1a: zero-copy KMS scans the slot itself (fd + offset) -> re-import as on a mode change; copy mode reads disp.pix */
+static void kms_sink_flip(sink_t *s)
+{
+    if (kms_zero_copy(kms)) kms_sink_scanout(s);
 }
 /* physical connector hot-plug -> run the hooks (e.g. tbctl.py plug/unplug) */
 static gboolean kms_hotplug_poll(gpointer data)
@@ -1222,6 +1247,15 @@ static void display1_sink_scanout(sink_t *s)
 static void display1_sink_update(sink_t *s, int x, int y, int w, int h)
 {
     for (guint i = 0; i < listeners->len; i++) listener_send_update(g_ptr_array_index(listeners, i), x, y, w, h);
+}
+/* IDLE-PATH-1a: a ScanoutMap listener maps the memfd at the slot's offset -> send it the new slot; inline listeners get the
+ * pixels with the next update from disp.pix */
+static void display1_sink_flip(sink_t *s)
+{
+    for (guint i = 0; i < listeners->len; i++) {
+        listener_t *l = g_ptr_array_index(listeners, i);
+        if (l->mapped) listener_send_scanout(l);
+    }
 }
 
 /* ------------------------------------------------ Display1 server objects */
@@ -2140,12 +2174,12 @@ int main(int argc, char **argv)
     listeners = g_ptr_array_new();
     exports = g_ptr_array_new();
     disp.sinks = g_ptr_array_new();
-    static sink_t display1_sink = { "display1", display1_sink_scanout, display1_sink_update };
+    static sink_t display1_sink = { "display1", display1_sink_scanout, display1_sink_update, NULL, display1_sink_flip };
     static sink_t console_props_sink = { "console-props", exports_sink_scanout, NULL };
     g_ptr_array_add(disp.sinks, &console_props_sink);
     g_ptr_array_add(disp.sinks, &display1_sink);
 
-    static sink_t kms_sink = { "kms", kms_sink_scanout, kms_sink_update };
+    static sink_t kms_sink = { "kms", kms_sink_scanout, kms_sink_update, NULL, kms_sink_flip };
     if (opt.kms) {
         kms = kms_open(opt.kms, opt.verbose);
         if (!kms) exit(1);

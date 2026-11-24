@@ -53,6 +53,17 @@ int main(void)
     const int before = maps;
     CHECK(qdp_scanout_maps_get(&m, &a) != NULL && maps == before + 1, "F-05 the next get maps again");
     qdp_scanout_maps_clear(&m);
+    /* F-06 (DISPLAY lane): more slots than entries -> round-robin replacement, the replaced slot is unmapped once and mapped
+     * again when it comes back; nothing leaks at the clear */
+    maps = unmaps = 0;
+    qdp_scanout s5[5];
+    for (int i = 0; i < 5; i++) { s5[i] = a; s5[i].offset = (uint32_t)i * 8294400u; }
+    for (int i = 0; i < 5; i++) CHECK(qdp_scanout_maps_get(&m, &s5[i]) != NULL, "F-06 slot %d mapped", i);
+    CHECK(maps == 5 && unmaps == 1, "F-06 five slots through four entries: 5 maps, 1 unmap (maps %d unmaps %d)", maps, unmaps);
+    CHECK(qdp_scanout_maps_get(&m, &s5[0]) != NULL && maps == 6 && unmaps == 2, "F-06 the replaced slot maps again (maps %d unmaps %d)",
+          maps, unmaps);
+    qdp_scanout_maps_clear(&m);
+    CHECK(unmaps == 6 && maps == 6, "F-06 clear: every mapping unmapped exactly once (maps %d unmaps %d)", maps, unmaps);
     printf("scanout-flip-test: %d checks, %d failures\nRESULT %s\n", checks, failures, failures ? "FAIL" : "PASS");
     return failures ? 1 : 0;
 }

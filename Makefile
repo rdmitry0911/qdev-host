@@ -88,7 +88,7 @@ dbus/dbus-display1.c dbus/dbus-display1.h: dbus/dbus-display1.xml
 	cd dbus && gdbus-codegen dbus-display1.xml --glib-min-required 2.64 --output-directory . \
 	    --interface-prefix org.qemu. --c-namespace QemuDBus --generate-c-code dbus-display1
 
-qdev-host: qdev-host.c kms-sink.c kms-sink.h ui-info-reply.h dbus/dbus-display1.c dbus/dbus-display1.h qdp.h $(VFU_DEP)
+qdev-host: qdev-host.c kms-sink.c kms-sink.h ui-info-reply.h scanout-flip.h dbus/dbus-display1.c dbus/dbus-display1.h qdp.h $(VFU_DEP)
 	$(CC) $(CFLAGS) -I. $(VFU_CFLAGS) $(GLIB_CFLAGS) $(DRM_CFLAGS) -o $@ qdev-host.c kms-sink.c dbus/dbus-display1.c $(VFU_LIBS) $(GLIB_LIBS) $(DRM_LIBS) -ldl -lpthread
 
 tools/display1-input-bench: tools/display1-input-bench.c
