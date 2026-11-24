@@ -103,6 +103,13 @@ tools/display1-uiinfo-test: tools/display1-uiinfo-test.c ui-info-reply.h qdp.h $
 ui-info-reply-test: tools/display1-uiinfo-test
 	tools/display1-uiinfo-test
 
+# IDLE-PATH-1a: how a new plugin scanout is taken (scanout-flip.h): SAME / FLIP / MODE and the slot map cache, unit cases only
+tools/scanout-flip-test: tools/scanout-flip-test.c scanout-flip.h qdp.h $(VFU_DEP)
+	$(CC) $(CFLAGS) -I. $(VFU_CFLAGS) -o $@ $<
+
+scanout-flip-test: tools/scanout-flip-test
+	tools/scanout-flip-test
+
 # QEMU's Display1 Audio over its p2p dbus display through QMP (no guest; stock QEMU, dbus-daemon, python3-gi):
 # make qemu-audio-p2p-test QEMU=/path/qemu-system-x86_64 QEMU_L=/path/pc-bios
 qemu-audio-p2p-test: qdev-host plugins/tb-vga/tb-vga.so
