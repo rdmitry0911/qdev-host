@@ -1,0 +1,18 @@
+{
+  "name": "apple-videotoolbox",
+  "title": "AppleGVA video decoder (VideoToolbox, macOS guest)",
+  "description": "Paravirtual VideoToolbox device for a macOS guest with the apple-virgl video kext: the guest's H.264 and HEVC streams are decoded on this node's GPU (NVDEC or VA-API). Add it next to the VM's uniq-vgpu GPU: it meets the GPU at the mapper bridge /pvg-mapper-bridge (uniq-vgpu's default), through which decoded frames land in the GPU's surfaces; for several such VMs on one node give both sidecars the same VM-scoped PVG_MAPPER_BRIDGE_SHM, e.g. /uniqvgpu-{vmid}-mapper. Without the kext the device stays unclaimed and the guest decodes in software. The device has no display. qdevctl shares the VM's memory for it.",
+  "fields": {"display": false, "kms": false},
+  "shared_memory": true,
+  "env": {"PVG_MAPPER_BRIDGE_SHM": "/pvg-mapper-bridge"},
+  "args": [
+    {"name": "backend", "label": "Decoder", "type": "choice", "default": "auto",
+     "choices": [["auto", "CUDA/NVDEC first, then VA-API"], ["nvdec", "NVDEC (NVIDIA)"], ["vaapi", "VA-API (AMD, Intel)"]]},
+    {"name": "render_node", "label": "Render node", "type": "render", "default": "/dev/dri/renderD128",
+     "hint": "VA-API: the DRM render node of the GPU that decodes"},
+    {"name": "gpu", "label": "CUDA device", "type": "string", "default": "",
+     "hint": "NVDEC: the CUDA ordinal of the GPU; empty - device 0"},
+    {"name": "hevc10", "label": "HEVC Main 10 in hardware", "type": "bool", "default": false,
+     "hint": "only where Main 10 playback reaches 24 fps; off - Main 10 is decoded in software"}
+  ]
+}

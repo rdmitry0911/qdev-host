@@ -81,6 +81,69 @@ def plugin_kind(plugin: str) -> str:
 def dev_kind(dev: dict) -> str:
     return plugin_kind(dev["plugin"])
 
+# Sidecar keys a plugin's NAME.json may carry besides title/description/args:
+#   "fields": {"display": false, "kms": false, "persistent": false} - dialog fields the device does not use
+#   "shared_memory": true - the plugin reaches guest memory directly (DMA, queues in guest RAM): qdevctl
+#       shares the VM's memory as it does for its GPUs, unless PVE or the VM's args already do
+#   "env": {"NAME": "value"} - environment of the device's process; {vmid} and {id} are replaced
+# Defaults for plugins whose sidecar does not carry the keys yet (the sidecar's own keys win).
+# uniq-vgpu has none: its VMs keep the environment they were set up with.
+PLUGIN_DEFAULTS = {
+    "v-airport": {"fields": {"display": False, "kms": False}, "shared_memory": True},
+    "v-aux": {"fields": {"display": False, "kms": False}, "shared_memory": True},
+    # the mapper bridge uniq-vgpu opens without PVG_MAPPER_BRIDGE_SHM: the video device of the same VM meets
+    # the GPU there (a VM-scoped name needs the same "env" in both sidecars, e.g. /uniqvgpu-{vmid}-mapper)
+    "apple-videotoolbox": {"fields": {"display": False, "kms": False}, "shared_memory": True,
+                           "env": {"PVG_MAPPER_BRIDGE_SHM": "/pvg-mapper-bridge"}},
+}
+PLUGIN_FIELDS = ("kms", "display", "persistent")
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+def plugin_meta(plugin: str) -> dict:
+    """A .so plugin's sidecar NAME.json over PLUGIN_DEFAULTS ({} for built-in plugins)."""
+    if plugin in BUILTIN_PLUGINS:
+        return {}
+    meta = {}
+    side = PLUGIN_DIR / f"{plugin}.json"
+    if side.exists():
+        try:
+            meta = json.loads(side.read_text())
+        except ValueError:
+            meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    return {**PLUGIN_DEFAULTS.get(plugin, {}), **meta}
+
+def plugin_fields(plugin: str) -> dict:
+    """The dialog fields a plugin's devices use."""
+    if plugin in BUILTIN_PLUGINS:
+        return dict(BUILTIN_PLUGINS[plugin]["fields"])
+    own = plugin_meta(plugin).get("fields") or {}
+    return {k: bool(own.get(k, True)) for k in PLUGIN_FIELDS}
+
+def clamp_to_fields(dev: dict) -> None:
+    """Drop the settings of fields the plugin does not use (the dialog does not send hidden fields)."""
+    f = plugin_fields(dev["plugin"])
+    if not f["display"]:
+        dev["display"] = False
+    if not f["kms"]:
+        dev["kms"] = None
+    if not f["persistent"]:
+        dev["persistent"] = False
+
+def needs_shared_memory(dev: dict) -> bool:
+    return dev_kind(dev) == "vhost-user-gpu" or (dev_kind(dev) == "vfio-user"
+                                                 and bool(plugin_meta(dev["plugin"]).get("shared_memory")))
+
+def plugin_env(vmid: int, dev: dict) -> dict[str, str]:
+    env = plugin_meta(dev["plugin"]).get("env") or {}
+    out = {}
+    for k, v in (env.items() if isinstance(env, dict) else []):
+        v = str(v).replace("{vmid}", str(vmid)).replace("{id}", dev["id"])
+        if ENV_NAME_RE.match(k) and k != "QDEV_ARGS" and "\n" not in v:
+            out[k] = v
+    return out
+
 def plugin_available(plugin: str) -> bool:
     if plugin_kind(plugin) == "tb":
         return True
@@ -552,7 +615,11 @@ def build_args(vmid: int, dev: dict) -> list[str]:
 def write_unit_env(vmid: int, dev: dict) -> None:
     UNIT_DIR.mkdir(parents=True, exist_ok=True)
     p = UNIT_DIR / f"{vmid}-{dev['id']}.env"
-    p.write_text("QDEV_ARGS=" + " ".join(build_args(vmid, dev)) + "\n")
+    lines = ["QDEV_ARGS=" + " ".join(build_args(vmid, dev))]
+    if dev_kind(dev) == "vfio-user":
+        for k, v in plugin_env(vmid, dev).items():
+            lines.append(f'{k}="' + v.replace("\\", "\\\\").replace('"', '\\"') + '"')
+    p.write_text("\n".join(lines) + "\n")
     p.chmod(0o640)
 
 def start_process(vmid: int, dev: dict) -> None:
@@ -885,8 +952,31 @@ def vm_memory(cfg: dict[str, str]) -> int:
         raise QdevError("set the VM's memory explicitly: the shared memory backend needs its size")
     return int(m.group(1))
 
+def args_share_memory(args: str) -> bool:
+    """The VM's args already back its RAM with a shared memory backend of their own (not qdev-host's)."""
+    for m in re.finditer(r"-machine\s+(?:\S*,)?memory-backend=([^,\s]+)", args or ""):
+        bid = m.group(1)
+        if bid == SHARED_MEM_ID:
+            continue
+        for o in re.finditer(r"-object\s+memory-backend-(?:memfd|file),(\S+)", args or ""):
+            opts = dict(x.split("=", 1) for x in o.group(1).split(",") if "=" in x)
+            if opts.get("id") == bid and opts.get("share") in ("on", "true", "yes"):
+                return True
+    return False
+
 def memory_is_shared(cfg: dict[str, str]) -> bool:
-    return bool(cfg.get("hugepages")) or any(re.match(r"^virtiofs\d+$", k) for k in cfg)
+    return (bool(cfg.get("hugepages")) or any(re.match(r"^virtiofs\d+$", k) for k in cfg)
+            or args_share_memory(cfg.get("args", "")))
+
+def running_memory_shared(vmid: int) -> bool:
+    """The running QEMU's RAM is in a shared memory backend (hugepages, virtiofs, a memfd with share=on)."""
+    try:
+        pid = int(Path(f"/var/run/qemu-server/{vmid}.pid").read_text().strip())
+        cmd = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace").split("\0")
+    except (OSError, ValueError):
+        return False
+    return any(re.match(r"memory-backend-(?:memfd|file),", a) and re.search(r"(?:^|,)share=(?:on|true|yes)(?:,|$)", a)
+               for a in cmd)
 
 def shared_memory_groups(cfg: dict[str, str]) -> str:
     """The args that give the VM shared memory, or '' when PVE already does."""
@@ -922,6 +1012,7 @@ def apply_vug_args(vmid: int, conf: dict, cfg: dict[str, str]) -> list[str]:
     root port, so a re-run gives the same result.  Returns notes for the user."""
     notes = []
     args = cfg.get("args", "")
+    had_mem = bool(_find(args, SHARED_MEM_PATTERNS[0]))
     for dev in conf["devices"]:
         for pat in vug_patterns(dev["id"]):
             args = _drop(args, pat)
@@ -948,12 +1039,12 @@ def apply_vug_args(vmid: int, conf: dict, cfg: dict[str, str]) -> list[str]:
             args = args.replace(after, f"{after} {gpu}", 1)
         else:
             args = f"{gpu} {args}".strip()
-    if vugs:
-        mem = shared_memory_groups(cfg)
+    if vugs or any(needs_shared_memory(d) for d in conf["devices"]):
+        mem = shared_memory_groups({**cfg, "args": args})
         groups = " ".join(vug_groups(vmid, d) for d in vugs)
         args = " ".join(x for x in (args, mem, groups) if x)
-        if mem:
-            notes.append(f"the VM's {vm_memory(cfg)} MiB of memory are shared with the GPU process "
+        if mem and not had_mem:
+            notes.append(f"the VM's {vm_memory(cfg)} MiB of memory are shared with qdev-host's device processes "
                          "(memory-backend-memfd in args; save the device again after changing the memory)")
     qm_set(vmid, "args", args or None)
     # the VM's own display device would come first, so QSM would not show the GPU
@@ -985,9 +1076,10 @@ def list_plugins() -> list[dict]:
                 meta = json.loads(side.read_text())
             except ValueError:
                 meta = {}
+        meta = {**PLUGIN_DEFAULTS.get(so.stem, {}), **(meta if isinstance(meta, dict) else {})}
         out.append({"name": so.stem, "kind": "vfio-user", "title": meta.get("title", so.stem),
                     "description": meta.get("description", ""), "args": meta.get("args", []),
-                    "fields": {"kms": True, "display": True, "persistent": True}})
+                    "fields": plugin_fields(so.stem), "shared_memory": bool(meta.get("shared_memory"))})
     for name, meta in BUILTIN_PLUGINS.items():  # after the .so plugins: tb-vga stays the dialog's default
         if plugin_available(name):
             entry = {"name": name, "kind": meta["kind"], "title": meta["title"],
@@ -1053,6 +1145,10 @@ def add_device(vmid: int, dev_id: str, plugin: str, args: str = "", bus: str = "
     snippets_dir()
     if plugin_kind(plugin) == "vhost-user-gpu":
         return add_vug_device(vmid, conf, cfg, dev, had_tb)
+    clamp_to_fields(dev)
+    shared = needs_shared_memory(dev)
+    if shared:
+        shared_memory_groups(cfg)          # refuses NUMA/memory hot-plug without hugepages/virtiofs
     changed_port = False
     try:
         if bus == PORT_ID:
@@ -1067,10 +1163,15 @@ def add_device(vmid: int, dev_id: str, plugin: str, args: str = "", bus: str = "
             qdev_tb.purge(vmid, conf, vm_config(vmid))
         raise
     conf["devices"].append(dev)
+    if shared:
+        msgs += [f"note: {n}" for n in apply_vug_args(vmid, conf, vm_config(vmid))]
     save_conf(conf)
     write_unit_env(vmid, dev)
     msgs.append(f"VM {vmid}: device {dev_id} ({plugin}) defined on bus {bus}")
-    if vm_running(vmid):
+    if vm_running(vmid) and shared and not running_memory_shared(vmid):
+        msgs.append(f"{dev_id}: not hot-plugged - {plugin} works in the guest's memory, which the running VM does not "
+                    "share yet: stop and start the VM (the hookscript starts and attaches the device then)")
+    elif vm_running(vmid):
         msgs.append(attach(vmid, dev))
         if changed_port:
             msgs.append(f"note: root port {PORT_ID} was added to args; it appears at the next VM start" if bus == PORT_ID
@@ -1132,6 +1233,8 @@ def update_device(vmid: int, dev_id: str, args: str | None = None, kms: str | No
         new["display"] = bool(display)
     if persistent is not None:
         new["persistent"] = bool(persistent)
+    if dev_kind(dev) == "vfio-user":
+        clamp_to_fields(new)
     validate_device(dev_id, new["plugin"], new.get("args", ""), new["bus"], new.get("kms"))
     if dev_kind(dev) == "tb":
         import qdev_tb
@@ -1189,6 +1292,8 @@ def remove_device(vmid: int, dev_id: str, keep_process: bool = False, purge_port
     else:
         msgs.append(detach(vmid, dev, keep_process))
         conf["devices"] = [d for d in conf["devices"] if d["id"] != dev_id]
+        if needs_shared_memory(dev) and _find(vm_config(vmid).get("args", ""), SHARED_MEM_PATTERNS[0]):
+            apply_vug_args(vmid, conf, vm_config(vmid))
     env = UNIT_DIR / f"{vmid}-{dev_id}.env"
     if env.exists() and not keep_process:
         env.unlink()

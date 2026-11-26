@@ -1,3 +1,28 @@
+qdev-host (0.6.4) unstable; urgency=medium
+
+  * Plugin sidecars (NAME.json next to NAME.so) may carry "fields" (the
+    dialog fields the device uses; qdevctl keeps the others off),
+    "shared_memory" (the plugin works in guest RAM: qdevctl shares the VM's
+    memory as it does for its GPUs, unless hugepages, virtiofs or the VM's
+    own shared backend already do, and refuses to hot-plug such a device into
+    a running VM whose memory is not shared) and "env" (the device
+    process's environment, {vmid}/{id} replaced). Defaults for v-airport,
+    v-aux and apple-videotoolbox until their own sidecars carry the keys, so
+    their devices can be added in Add > qdev-host Device.
+  * apple-videotoolbox.json: the AppleGVA video decoder in that dialog.
+  * qdevctl reboot-policy VMID cold|reset: an in-guest reboot can become a
+    VM-level cold restart (qdev-host-reboot-relay@VMID.service).
+  * qdev-host refuses a backend reload while a guest is attached unless
+    --allow-guest-gpu-loss, stops the guest's vCPUs around a reload
+    (--vm-qmp / --vm-paused), and treats a plugin's scanout slot flip as
+    no mode change (no re-map, no log line per frame).
+  * Display1: QEMU's audio over its p2p D-Bus display when input goes
+    through QMP.
+  * Source tree: the uniq-vgpu and apple-videotoolbox plugins (built
+    separately, not in these packages).
+
+ -- Dmitry R <rdmitry0911@gmail.com>  Thu, 26 Nov 2026 15:10:10 -0000
+
 qdev-host (0.6.3) unstable; urgency=medium
 
   * Web UI: Add > qdev-host Device offers only qdev-host's own devices
