@@ -1180,6 +1180,61 @@ int main(int argc, char **argv)
             print_residue("before", 0, &res0);
             res_warm = res0;
             res_last = res0;
+            /* 10a. D-QDEV-RELOAD-ROLLBACK-EIO (apple-virgl analysis/20261127-FIX-CANDIDATE-D-QDEV-RELOAD-ROLLBACK-EIO.md):
+             * the FIRST reload after boot is a transparent hand-over whose B refuses the state, so the
+             * plugin must roll back to the BOOT instance (loaded by its SONAME at realize).  Live
+             * (warm-4080, v66, 2026-11-27): "stamp unique SONAME on libmlapi.so: Input/output error",
+             * rollback failed, the device died.  The backend's recorded path must be the base
+             * instance's absolute file, the reload reports failure, and the boot instance serves on
+             * from the same state (PROTOCOL_VERSION 6, FIFO_READ continues, new work consumed). */
+            if (reload_noapi) {
+                const uint64_t fifo_gpa = B_IOVA + 0x100000, root_gpa = B_IOVA + 0x0f0000;
+                uint8_t *fifo = guest + B_FILE_OFF + 0x100000;
+                const uint32_t half = 12 * 100;
+                qdp_dma_region b = { B_IOVA, B_LEN, guest + B_FILE_OFF, memfd, B_FILE_OFF,
+                                     PROT_READ | PROT_WRITE };
+                char marker[64], before_path[512] = "", after_path[512] = "";
+                char *noapi = mint_instance(reload_noapi, sib, 95, root, marker, sizeof(marker));
+                ops->backend_report(priv, rep, sizeof(rep));
+                { char *p = strstr(rep, "path="); if (p) sscanf(p, "%511s", before_path); }
+                CHECK(strstr(rep, "reloads=0 ") != NULL && !strncmp(before_path, "path=/", 6),
+                      "boot rollback: before the first reload the boot instance's path is an absolute file (%s)",
+                      before_path);
+                r = ops->quiesce(priv); ops->dma_register(priv, &b); ops->resume(priv);
+                wr(PVG_REG_FIFO_ENABLE, 0);
+                memset(guest + B_FILE_OFF + 0x0f0000, 0, 0x1000);
+                wr(PVG_REG_PROTOCOL_VERSION, 6);
+                wr(PVG_REG_SHARED_STATE_PFN, (uint32_t)(root_gpa >> 12));
+                wr(PVG_REG_FIFO_PFN, (uint32_t)(fifo_gpa >> 12));
+                wr(PVG_REG_FIFO_OFFSET, 0x1000);
+                wr(PVG_REG_FIFO_SIZE, 0x10000);
+                wr(PVG_REG_FIFO_ENABLE, 1);
+                for (uint32_t i = 0; i < 101; i++) {
+                    uint32_t nop[3] = { 0x03, 12, 0x5000 + i };
+                    memcpy(fifo + 0x1000 + 12 * i, nop, sizeof(nop));
+                }
+                wr(PVG_REG_FIFO_WRITE, half);
+                CHECK(wait_reg(PVG_REG_FIFO_READ, half, 5.0), "boot rollback: the boot instance consumed the ring (FIFO_READ %u)",
+                      rd(PVG_REG_FIFO_READ));
+                r = ops->quiesce(priv);
+                int rr = noapi ? ops->reload(priv, noapi, 0) : 0;   /* transparent: suspend -> B refuses -> roll back */
+                ops->resume(priv);
+                CHECK(noapi && rr != 0, "boot rollback: B without the resume API refuses the boot instance's state (rc=%d)", rr);
+                ops->backend_report(priv, rep, sizeof(rep));
+                { char *p = strstr(rep, "path="); if (p) sscanf(p, "%511s", after_path); }
+                CHECK(!strcmp(before_path, after_path) && strstr(rep, "reloads=0 ") != NULL,
+                      "boot rollback: the boot instance is live again (%s, %s)", after_path,
+                      strstr(rep, "reloads=0 ") ? "reloads=0" : "reload count moved");
+                CHECK(rd(PVG_REG_PROTOCOL_VERSION) == 6 && rd(PVG_REG_FIFO_READ) == half,
+                      "boot rollback: resumed from the same state (protocol %u, FIFO_READ %u)",
+                      rd(PVG_REG_PROTOCOL_VERSION), rd(PVG_REG_FIFO_READ));
+                wr(PVG_REG_FIFO_WRITE, half + 12);
+                CHECK(wait_reg(PVG_REG_FIFO_READ, half + 12, 5.0), "boot rollback: the device serves new work (FIFO_READ %u)",
+                      rd(PVG_REG_FIFO_READ));
+                wr(PVG_REG_FIFO_ENABLE, 0);
+                r = ops->quiesce(priv); ops->dma_unregister(priv, &b); ops->resume(priv);
+                free(noapi);
+            }
             for (int cyc = 1; cyc <= reload_n; cyc++) {
                 char marker[64]; char *inst;
                 int errs_before = get_int(&qmetal_errors);
@@ -1306,6 +1361,9 @@ int main(int argc, char **argv)
                 { char *p = strstr(rep, "reloads="); if (p) reloads_before = atol(p + 8); }
 
                 r = ops->quiesce(priv);
+                /* D-QDEV-RELOAD-ROLLBACK-EIO: a missing library reports its real cause (was EIO) */
+                int rn = ops->reload(priv, "/nonexistent-uniq-vgpu-selftest/libmlapi.so", QDP_RELOAD_RESET);
+                CHECK(rn == -ENOENT, "rollback: a missing library is reported as ENOENT, not EIO (rc=%d %s)", rn, strerror(-rn));
                 int rr = ops->reload(priv, bad, QDP_RELOAD_RESET);
                 CHECK(rr != 0, "rollback: BAD reload (non-libmlapi) rejected by the vtable gate (rc=%d)", rr);
                 /* device is down (Session destroyed, new bind failed): roll back */
