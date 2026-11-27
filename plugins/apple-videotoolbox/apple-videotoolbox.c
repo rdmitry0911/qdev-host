@@ -57,6 +57,7 @@
 #include "vtpv_virtq.h"
 #include "aw_session.h"   /* the Apple contract-B wire session engine (H5/H6/H7) */
 #include "vt_scatter.h"   /* page-aware landing into a non-contiguous guest surface */
+#include "vt_submit.h"    /* queue-0 drain + P1 decode-ahead (D-AGVA-TIMEOUT-UNDER-LOAD) */
 #include "vt_land.h"      /* GVA-LAND-BOUNDS: only what fits the lent surface lands */
 #ifdef VTPV_HAVE_LAVC
 #define VT_LAVC_CLOSE(d) do { if ((d)->lavc) { vtpv_lavc_close((d)->lavc); (d)->lavc = NULL; } } while (0)
@@ -733,39 +734,32 @@ static void vt_put_buffer(void *ctx, const aw_out_buffer *b)
  * writable status tail. Gather the message, run it through the engine, write the
  * returned status into the tail, retire. Replies/requests go out on queue 1 via
  * vt_emit. */
+static void vt_q0_raise(void *ctx) { vt_raise((vt_dev *)ctx, 0); }
+static void vt_q0_flush(void *ctx) { vt_flush_pending((vt_dev *)ctx); }
+static void vt_q0_rx(void *ctx, const uint8_t *msg, size_t len)
+{
+    char hx[81*3]; size_t hn = len < 80 ? len : 80, o = 0;
+    for (size_t i = 0; i < hn; i++) o += (size_t)snprintf(hx+o, sizeof hx-o, "%02x ", msg[i]);
+    hx[o] = 0; vt_log((vt_dev *)ctx, 3, "q0 RX len=%zu bytes: %s", len, hx);
+}
+static void vt_q0_served(void *ctx, const uint8_t *msg, size_t len, int32_t status)
+{
+    aw_msg_view mv; char fc[5] = "????";
+    if (aw_parse(msg, len, &mv) == AW_PARSE_OK) vt_fourcc(mv.type, fc);
+    vt_log((vt_dev *)ctx, 3, "q0 '%s' (%zu B, flags %#x) -> status %d", fc, len,
+           (aw_parse(msg, len, &mv) == AW_PARSE_OK) ? mv.flags : 0, status);
+}
 static void vt_process_submission(vt_dev *d)
 {
-    vtpv_virtq *sq = &d->queues[0];
-    unsigned budget = 2 * VT_QUEUE_MAX; /* bound the drain */
-    unsigned rounds = 0;
-again:
     static uint8_t msg[VTPV_MAX_SAMPLE_BYTES + 4096];
-    while (budget-- && vtpv_virtq_has_avail(sq, vt_map, d) == 1) {
-        size_t len = 0; uint16_t head = 0;
-        uint8_t *wptr = NULL; uint32_t wcap = 0;
-        int rc = vtpv_virtq_pop_inout(sq, vt_map, d, msg, sizeof(msg), &len,
-                                      &wptr, &wcap, &head);
-        if (rc != 1) { d->needs_reset = 1; break; } /* malformed ring */
-        { char hx[81*3]; size_t hn = len < 80 ? len : 80, o = 0;
-          for (size_t i = 0; i < hn; i++) o += (size_t)snprintf(hx+o, sizeof hx-o, "%02x ", msg[i]);
-          hx[o] = 0; vt_log(d, 3, "q0 RX len=%zu bytes: %s", len, hx); }
-        int32_t status = aw_engine_deliver(d->engine, msg, len); /* emits on q1 */
-        { aw_msg_view mv; char fc[5] = "????";
-          if (aw_parse(msg, len, &mv) == AW_PARSE_OK) vt_fourcc(mv.type, fc);
-          vt_log(d, 3, "q0 '%s' (%zu B, flags %#x) -> status %d", fc, len,
-                 (aw_parse(msg, len, &mv) == AW_PARSE_OK) ? mv.flags : 0, status); }
-        uint32_t written = 0;
-        if (wptr && wcap >= 4) { memcpy(wptr, &status, 4); written = 4; } /* native i32 */
-        vtpv_virtq_retire(sq, vt_map, d, head, written);
-    }
-    vt_raise(d, 0);        /* the queue-0 chains are now free on the used ring */
-    vt_flush_pending(d);   /* deliver any replies/requests this drain queued on q1 */
-    /* D-GVA-PIPELINE P1: the Dbufs of this drain are delivered and the dfrm chains
-     * retired; decode those units now, while the guest lends their buffers. The
-     * guest's Dbuf replies that arrived meanwhile are then picked up here. */
-    if (d->engine && aw_engine_run_deferred(d->engine) && rounds++ < 4 &&
-        vtpv_virtq_has_avail(sq, vt_map, d) == 1)
-        goto again;
+    const vt_submit_io io = {
+        .sq = &d->queues[0], .map = vt_map, .map_ctx = d, .engine = d->engine,
+        .buf = msg, .buf_cap = sizeof(msg), .ctx = d,
+        .raise = vt_q0_raise, .flush = vt_q0_flush, .rx = vt_q0_rx, .served = vt_q0_served,
+    };
+    /* bound the drain: 2 x VT_QUEUE_MAX chains, 4 further decode-ahead rounds */
+    if (vt_submit_process(&io, 2 * VT_QUEUE_MAX, 4) < 0)
+        d->needs_reset = 1; /* malformed ring */
 }
 
 /* ---- BAR0: virtio-modern common config + notify --------------------- */
