@@ -163,7 +163,12 @@
     const showMessages = (result) => {
         const messages = (result && result.messages) || [];
         if (messages.some((m) => /next VM start|VM is stopped|not attached|^note:|plugged again|failed|not released/.test(m))) {
-            Ext.Msg.alert('qdev-host', messages.map(Ext.htmlEncode).join('<br>'));
+            // the request itself succeeded: an information box, a warning only when a step failed
+            const failed = messages.some((m) => /failed|not released/.test(m));
+            Ext.Msg.show({
+                title: 'qdev-host', msg: messages.map(Ext.htmlEncode).join('<br>'), buttons: Ext.Msg.OK,
+                icon: failed ? Ext.Msg.WARNING : Ext.Msg.INFO,
+            });
         }
     };
 

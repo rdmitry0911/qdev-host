@@ -1005,11 +1005,12 @@ def shared_memory_mismatch(cfg: dict[str, str]) -> str | None:
         return f"the VM's memory is {want} MiB, qdev-host's shared memory backend {m.group(1) if m else '?'} MiB"
     return None
 
-def apply_vug_args(vmid: int, conf: dict, cfg: dict[str, str]) -> list[str]:
+def apply_vug_args(vmid: int, conf: dict, cfg: dict[str, str], gpu_notes: bool = True) -> list[str]:
     """Rewrite the qdev-host parts of the VM's args (and vga) for its vhost-user-gpu devices.
 
     Removes every group qdev-host owns, then puts back the current ones after the
-    root port, so a re-run gives the same result.  Returns notes for the user."""
+    root port, so a re-run gives the same result.  Returns notes for the user; with
+    gpu_notes False (another kind of device changed) none about the VM's GPUs."""
     notes = []
     args = cfg.get("args", "")
     had_mem = bool(_find(args, SHARED_MEM_PATTERNS[0]))
@@ -1060,7 +1061,7 @@ def apply_vug_args(vmid: int, conf: dict, cfg: dict[str, str]) -> list[str]:
             notes.append(f"Display set to none (was {vga_now or 'default'}); it comes back when the GPU is removed")
     elif not primary and "saved_vga" in conf:
         qm_set(vmid, "vga", conf.pop("saved_vga"))
-    if vugs and not _find(args, r"-display\s+\S*gl=(?:on|core|es)\S*"):
+    if gpu_notes and vugs and not _find(args, r"-display\s+\S*gl=(?:on|core|es)\S*"):
         notes.append("the VM has no OpenGL display (QSM Display1 VirGL): the GPU renders, but its picture is not shown")
     return notes
 
@@ -1164,7 +1165,7 @@ def add_device(vmid: int, dev_id: str, plugin: str, args: str = "", bus: str = "
         raise
     conf["devices"].append(dev)
     if shared:
-        msgs += [f"note: {n}" for n in apply_vug_args(vmid, conf, vm_config(vmid))]
+        msgs += [f"note: {n}" for n in apply_vug_args(vmid, conf, vm_config(vmid), gpu_notes=False)]
     save_conf(conf)
     write_unit_env(vmid, dev)
     msgs.append(f"VM {vmid}: device {dev_id} ({plugin}) defined on bus {bus}")
