@@ -106,6 +106,12 @@ unsigned aw_engine_open_sessions(const aw_engine *e);
  * dinv / engine destroy) while a picture is held drops it with its decoder. */
 unsigned aw_engine_run_deferred(aw_engine *e);
 
+/* The same, calling after_unit(ctx) after each decoded unit (D-AGVA-TIMEOUT-UNDER-LOAD): the device
+ * retires the queue-0 chains that arrived during that unit there, so a queue-0 status never waits
+ * for the remaining units. after_unit may deliver messages to this engine; the loop re-reads each
+ * later session's state after it. A NULL after_unit is aw_engine_run_deferred. */
+unsigned aw_engine_run_deferred_hooked(aw_engine *e, void (*after_unit)(void *ctx), void *ctx);
+
 /* ---- QuickTime ImageDescription (=fds) helpers (contract-B §5 / WIRE §5.2) --
  * 86-byte big-endian header, then extension atoms (avcC/hvcC), then a zero u32. */
 

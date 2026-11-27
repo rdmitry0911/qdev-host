@@ -756,7 +756,7 @@ static int take_gone(aw_dsession *s, uint64_t req)
 /* D-GVA-PIPELINE P1: decode every in-flight unit whose Dbuf is out and whose lend
  * has not come back yet. Nothing is emitted here: the frame's messages still go out
  * on the Dbuf reply, in the same order as without decode-ahead. */
-unsigned aw_engine_run_deferred(aw_engine *e)
+unsigned aw_engine_run_deferred_hooked(aw_engine *e, void (*after_unit)(void *ctx), void *ctx)
 {
     unsigned n = 0;
     if (!e || !e->cfg.be || !e->cfg.be->decode) return 0;
@@ -768,8 +768,14 @@ unsigned aw_engine_run_deferred(aw_engine *e)
         s->pre_dr = e->cfg.be->decode(s->dec, s->pend_au, s->pend_au_len, &s->pre_f);
         s->pre_state = AW_PRE_DONE;
         n++;
+        if (after_unit) after_unit(ctx);   /* may deliver: later sessions are re-read above */
     }
     return n;
+}
+
+unsigned aw_engine_run_deferred(aw_engine *e)
+{
+    return aw_engine_run_deferred_hooked(e, NULL, NULL);
 }
 
 static int reserve_au(aw_dsession *s, size_t au_len)

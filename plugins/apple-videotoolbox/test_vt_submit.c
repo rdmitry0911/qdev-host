@@ -31,7 +31,7 @@ static int g_fail;
 #define CHECK(c, ...) do { if (!(c)) { g_fail++; printf("  FAIL: " __VA_ARGS__); printf("\n"); } \
                            else { printf("  ok: " __VA_ARGS__); printf("\n"); } } while (0)
 
-/* ---- synthetic guest memory + queue 0 (size 16 = 8 two-descriptor chains) ---- */
+/* ---- synthetic guest memory + queue 0 (size 32 = 16 two-descriptor chains) ---- */
 static uint8_t g_mem[1u << 16];
 static void *map_mem(void *ctx, uint64_t iova, uint64_t len)
 {
@@ -39,7 +39,7 @@ static void *map_mem(void *ctx, uint64_t iova, uint64_t len)
     if (iova + len > sizeof(g_mem)) return NULL;
     return g_mem + iova;
 }
-#define QSZ    16
+#define QSZ    32
 #define DESC   0x1000
 #define AVAIL  0x1200
 #define USED   0x1400
@@ -98,6 +98,7 @@ static size_t build_dfrm(uint8_t *m, const uint8_t *uuid, int64_t frm, uint64_t 
 static int g_decodes, g_raises, g_flushes, g_emits;
 static uint16_t g_used_at_decode[8];      /* used-ring index seen at the START of decode k */
 static int g_inject_at = -1;              /* decode index during which the guest posts a chain */
+static int g_inject_session;              /* ...and then dsta + dfrm for that new session */
 static unsigned g_injected = ~0u;
 static uint16_t g_used_at_last_raise;
 static void emit(void *c, const uint8_t *m, size_t n) { (void)c; (void)m; (void)n; g_emits++; }
@@ -120,8 +121,12 @@ static int be_decode(void *dec, const uint8_t *s, size_t sl, vtpv_decoded_frame 
     int k = g_decodes++;
     if (k < 8) g_used_at_decode[k] = used_idx();
     if (k == g_inject_at) {
-        uint8_t m[256], u[16]; memset(u, 0xCC, 16);
+        uint8_t m[512], u[16]; memset(u, 0xCC, 16);
         g_injected = post_chain(m, msg0(m, AW_MSG_PDEC, AW_FLAG_GUEST_REQ, u));
+        if (g_inject_session) {                /* a whole new session with one unit */
+            post_chain(m, build_dsta(m, u));
+            post_chain(m, build_dfrm(m, u, 40, 1001));
+        }
     }
     o->surface_id = 42; o->width = 352; o->height = 288; o->pixfmt = VTPV_PIXFMT_NV12;
     return 0;
@@ -200,6 +205,20 @@ int main(void)
         CHECK(used_idx() == 7 && g_used_at_last_raise == 7,
               "VT-Q0-05: all 7 chains retired and the guest was interrupted after chain 6 (raise saw %u)",
               (unsigned)g_used_at_last_raise);
+    }
+
+    printf("-- VT-Q0-RETIRE: P1 decode-ahead keeps every unit when the retired chains open a new one --\n");
+    {
+        g_inject_session = 1;
+        int rc = run(0, &q0);
+        g_inject_session = 0;
+        CHECK(rc == 0, "VT-Q0-06: drain rc 0 (got %d)", rc);
+        CHECK(g_decodes == 3, "VT-Q0-06: the new session's unit is decoded ahead too (%d decodes, want 3)", g_decodes);
+        CHECK(g_used_at_decode[1] == 9,
+              "VT-Q0-06: the 3 chains posted during decode 0 are retired before decode 1 (used idx %u, want 9)",
+              (unsigned)g_used_at_decode[1]);
+        int st_ok = 1; for (unsigned c = 0; c < 9; c++) st_ok &= stat_of(c) == AW_NOERR;
+        CHECK(used_idx() == 9 && st_ok, "VT-Q0-06: all 9 chains retired with delivery status 0");
     }
 
     printf("%s: queue-0 drain (VT-Q0-RETIRE)\n", g_fail ? "FAIL" : "PASS");
