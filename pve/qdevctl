@@ -100,10 +100,15 @@ def cmd_start(a):
 
 def cmd_stop(a):
     conf = Q.load_conf(a.vmid)
+    rc = 0
     for d in conf["devices"]:
         if a.id and d["id"] != a.id:
             continue
-        print(Q.detach(a.vmid, d, keep_process=False))
+        try:
+            print(Q.detach(a.vmid, d, keep_process=False))
+        except Q.QdevError as e:  # one device refused (e.g. a live unplug QEMU cannot survive): the others go on
+            print(f"qdevctl: {e}", file=sys.stderr); rc = 1
+    return rc
 
 def cmd_set(a):
     kms = "" if a.no_kms else a.kms

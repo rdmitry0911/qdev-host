@@ -389,9 +389,36 @@ def device_add(vmid: int, dev: dict, sock: Path) -> None:
     mon_cmd(vmid, "device_add", driver="vfio-user-pci", id=dev["id"], bus=dev["bus"],
             socket={"type": "unix", "path": str(sock)})
 
+# Stock QEMU (vfio-user client since 10.1, still in 11.x and master 2026-11) aborts when it frees a hot-unplugged
+# vfio-user-pci device that exposes MSI-X: QOM finalizes the device's memory regions first, then
+# vfio_user_pci_finalize -> vfio_user_msix_teardown deletes the already-unlinked PBA region again
+# (system/memory.c memory_region_del_subregion: Assertion `subregion->container == mr' failed; the VM dies).
+# Upstream fix, not merged: https://patchew.org/QEMU/20251010-vfio-v1-1-d7a6056539b7@rsg.ci.i.u-tokyo.ac.jp
+# The device carries that region as the QOM child "VFIO MSIX PBA[0]" exactly when the teardown will run
+# (vfio_user_msix_setup), so its presence is the guard: no live device_del for such a device.
+VFIO_USER_MSIX_PBA_CHILD = "VFIO MSIX PBA["
+VFIO_USER_MSIX_UPSTREAM_FIX = "https://patchew.org/QEMU/20251010-vfio-v1-1-d7a6056539b7@rsg.ci.i.u-tokyo.ac.jp"
+
+def vfio_user_msix_unplug_aborts(vmid: int, dev_id: str) -> bool:
+    """True when QMP device_del of DEV_ID would abort the running QEMU (vfio-user MSI-X teardown bug)."""
+    try:
+        props = mon_cmd(vmid, "qom-list", path=f"/machine/peripheral/{dev_id}")
+    except QdevError:
+        return False
+    return any(p.get("name", "").startswith(VFIO_USER_MSIX_PBA_CHILD) for p in props)
+
+def refuse_live_unplug(vmid: int, dev_id: str) -> None:
+    """Raise instead of letting a QMP device_del of DEV_ID abort the running QEMU."""
+    if vfio_user_msix_unplug_aborts(vmid, dev_id):
+        raise QdevError(f"{dev_id}: not removed from the running VM {vmid}: the device exposes MSI-X over vfio-user, "
+                        "and this QEMU aborts when it frees such a device after a hot-unplug (vfio-user MSI-X "
+                        "teardown bug, memory_region_del_subregion assertion; upstream fix not merged: "
+                        f"{VFIO_USER_MSIX_UPSTREAM_FIX}). Shut down or stop the VM first, then remove the device")
+
 def device_del(vmid: int, dev_id: str, timeout: float = 20.0) -> bool:
     if not device_present(vmid, dev_id):
         return True
+    refuse_live_unplug(vmid, dev_id)
     mon_cmd(vmid, "device_del", id=dev_id)
     end = time.time() + timeout
     while time.time() < end:
@@ -465,6 +492,8 @@ def device_swap(control_path, backing: str,
                    re-handshakes. Needs vmid/dev_id.
     Returns progress lines."""
     out = []
+    if reset == "hotplug" and vmid and dev_id and device_present(vmid, dev_id):
+        refuse_live_unplug(vmid, dev_id)   # before the swap: nothing changes when the re-handshake is refused
     reply = control_cmd(control_path, f"swap {backing}")
     if not reply.startswith("ok"):
         raise QdevError(f"device-swap: {reply}")
