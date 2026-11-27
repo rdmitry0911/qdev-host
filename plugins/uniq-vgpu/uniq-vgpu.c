@@ -61,6 +61,8 @@
 #include "pvg_backing.h"
 #include "pci_caps/msi.h"
 
+static char *pvg_handle_path(void *h, const char *sym);
+
 /* qmu_vk_consume_current_frame_signal is forward-declared in pvg.h (QMetal's
  * qmu_vulkan.h is C++).  The private peers (qmu_get_private_*) and the optional
  * qmu_display_set_mode_list (newer than the first qdev package's QMetal; absent
@@ -3007,7 +3009,16 @@ static int pvg_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env, 
         pvg_qvt = &s->qvt_storage;
         s->qmu_ns = NULL;            /* base instance */
         s->qmu_lmid = LM_ID_BASE;
-        s->qmu_path = g_strdup("libmlapi.so");
+        /* D-QDEV-RELOAD-ROLLBACK-EIO: record the file the base instance actually
+         * mapped (absolute, RUNPATH-resolved).  A rollback re-creates this instance
+         * from a unique-SONAME copy of qmu_path; the bare SONAME "libmlapi.so" is
+         * not a file path and the copy's open() fails relative to the cwd. */
+        s->qmu_path = pvg_handle_path(base, "qmu_destroy");
+        if (!s->qmu_path) {
+            pvg_log(s, "[uniq-vgpu-ml] [ERROR] realize: the base libmlapi's file path is not resolvable: "
+                    "a rollback to it cannot be re-created\n");
+            s->qmu_path = g_strdup("libmlapi.so");
+        }
     }
 
     r = pvg_create_session(s);
@@ -3750,6 +3761,25 @@ static int pvg_restart_workers(PvgState *s)
     return pvg_restart_workers_ex(s, false);
 }
 
+/* D-QDEV-RELOAD-ROLLBACK-EIO: the absolute file a dlopen handle mapped (its link
+ * map name; dladdr of one of its symbols as the fallback), or NULL.  g_free it. */
+static char *pvg_handle_path(void *h, const char *sym)
+{
+    struct link_map *lm = NULL;
+    Dl_info di;
+    void *p;
+
+    if (!h) return NULL;
+    if (dlinfo(h, RTLD_DI_LINKMAP, &lm) == 0 && lm && lm->l_name && lm->l_name[0] == '/') {
+        return g_strdup(lm->l_name);
+    }
+    p = sym ? dlsym(h, sym) : NULL;
+    if (p && dladdr(p, &di) && di.dli_fname && di.dli_fname[0] == '/') {
+        return g_strdup(di.dli_fname);
+    }
+    return NULL;
+}
+
 /* Driver-agnostic co-residency: stamp a UNIQUE DT_SONAME into a sibling copy of
  * an ELF .so so a plain base-namespace dlopen of the copy yields an INDEPENDENT
  * second instance.
@@ -3788,15 +3818,17 @@ static int pvg_stamp_unique_soname_copy(PvgState *s, const char *src,
         return -ENAMETOOLONG;
     }
 
+    /* D-QDEV-RELOAD-ROLLBACK-EIO: report the real cause (a missing or unreadable
+     * file was printed as "Input/output error"); -EIO stays for a short read only. */
     fd = open(src, O_RDONLY | O_CLOEXEC);
-    if (fd < 0 || fstat(fd, &st) != 0 || st.st_size < (off_t)sizeof(Elf64_Ehdr)) {
-        goto out;
-    }
+    if (fd < 0) { rc = -errno; goto out; }
+    if (fstat(fd, &st) != 0) { rc = -errno; goto out; }
+    if (st.st_size < (off_t)sizeof(Elf64_Ehdr)) { rc = -ENOEXEC; goto out; }
     buf = g_malloc((size_t)st.st_size);
     for (size_t got = 0; got < (size_t)st.st_size; ) {
         ssize_t n = read(fd, buf + got, (size_t)st.st_size - got);
-        if (n < 0) { if (errno == EINTR) continue; goto out; }
-        if (n == 0) { goto out; }   /* truncated */
+        if (n < 0) { if (errno == EINTR) continue; rc = -errno; goto out; }
+        if (n == 0) { rc = -EIO; goto out; }   /* truncated */
         got += (size_t)n;
     }
 
@@ -4061,6 +4093,22 @@ static int pvg_backend_reload_body(PvgState *s, const char *new_path, int reset)
                 "(guest GPU state lost)\n");
     }
     old_path = s->qmu_path ? g_strdup(s->qmu_path) : NULL;
+    if (old_path && old_path[0] != '/') {
+        /* D-QDEV-RELOAD-ROLLBACK-EIO guard: a non-absolute record (an older realize
+         * stored the bare SONAME) is resolved from the loaded instance before the
+         * Session is torn down, so a rollback can re-create it. */
+        void *h = dlopen(old_path, RTLD_NOW | RTLD_NOLOAD);
+        char *abs = pvg_handle_path(h, "qmu_destroy");
+        if (h) dlclose(h);
+        if (abs) {
+            pvg_log(s, "[uniq-vgpu-ml][reload] previous library %s resolved to %s\n", old_path, abs);
+            g_free(old_path);
+            old_path = abs;
+        } else {
+            pvg_log(s, "[uniq-vgpu-ml][reload][ERROR] previous library %s is not a resolvable file path: "
+                    "a rollback cannot re-create it\n", old_path);
+        }
+    }
 
     /* On a re-entry after a FAILED reload the Session is already NULL (dead
      * device): skip the stop + teardown and go straight to loading a (rollback)
