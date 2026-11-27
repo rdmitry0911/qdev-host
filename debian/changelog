@@ -1,3 +1,17 @@
+qdev-host (0.6.5) unstable; urgency=medium
+
+  * Adding a plugin device (v-aux, v-airport, ...) to a VM that has a VirGL
+    GPU no longer repeats the GPU's "no OpenGL display" note: GPU notes come
+    only when a GPU is added or edited.
+  * The Hardware panel shows the notes of a successful request in an
+    information box, a warning only when a step failed (PVE drew them with
+    the error icon).
+  * Source of the uniq-vgpu plugin (built separately, not in these
+    packages): a reload rolled back to the boot instance re-creates it from
+    its real file.
+
+ -- Dmitry R <rdmitry0911@gmail.com>  Fri, 27 Nov 2026 15:30:00 +0200
+
 qdev-host (0.6.4) unstable; urgency=medium
 
   * Plugin sidecars (NAME.json next to NAME.so) may carry "fields" (the
