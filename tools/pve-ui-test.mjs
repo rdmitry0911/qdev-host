@@ -75,7 +75,16 @@ try {
     await item.click();
     const win = page.locator('.x-window', { hasText: 'qdev-host Device' }).first();
     await win.waitFor({ timeout: 10000 });
-    await win.locator('input[name="id"]').fill(devId);
+    // the dialog preselects the first plugin by name (an installed plugin may sort before tb-vga)
+    const picked = await page.evaluate(() => {
+        const w = Ext.ComponentQuery.query('window').filter((x) => x.isVisible() && /qdev-host Device/.test(x.title || ''))[0];
+        const combo = w && w.down('[name=plugin]');
+        if (!combo || !combo.getStore().findRecord(combo.valueField, 'tb-vga', 0, false, true, true)) { return null; }
+        combo.setValue('tb-vga');
+        return combo.getValue();
+    });
+    if (picked !== 'tb-vga') await fail('tb-vga is not offered in the qdev-host Device dialog');
+    await win.locator('input[name="id"]').fill(devId); // after the plugin: choosing one proposes an ID
     await shot('3-add-dialog');
     if (dry) {
         const plugins = await win.locator('input[name="plugin"]').inputValue();
