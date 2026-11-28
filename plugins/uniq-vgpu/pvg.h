@@ -417,6 +417,8 @@ typedef struct PvgState {
                                     * instance's vtable is live (NULL = none pending) */
     long    qmu_lmid;              /* its link-map namespace id                      */
     char   *qmu_path;             /* path the active instance was loaded from (g_strdup) */
+    char    last_reload_error[512]; /* why the last reload was refused before any teardown
+                                    * (dlopen / entry-point reason; "" after a good one) */
     uint64_t reload_count;         /* successful in-process reloads so far           */
     uint64_t handshake_generation; /* bumped on every reload device-reset: the host- *
                                     * side stand-in for the guest kext's Handshake-  *

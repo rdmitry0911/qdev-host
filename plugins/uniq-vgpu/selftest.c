@@ -525,6 +525,12 @@ int main(int argc, char **argv)
     for (int i = 2; i + 1 < argc; i++) {
         if (!strcmp(argv[i], "--reload-noapi")) reload_noapi = argv[i + 1];
     }
+    /* --reload-unloadable LIB : a successor whose dlopen fails (undefined symbol,
+     * plugins/uniq-vgpu/stub_unloadable.so) for step 10f (D-QDEV-RELOAD-DLOPEN-NO-ROLLBACK). */
+    const char *reload_unloadable = NULL;
+    for (int i = 1; i + 1 < argc; i++) {
+        if (!strcmp(argv[i], "--reload-unloadable")) reload_unloadable = argv[i + 1];
+    }
     /* --reload-mapper refuse|handover : step 10e-m (D-MAPPER-RELOAD) with a live iosfc_mapper
      * mapping.  "refuse": the loaded library refuses will_suspend with live mappings (QMetal
      * before the mapper hand-over): the reload must be refused (-EBUSY) and the old Session keep
@@ -1579,6 +1585,56 @@ int main(int argc, char **argv)
                         printf("INFO hand-over rollback: QMU [ERROR] lines during the refused reload: %d (expected: the refusal)\n",
                                get_int(&qmetal_errors) - errs_rb);
                         free(noapi);
+                    }
+                    if (reload_unloadable) {
+                        /* 10f. D-QDEV-RELOAD-DLOPEN-NO-ROLLBACK (apple-virgl evidence/runs/main-v79-20261128
+                         * hpcaps): a transparent reload to a successor whose dlopen fails ("undefined
+                         * symbol") must be refused BEFORE anything is torn down: the live Session keeps
+                         * serving the guest, the refusal names the dlopen reason, and the next good
+                         * transparent reload still finds a Session to hand over.  Before the fix the old
+                         * Session was destroyed first, the dlopen failed, nothing rolled back (device
+                         * dead, reply ENOENT) and a later reload re-created a Session without the
+                         * guest's state (guest display dark). */
+                        char before_path[512] = "", after_path[512] = "", m93[64];
+                        long reloads_before = -1, reloads_after = -2;
+                        ops->backend_report(priv, rep, sizeof(rep));
+                        { char *p = strstr(rep, "path="); if (p) sscanf(p, "%511s", before_path); }
+                        { char *p = strstr(rep, "reloads="); if (p) reloads_before = atol(p + 8); }
+                        const uint32_t pos = rd(PVG_REG_FIFO_READ);
+                        r = ops->quiesce(priv);
+                        int ru = ops->reload(priv, reload_unloadable, 0);   /* transparent */
+                        ops->resume(priv);
+                        CHECK(ru == -ELIBACC, "unloadable successor: the reload is refused as a library load "
+                              "failure (rc=%d %s)", ru, strerror(-ru));
+                        ops->backend_report(priv, rep, sizeof(rep));
+                        { char *p = strstr(rep, "path="); if (p) sscanf(p, "%511s", after_path); }
+                        { char *p = strstr(rep, "reloads="); if (p) reloads_after = atol(p + 8); }
+                        CHECK(!strcmp(before_path, after_path) && reloads_after == reloads_before,
+                              "unloadable successor: the served library and reload count are unchanged (%s, reloads "
+                              "%ld -> %ld)", after_path, reloads_before, reloads_after);
+                        {
+                            const char *e = strstr(rep, "last_reload_error='");
+                            CHECK(e && strstr(e, "undefined symbol") && strstr(e, "uvg_selftest_unresolved_symbol"),
+                                  "unloadable successor: the backend report names the dlopen reason (%.200s)",
+                                  e ? e : "no last_reload_error");
+                        }
+                        CHECK(rd(PVG_REG_PROTOCOL_VERSION) == 6 && rd(PVG_REG_FIFO_READ) == pos,
+                              "unloadable successor: the live Session is untouched (protocol %u, FIFO_READ %u, was %u)",
+                              rd(PVG_REG_PROTOCOL_VERSION), rd(PVG_REG_FIFO_READ), pos);
+                        uint32_t nop[3] = { 0x03, 12, 0x6ffe };
+                        memcpy(fifo + 0x1000 + pos, nop, sizeof(nop));
+                        wr(PVG_REG_FIFO_WRITE, pos + 12);
+                        CHECK(wait_reg(PVG_REG_FIFO_READ, pos + 12, 5.0),
+                              "unloadable successor: the live Session consumes new work (FIFO_READ %u)",
+                              rd(PVG_REG_FIFO_READ));
+                        char *good = mint_instance(reload_golden, sib, 93, root, m93, sizeof(m93));
+                        r = ops->quiesce(priv);
+                        int rg = good ? ops->reload(priv, good, 0) : -1;   /* transparent */
+                        ops->resume(priv);
+                        CHECK(rg == 0 && rd(PVG_REG_PROTOCOL_VERSION) == 6 && rd(PVG_REG_FIFO_READ) == pos + 12,
+                              "unloadable successor: the next transparent reload hands the live state over (rc=%d, "
+                              "protocol %u, FIFO_READ %u)", rg, rd(PVG_REG_PROTOCOL_VERSION), rd(PVG_REG_FIFO_READ));
+                        free(good);
                     }
                     wr(PVG_REG_FIFO_ENABLE, 0);
                 }

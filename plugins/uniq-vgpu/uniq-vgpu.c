@@ -3911,13 +3911,19 @@ out:
     return rc;
 }
 
-/* Load `new_path` as a fresh co-resident libmlapi instance, switch the active
- * vtable to it and re-create the Session on it (re-adopting the parked
- * PvgState).  Caller holds backing_lock; on failure the device is down. */
-static int pvg_reload_load_and_create(PvgState *s, const char *new_path)
+/* D-QDEV-RELOAD-DLOPEN-NO-ROLLBACK: load `new_path` as a fresh co-resident libmlapi
+ * instance (unique-SONAME copy, RTLD_NOW: every symbol resolved) and bind its
+ * vtable WITHOUT touching the live Session, so a successor that cannot be loaded is
+ * refused before anything is suspended or torn down.  On failure the reason is
+ * kept in s->last_reload_error and returned as -errno: -ENOENT/-ENOEXEC from the
+ * copy (missing or not an ELF .so with a SONAME), -ELIBACC when dlopen fails
+ * (e.g. an undefined symbol), -ENOSYS when a required entry point is missing.  A
+ * copy that dlopen'ed but failed the bind stays mapped (it is never used, and its
+ * constructors already ran; this is the previous behaviour). */
+static int pvg_reload_preload(PvgState *s, const char *new_path, void **ns_out,
+                              struct pvg_qmu_vt *nvt, long *lmid_out)
 {
     const char *miss = NULL;
-    struct pvg_qmu_vt nvt;
     void *ns;
     long lmid = -1;
     char uniq_path[PATH_MAX];
@@ -3925,7 +3931,9 @@ static int pvg_reload_load_and_create(PvgState *s, const char *new_path)
 
     r = pvg_stamp_unique_soname_copy(s, new_path, uniq_path, sizeof(uniq_path));
     if (r) {
-        return r;   /* old instance already destroyed: caller rolls back */
+        g_snprintf(s->last_reload_error, sizeof(s->last_reload_error),
+                   "cannot copy %s for loading: %s", new_path, strerror(-r));
+        return r;
     }
     /* No RTLD_NODELETE: a copy that retires cleanly is unloaded after the next
      * reload (qmu_retired_ns); one without the retire entry is never dlclosed. */
@@ -3934,21 +3942,40 @@ static int pvg_reload_load_and_create(PvgState *s, const char *new_path)
      * not accumulate files. */
     unlink(uniq_path);
     if (!ns) {
+        const char *why = dlerror();
+
+        g_snprintf(s->last_reload_error, sizeof(s->last_reload_error), "dlopen %s: %s", new_path,
+                   why ? why : "(no dlerror)");
         pvg_log(s, "[uniq-vgpu-ml][reload][ERROR] dlopen %s (unique-soname copy of %s): %s\n",
-                uniq_path, new_path, dlerror());
-        return -ENOENT;
+                uniq_path, new_path, why ? why : "(no dlerror)");
+        return -ELIBACC;
     }
     lmid = LM_ID_BASE;
     dlinfo(ns, RTLD_DI_LMID, &lmid);   /* LM_ID_BASE: base-namespace co-residency */
-    memset(&nvt, 0, sizeof(nvt));
-    if (!pvg_qmu_vt_bind(&nvt, ns, lmid, &miss)) {
+    memset(nvt, 0, sizeof(*nvt));
+    if (!pvg_qmu_vt_bind(nvt, ns, lmid, &miss)) {
+        g_snprintf(s->last_reload_error, sizeof(s->last_reload_error), "%s is missing %s (not a libmlapi?)",
+                   new_path, miss ? miss : "(unknown)");
         pvg_log(s, "[uniq-vgpu-ml][reload][ERROR] %s missing %s (not a libmlapi?)\n",
                 new_path, miss ? miss : "(unknown)");
-        /* old instance already destroyed: caller must roll back to a good one */
         return -ENOSYS;
     }
+    *ns_out = ns;
+    *lmid_out = lmid;
+    return 0;
+}
+
+/* Switch the active vtable to a preloaded instance (pvg_reload_preload) and
+ * re-create the Session on it (re-adopting the parked PvgState).  Caller holds
+ * backing_lock and has torn the previous Session down; on failure the device is
+ * down. */
+static int pvg_reload_adopt_and_create(PvgState *s, const char *new_path, void *ns,
+                                       const struct pvg_qmu_vt *nvt, long lmid)
+{
+    int r;
+
     /* Switch the active vtable: every qmu_* call now targets the NEW instance. */
-    s->qvt_storage = nvt;
+    s->qvt_storage = *nvt;
     pvg_qvt = &s->qvt_storage;
     s->qmu_ns = ns;
     s->qmu_lmid = lmid;
@@ -3990,6 +4017,18 @@ static int pvg_reload_load_and_create(PvgState *s, const char *new_path)
      * then keeps its configured list, as before this step. */
     (void)pvg_reinstall_ui_info_mode_list(s, new_path);
     return 0;
+}
+
+/* Preload + adopt in one step: the rollback path, whose library served the guest
+ * a moment ago.  On failure the device is down. */
+static int pvg_reload_load_and_create(PvgState *s, const char *new_path)
+{
+    struct pvg_qmu_vt nvt;
+    void *ns = NULL;
+    long lmid = -1;
+    int r = pvg_reload_preload(s, new_path, &ns, &nvt, &lmid);
+
+    return r ? r : pvg_reload_adopt_and_create(s, new_path, ns, &nvt, lmid);
 }
 
 /* Plan Q4-Q6 / H1 (apple-virgl analysis/20261118-QMETAL-PLAN-SUSPEND-RESUME-RELOAD.md
@@ -4047,12 +4086,36 @@ static int pvg_backend_reload_body(PvgState *s, const char *new_path, int reset)
     void *blob = NULL;
     size_t blob_len = 0;
     char *old_path = NULL;
+    struct pvg_qmu_vt pre_vt;
+    void *pre_ns = NULL;
+    long pre_lmid = -1;
     int r;
 
     if (!s || !new_path || !*new_path) {
         return -EINVAL;
     }
     pthread_mutex_lock(&s->backing_lock);
+
+    /* D-QDEV-RELOAD-DLOPEN-NO-ROLLBACK: load and bind the successor FIRST, before the
+     * suspend (after finishSuspend the old Session cannot simply continue) and before
+     * the teardown.  A successor that cannot be loaded (missing, not a libmlapi, or a
+     * dlopen failure such as an undefined symbol) is refused here: nothing has been
+     * suspended or destroyed, the current Session keeps serving the guest, and the
+     * reason is kept for the backend report and the host's reply. */
+    s->last_reload_error[0] = '\0';
+    r = pvg_reload_preload(s, new_path, &pre_ns, &pre_vt, &pre_lmid);
+    if (r) {
+        if (s->qmu_dev) {
+            pvg_log(s, "[uniq-vgpu-ml][reload] ROLLBACK: reload of %s refused before any teardown (%s): "
+                    "the current Session (%s) continues unchanged\n", new_path, s->last_reload_error,
+                    s->qmu_path ? s->qmu_path : "?");
+        } else {
+            pvg_log(s, "[uniq-vgpu-ml][reload][ERROR] reload of %s refused (%s): the device was already "
+                    "down, there is no Session to keep\n", new_path, s->last_reload_error);
+        }
+        pthread_mutex_unlock(&s->backing_lock);
+        return r;
+    }
 
     /* Transparent reload (no --reset): suspend the live Session first, while the
      * vtable is still A and before the reversible stop (whose producer quiesce
@@ -4128,7 +4191,7 @@ static int pvg_backend_reload_body(PvgState *s, const char *new_path, int reset)
     }
     g_assert(!s->qmu_dev);
 
-    r = pvg_reload_load_and_create(s, new_path);
+    r = pvg_reload_adopt_and_create(s, new_path, pre_ns, &pre_vt, pre_lmid);
     if (!r && blob) {
         r = pvg_resume_from_blob(s, blob, blob_len, new_path);   /* starts the workers itself */
         if (r && old_path) {
@@ -4343,13 +4406,13 @@ static const char *pvg_backend_report(void *priv, char *buf, size_t len)
     g_snprintf(buf, len,
                "envelope=%s reloads=%" PRIu64 " handshake_gen=%" PRIu64
                " qmu_errors=%" PRIu64 " gpu_restarts=%" PRIu64 " lmid=%ld instance=%p"
-               " state_handover=%d handover_flush=%d path=%s banner='%s'",
+               " state_handover=%d handover_flush=%d path=%s banner='%s' last_reload_error='%s'",
                PVG_ENVELOPE_VERSION, s->reload_count, s->handshake_generation,
                s->qmu_error_count, s->qmu_gpu_restart_count, s->qmu_lmid, s->qmu_ns,
                (pvg_vt_can_suspend(pvg_qvt) && pvg_vt_can_resume(pvg_qvt)) ? 1 : 0,
                (pvg_vt_can_suspend(pvg_qvt) && pvg_vt_can_resume(pvg_qvt) &&
                 pvg_qvt->suspend_state_capabilities && (pvg_qvt->suspend_state_capabilities() & 1u)) ? 1 : 0,
-               s->qmu_path ? s->qmu_path : "?", s->backend_banner);
+               s->qmu_path ? s->qmu_path : "?", s->backend_banner, s->last_reload_error);
     pthread_mutex_unlock(&s->backing_lock);
     return buf;
 }

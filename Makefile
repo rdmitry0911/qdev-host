@@ -147,6 +147,11 @@ plugins/uniq-vgpu/backing_B.so: plugins/uniq-vgpu/backing_B.c plugins/uniq-vgpu/
 .PHONY: pvg-backings
 pvg-backings: plugins/uniq-vgpu/backing_A.so plugins/uniq-vgpu/backing_B.so
 
+# Selftest fixture (step 10f, --reload-unloadable): a SONAME'd .so whose dlopen
+# fails with "undefined symbol" (no -z defs, so the link leaves it unresolved).
+plugins/uniq-vgpu/stub_unloadable.so: plugins/uniq-vgpu/stub_unloadable.c
+	$(CC) $(CFLAGS) -fPIC -shared -Wl,-soname,libmlapi.so -o $@ $<
+
 # Self-test of the uniq-vgpu plugin on a vfu context without a VM (see
 # plugins/uniq-vgpu/README.md). Runs the real libmlapi; select the Vulkan
 # driver with VK_ICD_FILENAMES (e.g. lavapipe) when no GPU should be used.

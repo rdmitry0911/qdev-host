@@ -814,7 +814,20 @@ static void reload_reply(ctl_t *c, int r, const char *path, uint32_t flags, cons
     if (!c) return;
     if (r == 1) ctl_reply(c, "err quiesce refused");
     else if (r == 0) ctl_reply(c, "ok reloaded %s%s%s", path, (flags & QDP_RELOAD_RESET) ? " (reset)" : "", note ? note : "");
-    else ctl_reply(c, "err reload: %s", strerror(-r));
+    else {
+        /* D-QDEV-RELOAD-DLOPEN-NO-ROLLBACK: the plugin's backend report names why a reload was
+         * refused (e.g. the dlopen reason); the errno text alone ("No such file or directory")
+         * hid it. */
+        char rep[2048], why[640] = "";
+        const char *e = (v2.backend_report && v2.backend_report(priv, rep, sizeof(rep)))
+                        ? strstr(rep, "last_reload_error='") : NULL;
+        if (e) {
+            e += strlen("last_reload_error='");
+            const char *q = strrchr(e, '\'');
+            if (q && q > e) snprintf(why, sizeof(why), " (%.*s)", (int)(q - e), e);
+        }
+        ctl_reply(c, "err reload: %s%s", strerror(-r), why);
+    }
 }
 
 static gboolean reload_job_stopped(gpointer data)
