@@ -52,6 +52,15 @@ AW_CORE := aw_wire.c aw_sbuf.c aw_bplist.c aw_session.c vt_scatter.c vt_land.c
 $(BUILD)/test-aw-session: $(AW_CORE) test_aw_session.c | $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $(AW_CORE) test_aw_session.c
 
+# VT-DECODE-WORKER: drain + engine + decode worker on a synthetic ring, slow-decode / latched-landing
+# doubles, SYNC vs WORKER. TSan: make build/test-vt-worker-tsan. No libva/GPU/guest.
+$(BUILD)/test-vt-worker: $(AW_CORE) vt_submit.c vt_worker.c vtpv_virtq.c vtpv_proto.c test_vt_worker.c | $(BUILD)
+	$(CC) $(CFLAGS) -pthread -o $@ $(AW_CORE) vt_submit.c vt_worker.c vtpv_virtq.c vtpv_proto.c test_vt_worker.c
+$(BUILD)/test-vt-worker-tsan: $(AW_CORE) vt_submit.c vt_worker.c vtpv_virtq.c vtpv_proto.c test_vt_worker.c | $(BUILD)
+	$(CC) -O1 -g -std=c11 -fsanitize=thread -pthread -o $@ $(AW_CORE) vt_submit.c vt_worker.c vtpv_virtq.c vtpv_proto.c test_vt_worker.c
+$(BUILD)/test-vt-worker-asan: $(AW_CORE) vt_submit.c vt_worker.c vtpv_virtq.c vtpv_proto.c test_vt_worker.c | $(BUILD)
+	$(CC) -O1 -g -std=c11 -fsanitize=address,undefined -fno-omit-frame-pointer -pthread -o $@ $(AW_CORE) vt_submit.c vt_worker.c vtpv_virtq.c vtpv_proto.c test_vt_worker.c
+
 # D-AGVA-TIMEOUT-UNDER-LOAD: the queue-0 drain (vt_submit) on a synthetic ring with the real
 # session engine and a slow-decode backend double. No libva/GPU/guest.
 $(BUILD)/test-vt-submit: $(AW_CORE) vt_submit.c vtpv_virtq.c vtpv_proto.c test_vt_submit.c | $(BUILD)
@@ -124,8 +133,11 @@ $(BUILD)/test-aw-replay: $(AW_CORE) $(BACKEND) test_aw_replay.c | $(BUILD)
 $(BUILD)/test-lavc: vtpv_lavc.c vtpv_lavc.h test_lavc.c test_lavc_util.c test_lavc_util.h | $(BUILD)
 	$(CC) $(CFLAGS) $(VA_CFLAGS) $(LAVC_CFLAGS) -o $@ vtpv_lavc.c test_lavc.c test_lavc_util.c $(LAVC_LIBS) $(FMT_LIBS) $(VA_LIBS)
 
-$(BUILD)/test-aw-replay-lavc: $(AW_CORE) vtpv_lavc.c test_aw_replay_lavc.c test_lavc_util.c test_lavc_util.h | $(BUILD)
-	$(CC) $(CFLAGS) $(VA_CFLAGS) $(LAVC_CFLAGS) -o $@ $(AW_CORE) vtpv_lavc.c test_aw_replay_lavc.c test_lavc_util.c $(LAVC_LIBS) $(FMT_LIBS) $(VA_LIBS)
+$(BUILD)/test-aw-replay-lavc: $(AW_CORE) vt_worker.c vtpv_lavc.c test_aw_replay_lavc.c test_lavc_util.c test_lavc_util.h | $(BUILD)
+	$(CC) $(CFLAGS) $(VA_CFLAGS) $(LAVC_CFLAGS) -pthread -o $@ $(AW_CORE) vt_worker.c vtpv_lavc.c test_aw_replay_lavc.c test_lavc_util.c $(LAVC_LIBS) $(FMT_LIBS) $(VA_LIBS)
+# the same without encoders / libavformat (streams from VT_TEST_LOAD): runs on the package's bundled CUDA libavcodec
+$(BUILD)/test-aw-replay-lavc-noenc: $(AW_CORE) vt_worker.c vtpv_lavc.c test_aw_replay_lavc.c test_lavc_util.c test_lavc_util.h | $(BUILD)
+	$(CC) $(CFLAGS) $(VA_CFLAGS) $(LAVC_CFLAGS) -DTEST_LAVC_NO_ENCODE -pthread -o $@ $(AW_CORE) vt_worker.c vtpv_lavc.c test_aw_replay_lavc.c test_lavc_util.c $(LAVC_LIBS) $(VA_LIBS)
 
 # GVA 4K landing: decode + CPU-readable picture + scattered-page landing (shadow vs
 # direct), byte-identical + software-oracle MD5, per-frame ms.
@@ -156,21 +168,22 @@ $(BUILD)/test-lavc-hevc10: vtpv_lavc.c vtpv_lavc.h test_lavc_hevc10.c test_lavc_
 $(BUILD)/gva-payload: gva_payload.c test_lavc_util.c test_lavc_util.h | $(BUILD)
 	$(CC) $(CFLAGS) $(LAVC_CFLAGS) -o $@ gva_payload.c test_lavc_util.c $(LAVC_LIBS) $(FMT_LIBS)
 
-$(BUILD)/apple-videotoolbox.so: apple-videotoolbox.c $(AW_CORE) vt_submit.c $(BACKEND) vtpv_nvdec.c $(PLUGIN_LAVC_SRC) $(BRIDGE_DIR)/pvg_mapper_bridge.h vt_scatter.h vt_land.h vt_submit.h | $(BUILD)
+$(BUILD)/apple-videotoolbox.so: apple-videotoolbox.c $(AW_CORE) vt_submit.c vt_worker.c $(BACKEND) vtpv_nvdec.c $(PLUGIN_LAVC_SRC) $(BRIDGE_DIR)/pvg_mapper_bridge.h vt_scatter.h vt_land.h vt_submit.h vt_worker.h | $(BUILD)
 	$(CC) $(CFLAGS) -Wno-unused-parameter -fPIC -shared $(QDP_INC) $(VFU_INC) $(VA_CFLAGS) $(PLUGIN_LAVC_CFLAGS) \
-	    -o $@ apple-videotoolbox.c $(AW_CORE) vt_submit.c $(BACKEND) vtpv_nvdec.c $(PLUGIN_LAVC_SRC) $(VA_LIBS) $(if $(PLUGIN_LAVC_SRC),$(LAVC_LIBS)) -ldl
+	    -o $@ apple-videotoolbox.c $(AW_CORE) vt_submit.c vt_worker.c $(BACKEND) vtpv_nvdec.c $(PLUGIN_LAVC_SRC) $(VA_LIBS) $(if $(PLUGIN_LAVC_SRC),$(LAVC_LIBS)) -ldl
 
 $(BUILD)/test-plugin: test_plugin.c $(BUILD)/apple-videotoolbox.so | $(BUILD)
 	$(CC) $(CFLAGS) $(QDP_INC) $(VFU_INC) -o $@ test_plugin.c -ldl
 
 plugin: $(BUILD)/apple-videotoolbox.so
 
-test: $(BUILD)/test-proto $(BUILD)/test-virtq $(BUILD)/test-aw-wire $(BUILD)/test-aw-bplist $(BUILD)/test-aw-session $(BUILD)/test-vt-submit $(BUILD)/test-vt-scatter \
+test: $(BUILD)/test-proto $(BUILD)/test-virtq $(BUILD)/test-aw-wire $(BUILD)/test-aw-bplist $(BUILD)/test-aw-session $(BUILD)/test-vt-submit $(BUILD)/test-vt-worker $(BUILD)/test-vt-scatter \
       $(BUILD)/test-pvg-mapper-bridge $(BUILD)/test-vt-land
 	@echo "== Apple real-wire codec =="; $(BUILD)/test-aw-wire
 	@echo "== binary-plist encoder (H4) =="; $(BUILD)/test-aw-bplist
 	@echo "== Apple-wire session engine (H3/H5/H6, mock backend) =="; $(BUILD)/test-aw-session
 	@echo "== queue-0 drain: status retire vs deferred decodes (D-AGVA-TIMEOUT-UNDER-LOAD) =="; $(BUILD)/test-vt-submit
+	@echo "== decode worker: queue-0 status vs decode / landing (VT-DECODE-WORKER) =="; $(BUILD)/test-vt-worker
 	@echo "== scattered-page landing =="; $(BUILD)/test-vt-scatter
 	@echo "== landing bounds (GVA-LAND-BOUNDS) =="; $(BUILD)/test-vt-land
 	@echo "== IOSurface-mapper bridge (uniq-vgpu writer / VT reader) =="; $(BUILD)/test-pvg-mapper-bridge

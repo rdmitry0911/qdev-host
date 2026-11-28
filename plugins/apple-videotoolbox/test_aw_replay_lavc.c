@@ -32,6 +32,25 @@
 #include "aw_wire.h"
 #include "vtpv_lavc.h"
 #include "test_lavc_util.h"
+#include "vt_worker.h"
+#include <pthread.h>
+
+/* VT-DECODE-WORKER: VT_TEST_WORKER=1 runs every stream through the decode worker (the device default since
+ * the fix): decode + landing on the worker thread under the single-entry backend lock, every engine call
+ * under a mutex standing for the device lock. VT_TEST_HW=cuda opens the stream core on CUDA (argv[1] = the
+ * CUDA device ordinal) instead of VA-API. */
+static int g_use_worker;
+static pthread_mutex_t g_tm = PTHREAD_MUTEX_INITIALIZER;
+static vt_worker g_wk;
+static vt_locked_backend g_lbe;
+static int32_t deliver(aw_engine *e, const uint8_t *m, size_t n)
+{
+    if (!g_use_worker) return aw_engine_deliver(e, m, n);
+    pthread_mutex_lock(&g_tm);
+    int32_t r = aw_engine_deliver(e, m, n);
+    pthread_mutex_unlock(&g_tm);
+    return r;
+}
 
 static int g_fail, g_checks;
 #define CHECK(c, ...) do { g_checks++; if (!(c)) { g_fail++; printf("  FAIL: " __VA_ARGS__); printf("\n"); } } while (0)
@@ -174,10 +193,15 @@ static void service(aw_engine *e, const uint8_t *uuid, seen *s, uint64_t *last_m
     static size_t ql[MAXE];
     uint8_t m[512];
     for (;;) {
+        if (g_use_worker) {
+            pthread_mutex_lock(&g_tm);
+            while (aw_engine_jobs(e)) vt_worker_wait(&g_wk);
+        }
         int n = g_ne < MAXE ? g_ne : MAXE, i;
-        if (n == 0) return;
         for (i = 0; i < n; i++) { memcpy(q[i], g_e[i], g_el[i]); ql[i] = g_el[i]; }
         g_ne = 0;
+        if (g_use_worker) pthread_mutex_unlock(&g_tm);
+        if (n == 0) return;
         for (i = 0; i < n; i++) {
             aw_msg_view v;
             if (aw_get_be32(q[i] + 4) == AW_ATOM_RELS) continue;
@@ -186,13 +210,13 @@ static void service(aw_engine *e, const uint8_t *uuid, seen *s, uint64_t *last_m
                 uint64_t mapid = g_next_map;
                 g_next_map = g_next_map % NBUF + 1;
                 *last_map = mapid;
-                aw_engine_deliver(e, m, build_dbuf_reply(m, uuid, mapid));
+                deliver(e, m, build_dbuf_reply(m, uuid, mapid));
             } else if (v.type == AW_MSG_DFRM && v.flags == AW_FLAG_HOST_REPLY) {
                 s->n_dfrm_reply++;
                 if (g_send_next >= 0 && g_send_next < g_n_units) {
                     static uint8_t dm[5u << 20];   /* a unit may be large */
                     int k = g_send_next++;
-                    aw_engine_deliver(e, dm, build_dfrm(dm, sizeof dm, uuid, 1000 + k, 200 + (uint64_t)k,
+                    deliver(e, dm, build_dfrm(dm, sizeof dm, uuid, 1000 + k, 200 + (uint64_t)k,
                                                         g_units[k], g_unit_len[k]));
                 }
             } else if (v.type == AW_MSG_DEMT && v.flags == AW_FLAG_HOST_REQ) {
@@ -209,11 +233,14 @@ static void service(aw_engine *e, const uint8_t *uuid, seen *s, uint64_t *last_m
                                    sizeof s->luma_first);
                 }
                 s->n_demt++;
-                aw_engine_deliver(e, m, build_demt_reply(m, uuid));
+                deliver(e, m, build_demt_reply(m, uuid));
             }
         }
     }
 }
+
+static int sim_copy_locked(void *c, const vtpv_decoded_frame *f, const aw_out_buffer *b)
+{ vt_backend_lock(); int r = sim_copy(c, f, b); vt_backend_unlock(); return r; }
 
 static aw_engine *mk_engine(void)
 {
@@ -222,7 +249,22 @@ static aw_engine *mk_engine(void)
     cfg.be = vtpv_lavc_backend(); cfg.be_ctx = g_lavc;
     cfg.emit = cap_emit;
     cfg.resolve_buffer = sim_resolve; cfg.copy_frame = sim_copy; cfg.put_buffer = sim_put;
-    return aw_engine_create(&cfg);
+    if (g_use_worker) {
+        vt_worker_init(&g_wk, &g_tm, NULL, NULL, NULL);
+        vt_locked_backend_init(&g_lbe, vtpv_lavc_backend());
+        cfg.be = &g_lbe.be; cfg.copy_frame = sim_copy_locked;
+        cfg.submit_job = vt_worker_submit; cfg.wait_jobs = vt_worker_wait; cfg.job_ctx = &g_wk;
+    }
+    aw_engine *e = aw_engine_create(&cfg);
+    if (e && g_use_worker) vt_worker_start(&g_wk, e);
+    return e;
+}
+
+static void rm_engine(aw_engine *e)
+{
+    if (g_use_worker) vt_worker_stop(&g_wk);
+    aw_engine_destroy(e);
+    if (g_use_worker) vt_worker_destroy(&g_wk);
 }
 
 static void set_geometry(uint32_t w, uint32_t h)
@@ -252,9 +294,9 @@ static void run_stream(const char *name, const stream *st, uint32_t codec4cc)
     set_geometry((uint32_t)st->w, (uint32_t)st->h);
     e = mk_engine();
     g_ne = 0;
-    aw_engine_deliver(e, m, msg0(m, AW_MSG_PDEC, uuid));
+    deliver(e, m, msg0(m, AW_MSG_PDEC, uuid));
     g_ne = 0;
-    CHECK(aw_engine_deliver(e, m, build_dsta(m, sizeof m, uuid, codec4cc, (uint16_t)st->w, (uint16_t)st->h,
+    CHECK(deliver(e, m, build_dsta(m, sizeof m, uuid, codec4cc, (uint16_t)st->w, (uint16_t)st->h,
                                              st->extradata, st->extradata_len)) == AW_NOERR, "%s: dsta", name);
     {
         aw_msg_view v; int32_t err = 1;
@@ -265,7 +307,7 @@ static void run_stream(const char *name, const stream *st, uint32_t codec4cc)
     /* the first unit; each next one goes once the previous dfrm is replied to, while that frame still
      * waits for its Demt reply (parked, then started) */
     g_units = (const uint8_t *const *)st->pkt; g_unit_len = st->pkt_len; g_n_units = st->n; g_send_next = 1;
-    CHECK(aw_engine_deliver(e, m, build_dfrm(m, sizeof m, uuid, 1000, 200, st->pkt[0], st->pkt_len[0])) == AW_NOERR,
+    CHECK(deliver(e, m, build_dfrm(m, sizeof m, uuid, 1000, 200, st->pkt[0], st->pkt_len[0])) == AW_NOERR,
           "%s: dfrm 0", name);
     service(e, uuid, &s, &last);
     g_send_next = -1;
@@ -277,7 +319,7 @@ static void run_stream(const char *name, const stream *st, uint32_t codec4cc)
     CHECK(ok == st->n, "%s: %d/%d landed frames == oracle, decode order", name, ok, st->n);
     printf("  %s: %d dfrm -> %d Demt, %d/%d landed frames == software oracle (decode order, %dx%d)\n",
            name, st->n, s.n_demt, ok, st->n, st->w, st->h);
-    aw_engine_destroy(e);
+    rm_engine(e);
 }
 
 static uint8_t *slurp(const char *path, size_t *n)
@@ -294,6 +336,48 @@ static uint8_t *slurp(const char *path, size_t *n)
     return b;
 }
 
+
+/* VT_TEST_SAVE=dir writes each generated stream (extradata + packets in decode order) to dir/<tag>.stream;
+ * VT_TEST_LOAD=dir reads them instead of encoding (a host without the encoders, e.g. the bundled
+ * CUDA libavcodec; VT-DECODE-WORKER smoke). */
+static void stream_save(const char *dir, const char *tag, const stream *st)
+{
+    char p[512]; snprintf(p, sizeof p, "%s/%s.stream", dir, tag);
+    FILE *f = fopen(p, "wb"); if (!f) return;
+    int32_t hd[5] = { st->w, st->h, (int32_t)st->id, st->n, (int32_t)st->extradata_len };
+    fwrite(hd, sizeof hd, 1, f); fwrite(st->extradata, 1, st->extradata_len, f);
+    for (int i = 0; i < st->n; i++) { uint32_t l = (uint32_t)st->pkt_len[i]; fwrite(&l, 4, 1, f); fwrite(st->pkt[i], 1, l, f); }
+    fclose(f);
+}
+static int stream_load(const char *dir, const char *tag, stream *st)
+{
+    char p[512]; snprintf(p, sizeof p, "%s/%s.stream", dir, tag);
+    FILE *f = fopen(p, "rb"); if (!f) return -1;
+    int32_t hd[5]; memset(st, 0, sizeof *st);
+    if (fread(hd, sizeof hd, 1, f) != 1 || hd[3] <= 0 || hd[3] > MAXF) { fclose(f); return -1; }
+    st->w = hd[0]; st->h = hd[1]; st->id = (enum AVCodecID)hd[2]; st->n = hd[3]; st->extradata_len = (size_t)hd[4];
+    st->extradata = calloc(1, st->extradata_len + 64);
+    st->pkt = calloc((size_t)st->n, sizeof *st->pkt); st->pkt_len = calloc((size_t)st->n, sizeof *st->pkt_len);
+    int ok = st->extradata && st->pkt && st->pkt_len && fread(st->extradata, 1, st->extradata_len, f) == st->extradata_len;
+    for (int i = 0; ok && i < st->n; i++) {
+        uint32_t l; ok = fread(&l, 4, 1, f) == 1 && (st->pkt[i] = calloc(1, l + 64)) != NULL &&
+                         fread(st->pkt[i], 1, l, f) == l;
+        st->pkt_len[i] = l;
+    }
+    fclose(f);
+    if (!ok) { stream_free(st); return -1; }
+    return 0;
+}
+static int get_stream(const char *encoder, const char *params, enum AVPixelFormat pf, int w, int h, int n,
+                      const char *tag, stream *st)
+{
+    const char *ld = getenv("VT_TEST_LOAD"), *sv = getenv("VT_TEST_SAVE");
+    if (ld) return stream_load(ld, tag, st);
+    int rc = make_stream(encoder, params, pf, w, h, n, tag, st);
+    if (rc == 0 && sv) stream_save(sv, tag, st);
+    return rc;
+}
+
 int main(int argc, char **argv)
 {
     const char *node = argc > 1 ? argv[1] : "/dev/dri/renderD128";
@@ -302,7 +386,11 @@ int main(int argc, char **argv)
     stream st;
 
     av_log_set_level(AV_LOG_QUIET);
-    if (vtpv_lavc_open(VTPV_LAVC_HW_VAAPI, node, &g_lavc, err, sizeof err) != VTPV_OK) {
+    g_use_worker = getenv("VT_TEST_WORKER") && getenv("VT_TEST_WORKER")[0] == '1';
+    const int hw = (getenv("VT_TEST_HW") && !strcmp(getenv("VT_TEST_HW"), "cuda")) ? VTPV_LAVC_HW_CUDA : VTPV_LAVC_HW_VAAPI;
+    if (hw == VTPV_LAVC_HW_CUDA && argc <= 1) node = "0";
+    printf("  configuration: %s, %s\n", g_use_worker ? "WORKER" : "SYNC", hw == VTPV_LAVC_HW_CUDA ? "CUDA" : "VA-API");
+    if (vtpv_lavc_open(hw, node, &g_lavc, err, sizeof err) != VTPV_OK) {
         printf("SKIP: %s\n", err);
         return 77;
     }
@@ -325,29 +413,29 @@ int main(int argc, char **argv)
             memset(&s, 0, sizeof s);
             set_geometry(352, 288);
             e = mk_engine();
-            aw_engine_deliver(e, m, msg0(m, AW_MSG_PDEC, uuid));
-            aw_engine_deliver(e, m, build_dsta(m, sizeof m, uuid, AW_4CC('a','v','c','1'), 352, 288, avcc, al));
+            deliver(e, m, msg0(m, AW_MSG_PDEC, uuid));
+            deliver(e, m, build_dsta(m, sizeof m, uuid, AW_4CC('a','v','c','1'), 352, 288, avcc, al));
             g_ne = 0;
-            aw_engine_deliver(e, m, build_dfrm(m, sizeof m, uuid, 0, 300, sample, sl));
+            deliver(e, m, build_dfrm(m, sizeof m, uuid, 0, 300, sample, sl));
             service(e, uuid, &s, &last);
             CHECK(s.n_demt == 1 && s.n_err == 0, "replay: one clean Demt (got %d, err %d)", s.n_demt, s.n_err);
             for (k = 0; k < ll; k++) diffs += s.luma_first[k] != luma[k];
             CHECK(diffs == 0, "replay: luma %zu/%zu bytes differ", diffs, ll);
             printf("  replay (live guest bytes, I_PCM 352x288): luma diffs %zu/%zu\n", diffs, ll);
-            aw_engine_destroy(e);
+            rm_engine(e);
         } else printf("  replay: SKIP (fixtures missing under %s)\n", fx);
         free(avcc); free(sample); free(luma);
     }
 
     /* ENG-MULTI-01 */
-    if (make_stream("libx264", "bframes=2:ref=3:keyint=12:min-keyint=12:scenecut=0", AV_PIX_FMT_YUV420P,
-                    640, 360, 30, "eng264", &st) == 0) {
+    if (get_stream("libx264", "bframes=2:ref=3:keyint=12:min-keyint=12:scenecut=0", AV_PIX_FMT_YUV420P,
+                   640, 360, 30, "eng264", &st) == 0) {
         run_stream("engine-h264-ipb-640x360", &st, AW_4CC('a','v','c','1'));
         stream_free(&st);
     }
     /* ENG-MULTI-02 */
-    if (make_stream("libx265", "bframes=3:keyint=8:scenecut=0:log-level=error", AV_PIX_FMT_YUV420P,
-                    1280, 720, 16, "eng265", &st) == 0) {
+    if (get_stream("libx265", "bframes=3:keyint=8:scenecut=0:log-level=error", AV_PIX_FMT_YUV420P,
+                   1280, 720, 16, "eng265", &st) == 0) {
         run_stream("engine-hevc-ipb-1280x720", &st, AW_4CC('h','v','c','1'));
         stream_free(&st);
     }

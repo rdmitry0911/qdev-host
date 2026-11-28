@@ -46,7 +46,8 @@
  * decoded (later frames keep their references) and replied to, but not emitted:
  * no Dbuf is asked for it, and a Dbuf already asked is answered, when its reply
  * comes, with Dfub + rels (reims decoder.rs guest_gave_up). */
-enum { AW_FRM_IDLE = 0, AW_FRM_AWAIT_DBUF, AW_FRM_AWAIT_DEMT };
+enum { AW_FRM_IDLE = 0, AW_FRM_AWAIT_DBUF, AW_FRM_AWAIT_DEMT,
+       AW_FRM_LANDING /* worker mode: the lend arrived, its decode / landing job runs */ };
 enum { AW_PRE_NONE = 0, AW_PRE_PENDING, AW_PRE_DONE };
 
 #define AW_PARK_MAX 16u
@@ -102,13 +103,49 @@ typedef struct aw_dsession {
     uint64_t     gone_dbuf[AW_GONE_MAX];
     unsigned     gone_head, gone_n;
     uint32_t     gave_up;       /* frames given up on (count, for the log)          */
+
+    /* VT-DECODE-WORKER (worker mode only; all under the device lock) */
+    uint64_t     epoch;         /* this session's identity for its jobs (0 = none yet) */
+    unsigned     jobs;          /* jobs submitted, not yet completed / discarded      */
+    int          closing;       /* close waits for jobs: no new frame starts           */
+    uint64_t     frame_seq;     /* bumped per started or given-up in-flight frame      */
+    uint64_t     ahead_frame;   /* frame_seq of the decode-ahead job in flight, or 0   */
+    int          land_waits;    /* the lend arrived while that decode-ahead runs       */
+    int          land_got;      /* resolve_buffer's result for the lend                */
+    uint8_t      land_bu[16];   /* the lent buffer id (,uui)                           */
+    uint64_t     land_mapid;    /* the lent mapping id (subs)                          */
+    int          give_up_after; /* a sync frame's reply was owed when a dfrm came while
+                                   it lands: give it up once it lands (D-GVA-SYNC-DFRM) */
 } aw_dsession;
+
+enum { AW_JOB_AHEAD = 1, AW_JOB_LAND, AW_JOB_DECODE };
+struct aw_job {
+    int       kind;
+    unsigned  si;               /* session index                                     */
+    uint64_t  epoch;            /* the session's epoch at submit                     */
+    uint64_t  frame;            /* the session's frame_seq at submit                 */
+    void     *dec;              /* the session's backend decoder                     */
+    uint8_t  *au;               /* owned copy of the access unit (NULL: no decode)   */
+    size_t    au_len;
+    int       need_decode;
+    vtpv_decoded_frame f;       /* the decode result (or the held picture)           */
+    int       dr;
+    int       got;              /* LAND: resolve_buffer's result                     */
+    uint8_t   bu[16];
+    uint64_t  mapid;
+    aw_out_buffer ob;
+    int       cr;               /* LAND: copy_frame's result                         */
+};
 
 struct aw_engine {
     aw_session_cfg cfg;
     aw_dsession    sess[AW_MAX_SESSIONS];
     uint64_t       next_reply_id; /* host reply clerk: numbers from 100          */
+    uint64_t       next_epoch;    /* worker mode: session epochs                  */
+    int            destroying;    /* aw_engine_destroy: close waits for no job     */
 };
+
+#define AW_WM(e) ((e)->cfg.submit_job != NULL)
 
 /* ---- binary-plist payloads (H4) ------------------------------------------ *
  * The guest's VideoToolbox parses these as bplist00 (contract-B §3). */
@@ -389,7 +426,13 @@ aw_engine *aw_engine_create(const aw_session_cfg *cfg)
 
 static void close_session(aw_engine *e, aw_dsession *s)
 {
-    if (s->pend_state == AW_FRM_AWAIT_DEMT && e->cfg.put_buffer)
+    if (AW_WM(e) && s->jobs && e->cfg.wait_jobs && !e->destroying) {
+        /* VT-DECODE-WORKER: this session's jobs finish first (each completes as the
+         * synchronous path would have before this close arrived); no new frame starts */
+        s->closing = 1;
+        while (s->jobs) e->cfg.wait_jobs(e->cfg.job_ctx);
+    }
+    if ((s->pend_state == AW_FRM_AWAIT_DEMT || s->pend_state == AW_FRM_LANDING) && e->cfg.put_buffer)
         e->cfg.put_buffer(e->cfg.buf_ctx, &s->pend_buf); /* let a held buffer go */
     if (s->pend_au) free(s->pend_au);
     for (unsigned i = 0; i < s->park_n; i++)
@@ -402,6 +445,7 @@ static void close_session(aw_engine *e, aw_dsession *s)
 void aw_engine_destroy(aw_engine *e)
 {
     if (!e) return;
+    e->destroying = 1;
     for (unsigned i = 0; i < AW_MAX_SESSIONS; i++)
         if (e->sess[i].used) close_session(e, &e->sess[i]);
     free(e);
@@ -687,6 +731,58 @@ static void emit_dfrm_reply(aw_engine *e, aw_dsession *s, const aw_msg_view *v,
     if (n) emit(e, buf, n);
 }
 
+/* ---- VT-DECODE-WORKER job helpers (worker mode; device lock held) ------- */
+
+/* A job for session s, owning a copy of `au` (au_len 0: no decode). NULL on no memory. */
+static aw_job *new_job(aw_engine *e, aw_dsession *s, int kind, const uint8_t *au, size_t au_len)
+{
+    aw_job *j = calloc(1, sizeof(*j));
+    if (!j) return NULL;
+    if (au_len) {
+        j->au = malloc(au_len);
+        if (!j->au) { free(j); return NULL; }
+        memcpy(j->au, au, au_len);
+        j->au_len = au_len;
+        j->need_decode = 1;
+    }
+    if (!s->epoch) s->epoch = ++e->next_epoch;
+    j->kind = kind;
+    j->si = (unsigned)(s - e->sess);
+    j->epoch = s->epoch;
+    j->frame = s->frame_seq;
+    j->dec = s->dec;
+    return j;
+}
+
+static void free_job(aw_job *j)
+{
+    if (!j) return;
+    free(j->au);
+    free(j);
+}
+
+/* Queue j; 0, or <0 (j freed: the caller does the work synchronously). */
+static int submit_job(aw_engine *e, aw_dsession *s, aw_job *j)
+{
+    s->jobs++;
+    if (e->cfg.submit_job(e->cfg.job_ctx, j) == 0) return 0;
+    s->jobs--;
+    free_job(j);
+    return -1;
+}
+
+/* Decode the unit for its references only (a given-up unit): a decode job in worker
+ * mode, else (or without memory for the job) synchronously. */
+static void decode_for_refs(aw_engine *e, aw_dsession *s, const uint8_t *au, size_t au_len)
+{
+    if (AW_WM(e) && au_len) {
+        aw_job *j = new_job(e, s, AW_JOB_DECODE, au, au_len);
+        if (j && submit_job(e, s, j) == 0) return;   /* submit_job frees j on failure */
+    }
+    vtpv_decoded_frame f; memset(&f, 0, sizeof f);
+    (void)e->cfg.be->decode(s->dec, au, au_len, &f);
+}
+
 /* Start a frame: make it the in-flight one and ask the guest for a buffer. */
 static void start_frame(aw_engine *e, aw_dsession *s, const uint8_t *au, size_t au_len,
                         int64_t frm, uint32_t inf, uint64_t reply_id)
@@ -699,7 +795,12 @@ static void start_frame(aw_engine *e, aw_dsession *s, const uint8_t *au, size_t 
     s->pend_replied = 0;
     s->pend_state = AW_FRM_AWAIT_DBUF;
     s->pre_state = AW_PRE_PENDING;   /* decode it once the Dbuf is on its way (P1)  */
+    s->frame_seq++;
     s->pend_dbuf_req = emit_dbuf(e, s, frm); /* -> guest replies Dbuf (lent buffer) */
+    if (AW_WM(e) && au_len) {        /* worker mode: the decode-ahead is a job      */
+        aw_job *j = new_job(e, s, AW_JOB_AHEAD, s->pend_au, s->pend_au_len);
+        if (j && submit_job(e, s, j) == 0) s->ahead_frame = s->frame_seq;
+    }                                /* (no job: decoded on the lend, as without P1) */
 }
 
 /* The in-flight frame's dfrm reply, once: ,err 0 and the frame's own ,inf. */
@@ -717,8 +818,7 @@ static void reply_pending_dfrm(aw_engine *e, aw_dsession *s)
 static void give_up_unit(aw_engine *e, aw_dsession *s, const uint8_t *au, size_t au_len,
                          uint32_t inf, uint64_t reply_id)
 {
-    vtpv_decoded_frame f; memset(&f, 0, sizeof f);
-    (void)e->cfg.be->decode(s->dec, au, au_len, &f);
+    decode_for_refs(e, s, au, au_len);
     aw_msg_view fv; memset(&fv, 0, sizeof fv);
     fv.reply_id = reply_id;
     emit_dfrm_reply(e, s, &fv, AW_NOERR, inf);
@@ -760,6 +860,7 @@ unsigned aw_engine_run_deferred_hooked(aw_engine *e, void (*after_unit)(void *ct
 {
     unsigned n = 0;
     if (!e || !e->cfg.be || !e->cfg.be->decode) return 0;
+    if (AW_WM(e)) return 0;          /* worker mode: decode-ahead runs as jobs     */
     for (unsigned i = 0; i < AW_MAX_SESSIONS; i++) {
         aw_dsession *s = &e->sess[i];
         if (!s->used || !s->started || s->pend_state != AW_FRM_AWAIT_DBUF || s->pre_state != AW_PRE_PENDING)
@@ -826,10 +927,13 @@ static void start_next(aw_engine *e, aw_dsession *s)
 static void give_up_inflight(aw_engine *e, aw_dsession *s)
 {
     if (s->pre_state != AW_PRE_DONE) {
-        vtpv_decoded_frame f; memset(&f, 0, sizeof f);
-        (void)e->cfg.be->decode(s->dec, s->pend_au, s->pend_au_len, &f);
+        /* worker mode: a decode-ahead job of this frame in flight decodes it (its
+         * picture is dropped on completion: frame_seq moves on below) */
+        if (!(AW_WM(e) && s->ahead_frame && s->ahead_frame == s->frame_seq))
+            decode_for_refs(e, s, s->pend_au, s->pend_au_len);
     }
     s->pre_state = AW_PRE_NONE;
+    s->frame_seq++;
     reply_pending_dfrm(e, s);
     remember_gone(s, s->pend_dbuf_req);
     s->pend_state = AW_FRM_IDLE;
@@ -876,6 +980,8 @@ static int32_t handle_dfrm(aw_engine *e, aw_dsession *s, const aw_msg_view *v)
         give_up_inflight(e, s);      /* its reply is owed: the guest moved on      */
     else if (s->pend_state == AW_FRM_AWAIT_DEMT && !s->pend_replied && s->park_n == 0)
         give_up_demt(e, s);          /* sync frame, reply owed: the same           */
+    else if (s->pend_state == AW_FRM_LANDING && !s->pend_replied && s->park_n == 0)
+        s->give_up_after = 1;        /* worker mode: the same, once it has landed  */
 
     if (s->pend_state != AW_FRM_IDLE) {
         /* a frame is in flight: park this unit until it completes            */
@@ -900,6 +1006,53 @@ static int32_t handle_dfrm(aw_engine *e, aw_dsession *s, const aw_msg_view *v)
     memcpy(s->pend_au, au, au_len);
     start_frame(e, s, s->pend_au, au_len, frm64, inf, v->reply_id);
     return AW_NOERR;
+}
+
+/* The lend's outcome, once the frame is decoded (dr) and, when it could be, landed (cr):
+ * exactly the synchronous Dbuf-reply tail (also run by the worker's aw_job_complete).
+ * A closing session (close waits for its jobs) starts no new frame. */
+static void finish_lend(aw_engine *e, aw_dsession *s, int got, const uint8_t bu[16],
+                        uint64_t mapid, const aw_out_buffer *ob, int dr, int cr)
+{
+    if (got != 0) {
+        /* The guest's lent buffer cannot take the frame (no surface, or one the
+         * host cannot reach). The unit was decoded above all the same (its picture
+         * may be a reference of later units); THIS frame fails now as Apple's host
+         * fails a frame it cannot output: Demt -12909 without a buffer, the lent
+         * buffer back with Dfub, rels of a real id - instead of leaving the guest
+         * to its 10 s reply timeout (D-GVA-LEND-FAIL-FAST, host half). */
+        static const uint8_t zero[16];
+        emit_demt(e, s, s->pend_frm, AW_ERR_MALFUNCTION, s->pend_inf, NULL);
+        if (memcmp(bu, zero, 16) != 0) emit_dfub(e, s, bu);
+        if (mapid) emit_rels(e, mapid);
+        if (e->cfg.put_buffer) e->cfg.put_buffer(e->cfg.buf_ctx, ob);
+        reply_pending_dfrm(e, s);    /* sync: the reply last                  */
+        s->pend_state = AW_FRM_IDLE;
+        if (!s->closing) start_next(e, s);
+        return;
+    }
+    if (dr != 0) {
+        /* Apple's host: a sample with no picture is emitted with
+         * FrameDropped and no buffer; a frame that does not decode with the
+         * decoder's status and no buffer; the unused buffer goes back with
+         * Dfub, then rels. */
+        if (dr == VTPV_DROPPED)
+            emit_demt(e, s, s->pend_frm, AW_NOERR, s->pend_inf | AW_INFO_FRAMEDROPPED, NULL);
+        else
+            emit_demt(e, s, s->pend_frm, AW_ERR_MALFUNCTION, s->pend_inf, NULL);
+        emit_dfub(e, s, ob->uuid);
+        emit_rels(e, ob->mapping_id);
+        if (e->cfg.put_buffer) e->cfg.put_buffer(e->cfg.buf_ctx, ob);
+        reply_pending_dfrm(e, s);    /* sync: the reply last                  */
+        s->pend_state = AW_FRM_IDLE;
+        if (!s->closing) start_next(e, s);
+        return;
+    }
+
+    s->pend_buf = *ob;
+    s->pend_demt_req = emit_demt(e, s, s->pend_frm, cr == 0 ? AW_NOERR : AW_ERR_MALFUNCTION,
+                                 s->pend_inf, ob->uuid); /* ,inf: the frame's own flag */
+    s->pend_state = AW_FRM_AWAIT_DEMT; /* -> guest replies Demt                */
 }
 
 /* A guest reply (flag 0x8). `msg`/`len` are the raw message so a Dbuf reply's
@@ -939,6 +1092,28 @@ static int32_t handle_guest_reply(aw_engine *e, aw_dsession *s,
          * last, after the frame's Demt and rels (D-GVA-SYNC-DFRM) */
         if (async) reply_pending_dfrm(e, s);
 
+        if (AW_WM(e)) {
+            /* VT-DECODE-WORKER: the decode / landing runs on the worker; this chain's
+             * status (the delivery result) goes now. The frame lands, its Demt / Dfub /
+             * rels go out, in aw_job_complete -> finish_lend, as below. */
+            s->pend_buf = ob;
+            s->land_got = got; memcpy(s->land_bu, bu, 16); s->land_mapid = mapid;
+            s->pend_state = AW_FRM_LANDING;
+            if (s->ahead_frame && s->ahead_frame == s->frame_seq) {
+                s->land_waits = 1;                  /* its decode-ahead job lands it  */
+                return AW_NOERR;
+            }
+            const int done = s->pre_state == AW_PRE_DONE;
+            aw_job *j = new_job(e, s, AW_JOB_LAND, done ? NULL : s->pend_au, done ? 0 : s->pend_au_len);
+            if (j) {
+                if (done) { j->f = s->pre_f; j->dr = s->pre_dr; }
+                j->got = got; memcpy(j->bu, bu, 16); j->mapid = mapid; j->ob = ob;
+                s->pre_state = AW_PRE_NONE;
+                if (submit_job(e, s, j) == 0) return AW_NOERR;
+            }
+            s->pend_state = AW_FRM_AWAIT_DBUF;      /* no job: land it here (below)   */
+        }
+
         vtpv_decoded_frame f; memset(&f, 0, sizeof f);
         int dr;
         if (s->pre_state == AW_PRE_DONE) {          /* decoded ahead during the lend (P1) */
@@ -947,47 +1122,10 @@ static int32_t handle_guest_reply(aw_engine *e, aw_dsession *s,
             dr = e->cfg.be->decode(s->dec, s->pend_au, s->pend_au_len, &f);
         }
         s->pre_state = AW_PRE_NONE;
-
-        if (got != 0) {
-            /* The guest's lent buffer cannot take the frame (no surface, or one the
-             * host cannot reach). The unit was decoded above all the same (its picture
-             * may be a reference of later units); THIS frame fails now as Apple's host
-             * fails a frame it cannot output: Demt -12909 without a buffer, the lent
-             * buffer back with Dfub, rels of a real id - instead of leaving the guest
-             * to its 10 s reply timeout (D-GVA-LEND-FAIL-FAST, host half). */
-            static const uint8_t zero[16];
-            emit_demt(e, s, s->pend_frm, AW_ERR_MALFUNCTION, s->pend_inf, NULL);
-            if (memcmp(bu, zero, 16) != 0) emit_dfub(e, s, bu);
-            if (mapid) emit_rels(e, mapid);
-            if (e->cfg.put_buffer) e->cfg.put_buffer(e->cfg.buf_ctx, &ob);
-            reply_pending_dfrm(e, s);    /* sync: the reply last                  */
-            s->pend_state = AW_FRM_IDLE;
-            start_next(e, s);
-            return AW_NOERR;
-        }
-        if (dr != 0) {
-            /* Apple's host: a sample with no picture is emitted with
-             * FrameDropped and no buffer; a frame that does not decode with the
-             * decoder's status and no buffer; the unused buffer goes back with
-             * Dfub, then rels. */
-            if (dr == VTPV_DROPPED)
-                emit_demt(e, s, s->pend_frm, AW_NOERR, s->pend_inf | AW_INFO_FRAMEDROPPED, NULL);
-            else
-                emit_demt(e, s, s->pend_frm, AW_ERR_MALFUNCTION, s->pend_inf, NULL);
-            emit_dfub(e, s, ob.uuid);
-            emit_rels(e, ob.mapping_id);
-            if (e->cfg.put_buffer) e->cfg.put_buffer(e->cfg.buf_ctx, &ob);
-            reply_pending_dfrm(e, s);    /* sync: the reply last                  */
-            s->pend_state = AW_FRM_IDLE;
-            start_next(e, s);
-            return AW_NOERR;
-        }
-
-        int cr = e->cfg.copy_frame ? e->cfg.copy_frame(e->cfg.buf_ctx, &f, &ob) : -1;
-        s->pend_buf = ob;
-        s->pend_demt_req = emit_demt(e, s, s->pend_frm, cr == 0 ? AW_NOERR : AW_ERR_MALFUNCTION,
-                                     s->pend_inf, ob.uuid); /* ,inf: the frame's own flag */
-        s->pend_state = AW_FRM_AWAIT_DEMT; /* -> guest replies Demt                */
+        int cr = -1;
+        if (got == 0 && dr == 0)
+            cr = e->cfg.copy_frame ? e->cfg.copy_frame(e->cfg.buf_ctx, &f, &ob) : -1;
+        finish_lend(e, s, got, bu, mapid, &ob, dr, cr);
         return AW_NOERR;
     }
 
@@ -1134,4 +1272,100 @@ int32_t aw_engine_deliver(aw_engine *e, const uint8_t *msg, size_t len)
     case AW_MSG_DSET: return reply_err(e, &v, AW_NOERR);
     default:          return AW_ERR_UNKNOWN_UUID;
     }
+}
+
+/* ---- VT-DECODE-WORKER: the worker side (see aw_session.h) ----------------- */
+
+static aw_dsession *job_session(aw_engine *e, const aw_job *j)
+{
+    if (j->si >= AW_MAX_SESSIONS) return NULL;
+    aw_dsession *s = &e->sess[j->si];
+    return (s->used && s->epoch == j->epoch) ? s : NULL;
+}
+
+void aw_job_work(aw_engine *e, aw_job *j)
+{
+    if (!e || !j) return;
+    if (j->need_decode) {
+        memset(&j->f, 0, sizeof j->f);
+        j->dr = (e->cfg.be && e->cfg.be->decode)
+            ? e->cfg.be->decode(j->dec, j->au, j->au_len, &j->f) : VTPV_ERR_BACKEND;
+        j->need_decode = 0;
+    }
+    if (j->kind == AW_JOB_LAND) {
+        j->cr = -1;
+        if (j->got == 0 && j->dr == 0)
+            j->cr = e->cfg.copy_frame ? e->cfg.copy_frame(e->cfg.buf_ctx, &j->f, &j->ob) : -1;
+    }
+}
+
+int aw_job_complete(aw_engine *e, aw_job *j)
+{
+    aw_dsession *s = job_session(e, j);
+    if (s && j->kind == AW_JOB_AHEAD) {
+        if (s->ahead_frame == j->frame) s->ahead_frame = 0;
+        if (j->frame == s->frame_seq) {
+            if (s->pend_state == AW_FRM_LANDING && s->land_waits) {
+                /* the lend arrived while this unit decoded ahead: land it now */
+                s->land_waits = 0;
+                j->kind = AW_JOB_LAND;
+                j->got = s->land_got; memcpy(j->bu, s->land_bu, 16);
+                j->mapid = s->land_mapid; j->ob = s->pend_buf;
+                s->pre_state = AW_PRE_NONE;
+                return 1;                 /* still counted in s->jobs               */
+            }
+            if (s->pend_state == AW_FRM_AWAIT_DBUF && !s->closing) {
+                s->pre_f = j->f; s->pre_dr = j->dr; s->pre_state = AW_PRE_DONE;
+            }
+        }                                 /* a given-up frame's picture is dropped  */
+    } else if (s && j->kind == AW_JOB_LAND) {
+        finish_lend(e, s, j->got, j->bu, j->mapid, &j->ob, j->dr, j->cr);
+        if (s->give_up_after) {
+            s->give_up_after = 0;
+            if (s->pend_state == AW_FRM_AWAIT_DEMT && !s->pend_replied) give_up_demt(e, s);
+            if (!s->closing) start_next(e, s);
+        }
+    }
+    if (s && s->jobs) s->jobs--;
+    free_job(j);
+    return 0;
+}
+
+/* Device reset: a lent frame that cannot land now gives its buffer back and the
+ * session goes idle; nothing is emitted for it (the reset dropped the backlog). */
+static void abandon_lend(aw_engine *e, aw_dsession *s)
+{
+    if (s->pend_state != AW_FRM_LANDING) return;
+    if (e->cfg.put_buffer) e->cfg.put_buffer(e->cfg.buf_ctx, &s->pend_buf);
+    memset(&s->pend_buf, 0, sizeof s->pend_buf);
+    s->pend_state = AW_FRM_IDLE;
+    s->pre_state = AW_PRE_NONE;
+    s->land_waits = 0;
+    s->give_up_after = 0;
+    if (!s->closing) start_next(e, s);
+}
+
+void aw_job_discard(aw_engine *e, aw_job *j)
+{
+    if (!j) return;
+    aw_dsession *s = e ? job_session(e, j) : NULL;
+    if (s) {
+        if (j->kind == AW_JOB_AHEAD && s->ahead_frame == j->frame) {
+            s->ahead_frame = 0;
+            if (j->frame == s->frame_seq && s->land_waits) abandon_lend(e, s);
+        } else if (j->kind == AW_JOB_LAND) {
+            abandon_lend(e, s);
+        }
+        if (s->jobs) s->jobs--;
+    }
+    free_job(j);
+}
+
+unsigned aw_engine_jobs(const aw_engine *e)
+{
+    unsigned n = 0;
+    if (!e) return 0;
+    for (unsigned i = 0; i < AW_MAX_SESSIONS; i++)
+        if (e->sess[i].used) n += e->sess[i].jobs;
+    return n;
 }

@@ -5,7 +5,9 @@
 #include <unistd.h>
 
 #include <libavcodec/avcodec.h>
+#ifndef TEST_LAVC_NO_ENCODE
 #include <libavformat/avformat.h>
+#endif
 #include <libavutil/md5.h>
 #include <libavutil/opt.h>
 
@@ -21,6 +23,7 @@ void stream_free(stream *s)
     memset(s, 0, sizeof(*s));
 }
 
+#ifndef TEST_LAVC_NO_ENCODE /* VT-DECODE-WORKER CUDA smoke: a build without encoders / libavformat */
 static void fill_frame(AVFrame *f, int idx)
 {
     int x, y, cw = (f->width + 1) / 2, ch = (f->height + 1) / 2;
@@ -137,6 +140,8 @@ done:
     return rc;
 }
 
+#endif
+
 /* ---- the oracle: libavcodec software decode, display order, by pts ---- */
 
 
@@ -228,6 +233,10 @@ int run_oracle(const stream *s, oracle *o)
 int make_stream(const char *encoder, const char *params, enum AVPixelFormat pf,
                 int w, int h, int n, const char *tag, stream *out)
 {
+#ifdef TEST_LAVC_NO_ENCODE
+    (void)encoder; (void)params; (void)pf; (void)w; (void)h; (void)n; (void)tag; (void)out;
+    return -1;                       /* streams come from VT_TEST_LOAD files */
+#else
     int rc = 1, attempt;
     for (attempt = 0; attempt < 3; attempt++) {
         rc = make_stream_once(encoder, params, pf, w, h, n, tag, out);
@@ -235,4 +244,5 @@ int make_stream(const char *encoder, const char *params, enum AVPixelFormat pf,
         stream_free(out);
     }
     return rc;
+#endif
 }

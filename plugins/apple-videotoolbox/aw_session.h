@@ -75,6 +75,20 @@ typedef int (*aw_copy_frame_fn)(void *ctx, const vtpv_decoded_frame *f,
 /* Release a buffer the host is done with (models the rels sweep). */
 typedef void (*aw_put_buffer_fn)(void *ctx, const aw_out_buffer *b);
 
+/* VT-DECODE-WORKER (D-AGVA-TIMEOUT-UNDER-LOAD; apple-virgl analysis/20261128-FIX-CANDIDATE-VT-DECODE-WORKER.md).
+ * Worker mode: with cfg.submit_job set, aw_engine_deliver never decodes or lands a frame. The decode-ahead of a
+ * started frame, a lent frame's decode + landing and a given-up unit's decode become jobs that cfg.submit_job hands
+ * to ONE worker thread, which runs them in submission order (so a session's units reach its decoder in the same order
+ * as without the worker). The queue-0 status of every message is the delivery result as before (contract B section 1),
+ * now returned without waiting for any decode or landing. Per job the worker calls aw_job_work WITHOUT the device lock,
+ * then aw_job_complete WITH it (that applies the result and emits exactly what the synchronous path emits). Every
+ * other engine call keeps the device lock as before. submit_job is called with the device lock held; it returns 0, or
+ * <0 when the job could not be queued (the engine then does that work synchronously). wait_jobs is called with the
+ * device lock held and returns after the worker completed a job (it may release and re-take the lock). */
+typedef struct aw_job aw_job;
+typedef int  (*aw_submit_job_fn)(void *ctx, aw_job *job);
+typedef void (*aw_wait_jobs_fn)(void *ctx);
+
 typedef struct aw_session_cfg {
     const vtpv_decoder_backend *be;
     void                       *be_ctx;
@@ -84,11 +98,25 @@ typedef struct aw_session_cfg {
     aw_copy_frame_fn     copy_frame;
     aw_put_buffer_fn     put_buffer;
     void                *buf_ctx;
+    aw_submit_job_fn     submit_job;  /* NULL: synchronous (decode / land inside deliver) */
+    aw_wait_jobs_fn      wait_jobs;
+    void                *job_ctx;
 } aw_session_cfg;
 
 typedef struct aw_engine aw_engine;
 
+/* Worker side of worker mode (see aw_session_cfg). aw_job_complete returns 1 when the job needs one more
+ * aw_job_work (a decode-ahead whose lend arrived meanwhile: its landing follows), 0 when it is finished and freed.
+ * aw_job_discard frees a job that will not run (device reset) under the device lock: a lent frame's buffer is put
+ * back and the frame abandoned without emitting anything (the reset dropped the host->guest backlog). */
+void aw_job_work(aw_engine *e, aw_job *job);
+int  aw_job_complete(aw_engine *e, aw_job *job);
+void aw_job_discard(aw_engine *e, aw_job *job);
+/* Jobs submitted and not yet completed or discarded (device lock held). */
+unsigned aw_engine_jobs(const aw_engine *e);
+
 aw_engine *aw_engine_create(const aw_session_cfg *cfg);
+/* In worker mode the worker must be stopped first (no job in flight). */
 void       aw_engine_destroy(aw_engine *e);
 
 /* Deliver one queue-0 guest->host message. Returns the i32 device status the

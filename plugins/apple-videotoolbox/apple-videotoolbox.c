@@ -59,6 +59,7 @@
 #include "vt_scatter.h"   /* page-aware landing into a non-contiguous guest surface */
 #include "vt_submit.h"    /* queue-0 drain + P1 decode-ahead (D-AGVA-TIMEOUT-UNDER-LOAD) */
 #include "vt_land.h"      /* GVA-LAND-BOUNDS: only what fits the lent surface lands */
+#include "vt_worker.h"    /* VT-DECODE-WORKER: decode + landing off the device thread */
 #ifdef VTPV_HAVE_LAVC
 #define VT_LAVC_CLOSE(d) do { if ((d)->lavc) { vtpv_lavc_close((d)->lavc); (d)->lavc = NULL; } } while (0)
 #else
@@ -195,6 +196,16 @@ typedef struct vt_dev {
     unsigned pend_head;   /* index of the oldest pending message */
     unsigned pend_count;  /* number of pending messages */
     uint64_t pend_dropped;/* diagnostics: messages lost to a full ring */
+
+    /* VT-DECODE-WORKER (D-AGVA-TIMEOUT-UNDER-LOAD): the engine's decode / landing jobs run on
+     * this worker, so a queue-0 status never waits for them. `mem` guards guest memory against
+     * the host's map changes: the worker holds it shared per job, quiesce() .. resume() hold it
+     * exclusively. `worker=0` in the plugin args keeps the synchronous engine. */
+    int              worker_on;
+    vt_worker        worker;
+    vt_locked_backend lbe;
+    pthread_rwlock_t mem;
+    int              quiesced;     /* host main loop only */
 } vt_dev;
 
 /* the completion vq's MSI-X vector (set by the driver; config vector fallback) */
@@ -954,6 +965,19 @@ static const vtpv_decoder_backend fake_h264_be = {
 
 /* ---- qdp_device_ops ------------------------------------------------- */
 
+/* VT-DECODE-WORKER: the landing reads the backend's picture (single-entry backend lock); the
+ * worker already holds `mem` shared for the whole job. */
+static int vt_copy_frame_locked(void *ctx, const vtpv_decoded_frame *f, const aw_out_buffer *b)
+{
+    vt_backend_lock();
+    int r = vt_copy_frame(ctx, f, b);
+    vt_backend_unlock();
+    return r;
+}
+
+/* After a worker completion (under d->m): deliver what it emitted on queue 1. */
+static void vt_worker_post(void *ctx) { vt_flush_pending((vt_dev *)ctx); }
+
 static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
                     void **priv)
 {
@@ -1063,7 +1087,37 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
         cfg.copy_frame = vt_copy_frame;
         cfg.put_buffer = vt_put_buffer;
         cfg.buf_ctx = d;
+        /* VT-DECODE-WORKER: default on with a decoding backend; `worker=0` keeps the
+         * synchronous engine (the pre-worker behaviour). */
+        d->worker_on = d->be && d->be->decode && !(args && strstr(args, "worker=0"));
+        if (d->worker_on &&
+            (pthread_rwlock_init(&d->mem, NULL) != 0 ||
+             vt_worker_init(&d->worker, &d->m, &d->mem, vt_worker_post, d) != 0)) {
+            vt_log(d, 1, "decode worker unavailable (init); synchronous decode");
+            d->worker_on = 0;
+        }
+        if (d->worker_on) {
+            vt_locked_backend_init(&d->lbe, d->be);
+            cfg.be = &d->lbe.be;
+            cfg.copy_frame = vt_copy_frame_locked;
+            cfg.submit_job = vt_worker_submit;
+            cfg.wait_jobs = vt_worker_wait;
+            cfg.job_ctx = &d->worker;
+        }
         d->engine = aw_engine_create(&cfg);
+        if (d->engine && d->worker_on && vt_worker_start(&d->worker, d->engine) != 0) {
+            vt_log(d, 1, "decode worker unavailable (thread); synchronous decode");
+            aw_engine_destroy(d->engine);
+            vt_worker_destroy(&d->worker);
+            pthread_rwlock_destroy(&d->mem);
+            d->worker_on = 0;
+            cfg.be = d->be; cfg.copy_frame = vt_copy_frame;
+            cfg.submit_job = NULL; cfg.wait_jobs = NULL; cfg.job_ctx = NULL;
+            d->engine = aw_engine_create(&cfg);
+        }
+        if (d->engine)
+            vt_log(d, 2, "decode %s", d->worker_on ? "worker: on (queue-0 status independent of decode / landing)"
+                                                   : "synchronous");
     }
     if (!d->engine) {
         VT_LAVC_CLOSE(d);
@@ -1127,7 +1181,9 @@ static void vt_teardown(void *priv)
     vt_dev *d = priv;
     if (!d) return;
     if (g_dev == d) g_dev = NULL;
+    if (d->worker_on) vt_worker_stop(&d->worker); /* finishes its queued jobs, then joins */
     aw_engine_destroy(d->engine);
+    if (d->worker_on) { vt_worker_destroy(&d->worker); pthread_rwlock_destroy(&d->mem); }
     VT_LAVC_CLOSE(d);
     if (d->nvdec) vtpv_nvdec_close(d->nvdec);
     if (d->va) vtpv_vaapi_close(d->va);
@@ -1149,6 +1205,7 @@ static int vt_reset(void *priv, vfu_reset_type_t type)
     d->needs_reset = 0;
     d->msix_config = VT_MSIX_NO_VECTOR;
     d->pend_head = d->pend_count = 0;   /* drop any undelivered host->guest backlog */
+    if (d->worker_on) vt_worker_discard(&d->worker); /* quiesced: no job is running */
     for (i = 0; i < VT_QUEUES; i++) {
         vtpv_virtq *vq = &d->queues[i];
         vq->ready = 0; vq->desc = vq->avail = vq->used = 0;
@@ -1184,6 +1241,24 @@ static void vt_dma_unregister(void *priv, const qdp_dma_region *region)
     pthread_mutex_unlock(&d->m);
 }
 
+/* The host's guest-memory map changes (and resets) run between these two (host main loop):
+ * the worker finishes the job it runs and starts no other until resume(). */
+static int vt_quiesce(void *priv)
+{
+    vt_dev *d = priv;
+    if (!d || !d->worker_on || d->quiesced) return 0;
+    pthread_rwlock_wrlock(&d->mem);
+    d->quiesced = 1;
+    return 0;
+}
+static void vt_resume(void *priv)
+{
+    vt_dev *d = priv;
+    if (!d || !d->worker_on || !d->quiesced) return;
+    d->quiesced = 0;
+    pthread_rwlock_unlock(&d->mem);
+}
+
 static const qdp_device_ops ops = {
     .abi_version = QDP_ABI_VERSION,
     .name = "apple-videotoolbox",
@@ -1191,6 +1266,8 @@ static const qdp_device_ops ops = {
     .setup = vt_setup,
     .teardown = vt_teardown,
     .reset = vt_reset,
+    .quiesce = vt_quiesce,
+    .resume = vt_resume,
     .dma_register = vt_dma_register,
     .dma_unregister = vt_dma_unregister,
 };
