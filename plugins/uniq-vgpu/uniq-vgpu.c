@@ -2817,6 +2817,19 @@ static int pvg_create_session(PvgState *s)
     };
     int r;
 
+#ifdef QMU_EXTENDED_CONFIG_HAS_ROOT_FIFO_SIZE_IS_TOTAL
+#if QMU_EXTENDED_ABI_VERSION < 4
+#error "root_fifo_size_is_total needs the version-4 qmu_extended ABI (the member sits in version 3's tail padding)"
+#endif
+    /* PVG-ROOTFIFO-LEN-01: device id 0xeeee is the stock-driver personality: Apple's x86 AppleParavirtGPU, and on
+     * arm64 Apple's drivers behind the uniqvgpu-arm-bridge kext.  Those guests allocate exactly FIFO_SIZE bytes for
+     * the root FIFO and wrap at FIFO_SIZE - FIFO_OFFSET (PGRootFIFO's reading).  eee1, the uniq-vgpu kext,
+     * allocates FIFO_OFFSET + FIFO_SIZE and wraps at FIFO_SIZE: it keeps QMetal's historical reading (0). */
+    config.root_fifo_size_is_total = s->pci_device_id == UNIQ_VGPU_ML_DEVICE_ID;
+    pvg_log(s, "[uniq-vgpu-ml] root FIFO: FIFO_SIZE read as %s (device id 0x%04x)\n",
+            config.root_fifo_size_is_total ? "the total length" : "the ring size", s->pci_device_id);
+#endif
+
     /* reference apple-gfx.m:45-49: three modes, mode 0 the primary one */
     config.mode_data[0] = (s->display_height << 16) | s->display_width;
     config.mode_data[1] = (1080u << 16) | 1440u;
