@@ -2510,6 +2510,16 @@ static int pvg_parse_args(PvgState *s, const char *args)
         } else if (!strcmp(tok, "fw-device-id")) {
             ok = pvg_parse_u32(val, &s->fw_device_id) && s->fw_device_id <= 0xffff;
             s->fw_identity = true;
+        } else if (!strcmp(tok, "guest-page-shift")) {
+            ok = pvg_parse_u32(val, &s->guest_page_shift) &&
+                 (s->guest_page_shift == 12 || s->guest_page_shift == 14);
+#ifndef QMU_EXTENDED_CONFIG_HAS_GUEST_PAGE_SHIFT
+            if (ok && s->guest_page_shift != 12) {
+                fprintf(stderr, "[uniq-vgpu-ml] [ERROR] guest-page-shift=%u needs a QMetal header with "
+                        "qmu_extended_config::guest_page_shift (ARM64-PVG-PFN-01)\n", s->guest_page_shift);
+                ok = false;
+            }
+#endif
         } else if (!strcmp(tok, "log")) {
             ok = !strcmp(val, "stderr") || !strcmp(val, "host");
             s->log_to_host = !strcmp(val, "host");
@@ -2829,6 +2839,13 @@ static int pvg_create_session(PvgState *s)
     pvg_log(s, "[uniq-vgpu-ml] root FIFO: FIFO_SIZE read as %s (device id 0x%04x)\n",
             config.root_fifo_size_is_total ? "the total length" : "the ring size", s->pci_device_id);
 #endif
+#ifdef QMU_EXTENDED_CONFIG_HAS_GUEST_PAGE_SHIFT
+    /* ARM64-PVG-PFN-01: guest page numbers are pa >> guest_page_shift (14 for arm64 guests, 12 otherwise). */
+    config.guest_page_shift = s->guest_page_shift;
+    if (s->guest_page_shift != 12)
+        pvg_log(s, "[uniq-vgpu-ml] guest pages: %u bytes (guest-page-shift=%u)\n",
+                1u << s->guest_page_shift, s->guest_page_shift);
+#endif
 
     /* reference apple-gfx.m:45-49: three modes, mode 0 the primary one */
     config.mode_data[0] = (s->display_height << 16) | s->display_width;
@@ -2922,6 +2939,7 @@ static int pvg_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env, 
     s->display_height = 1080;
     s->pci_vendor_id = UNIQ_VGPU_ML_VENDOR_ID;
     s->pci_device_id = UNIQ_VGPU_ML_DEVICE_ID;
+    s->guest_page_shift = 12;
     s->vsync_enabled = true;
     s->exit_on_disconnect = true;
     s->display_modes_follow = true;

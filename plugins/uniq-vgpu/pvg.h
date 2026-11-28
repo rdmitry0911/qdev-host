@@ -284,6 +284,9 @@ typedef struct PvgState {
      * FLR reset re-arms.  Accessed on the vfu loop thread only. */
     uint32_t fw_vendor_id, fw_device_id;
     bool fw_identity;             /* configured */
+    /* guest-page-shift= (ARM64-PVG-PFN-01): the guest's page unit for every guest page number QMetal decodes:
+     * 12 = 4 KiB (x86-64 guests, the default), 14 = 16 KiB (arm64 guests). */
+    uint32_t guest_page_shift;
     bool fw_identity_armed;
     uint64_t fw_identity_switches;
     bool vsync_enabled;

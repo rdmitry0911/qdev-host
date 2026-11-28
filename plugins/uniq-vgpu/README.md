@@ -25,6 +25,7 @@ Plugin args (`--plugin-args`; the fork's property names are accepted):
 | `vsync=`, `direct_scanout=` | on, off | passed to QMetal |
 | `spirv_cache_dir=` | none | SPIR-V / VkPipelineCache directory |
 | `device-id=` (`x-pci-device-id=`), `vendor-id=` (`x-pci-vendor-id=`) | 0xeeee, 0x106b | personality, e.g. `device-id=0xeee1` |
+| `guest-page-shift=` | 12 | the guest's page unit for guest page numbers: 12 = 4 KiB (x86-64), 14 = 16 KiB (arm64 guests); 14 needs a QMetal header with `qmu_extended_config::guest_page_shift` |
 | `log=` | `stderr` | device log sink: `stderr` writes the device's `[uniq-vgpu-ml]` lines (the fork's `[apple-gfx-ml]` tag until 2026-11-19, HOST-LOG-TAG-01); `host` routes them through `qdp_host_ops.log` |
 | `exit-on-disconnect=` | on | when the client goes away: run the quit stop phase, then exit the process (GPU state refers to the lost guest's memory) |
 
