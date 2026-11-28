@@ -1106,8 +1106,7 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
         cfg.copy_frame = vt_copy_frame;
         cfg.put_buffer = vt_put_buffer;
         cfg.buf_ctx = d;
-        /* VT-DECODE-WORKER: on with a decoding backend, except on CUDA/NVDEC (D-VT-WORKER-NVDEC:
-         * the synchronous engine there, as dcaab99); `worker=0` / `worker=1` decide explicitly. */
+        /* VT-DECODE-WORKER: on with a decoding backend (vt_worker_wanted); `worker=0` / `worker=1` decide explicitly. */
         {
             int nv = d->nvdec != NULL;
 #ifdef VTPV_HAVE_LAVC

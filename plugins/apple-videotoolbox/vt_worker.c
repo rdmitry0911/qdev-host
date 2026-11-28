@@ -151,7 +151,8 @@ int vt_worker_wanted(const char *args, int has_decode, int nvidia)
         if (q != args && q[-1] != ',' && q[-1] != ' ') continue;   /* a key ending in "worker" */
         if (q[7] == '0' || q[7] == '1') return q[7] == '1';
     }
-    return !nvidia;
+    (void)nvidia;   /* D-VT-WORKER-NVDEC closed by the guest kext AGVA-KEXT-SEND-PATH (b): default on everywhere */
+    return 1;
 }
 
 /* ---- the single-entry backend (one per process: the device is one per host process) */

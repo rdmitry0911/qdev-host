@@ -53,11 +53,11 @@ void vt_worker_discard(vt_worker *w);
 void vt_worker_stop(vt_worker *w);
 void vt_worker_destroy(vt_worker *w);
 
-/* Whether the device runs its engine on the decode worker (D-VT-WORKER-NVDEC). Only with a decoding
- * backend; `worker=0` / `worker=1` in the plugin args decide; otherwise on, except on an NVIDIA
- * (CUDA/NVDEC) backend: there v75 (qdev-host eb5be16) stalled 4K HEVC Main 10 playback and a queue-0
- * status timed out, while the synchronous engine (dcaab99) passed; the worker stays the default on
- * VA-API until the NVDEC cause is closed. */
+/* Whether the device runs its engine on the decode worker. Only with a decoding backend; `worker=0` / `worker=1` in
+ * the plugin args decide; otherwise ON on every backend. (D-VT-WORKER-NVDEC: v75 eb5be16's NVDEC stall was a guest
+ * video-kext coupling - a per-Demt IOSurface write transition on the context that completes every guest send - fixed by
+ * apple-virgl AGVA-KEXT-SEND-PATH (b), guest kext F39A1BB0; 951895c's NV default-off is reverted here.) `nvidia` stays
+ * in the signature for a future per-backend policy. */
 int vt_worker_wanted(const char *args, int has_decode, int nvidia);
 
 /* A backend whose every call holds one mutex (the stream core and the legacy backends are
