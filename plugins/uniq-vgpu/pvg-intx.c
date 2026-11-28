@@ -1,5 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /* pvg-intx: level-triggered INTx state of the uniq-vgpu device (see pvg-intx.h). */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE   /* libvfio-user.h needs loff_t (also under -std=c11 builds) */
+#endif
 #include "pvg-intx.h"
 
 #include <errno.h>

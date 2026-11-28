@@ -53,10 +53,11 @@ endif
 # Its module unit tests (no VM) run with: make apple-videotoolbox-test
 VT_DIR := plugins/apple-videotoolbox
 VT_SRC := $(addprefix $(VT_DIR)/,apple-videotoolbox.c vtpv_vaapi.c vtpv_nvdec.c vtpv_h264.c \
-          vtpv_virtq.c aw_wire.c aw_sbuf.c aw_bplist.c aw_session.c vt_scatter.c vt_land.c vt_submit.c vt_worker.c)
+          vtpv_virtq.c aw_wire.c aw_sbuf.c aw_bplist.c aw_session.c vt_scatter.c vt_land.c vt_submit.c vt_worker.c) \
+          plugins/uniq-vgpu/pvg-intx.c
 VT_HDR := $(addprefix $(VT_DIR)/,vtpv_proto.h vtpv_vaapi.h vtpv_nvdec.h vtpv_h264.h vtpv_virtq.h \
           aw_wire.h aw_sbuf.h aw_bplist.h aw_session.h vt_scatter.h vt_land.h vt_submit.h vt_worker.h) \
-          plugins/uniq-vgpu/pvg_mapper_bridge.h
+          plugins/uniq-vgpu/pvg_mapper_bridge.h plugins/uniq-vgpu/pvg-intx.h
 VT_VA_CFLAGS := $(shell $(PKG_CONFIG) --cflags libva libva-drm 2>/dev/null)
 VT_VA_LIBS   := $(shell $(PKG_CONFIG) --libs libva libva-drm 2>/dev/null)
 # The stream decode core (vtpv_lavc: libavcodec + VA-API/CUDA hwaccel, keeps the
@@ -180,7 +181,7 @@ uniq-vgpu-pvm-test: plugins/uniq-vgpu/pvg_process_vm_test
 # Native test of the uniq-vgpu interrupt line (D-ARM64-INTX): production pvg-intx.c (level INTx state, irq=
 # msi|intx|auto dispatch) over the vendored libvfio-user, driven by a vfio-user client in the same process
 # (config space, SET_IRQS, assert/deassert by eventfd counts).  No VM, GPU or libmlapi.
-plugins/uniq-vgpu/pvg_intx_test: plugins/uniq-vgpu/pvg_intx_test.c plugins/uniq-vgpu/pvg-intx.c plugins/uniq-vgpu/pvg-intx.h $(VFU_DEP)
+plugins/uniq-vgpu/pvg_intx_test: plugins/uniq-vgpu/pvg_intx_test.c plugins/uniq-vgpu/pvg-intx.c plugins/uniq-vgpu/pvg-intx.h plugins/uniq-vgpu/vfu_mini_client.h $(VFU_DEP)
 	$(CC) $(CFLAGS) -pthread -Iplugins/uniq-vgpu $(VFU_CFLAGS) -o $@ plugins/uniq-vgpu/pvg_intx_test.c \
 	    plugins/uniq-vgpu/pvg-intx.c $(VFU_LIBS)
 

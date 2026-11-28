@@ -168,9 +168,16 @@ $(BUILD)/test-lavc-hevc10: vtpv_lavc.c vtpv_lavc.h test_lavc_hevc10.c test_lavc_
 $(BUILD)/gva-payload: gva_payload.c test_lavc_util.c test_lavc_util.h | $(BUILD)
 	$(CC) $(CFLAGS) $(LAVC_CFLAGS) -o $@ gva_payload.c test_lavc_util.c $(LAVC_LIBS) $(FMT_LIBS)
 
-$(BUILD)/apple-videotoolbox.so: apple-videotoolbox.c $(AW_CORE) vt_submit.c vt_worker.c $(BACKEND) vtpv_nvdec.c $(PLUGIN_LAVC_SRC) $(BRIDGE_DIR)/pvg_mapper_bridge.h vt_scatter.h vt_land.h vt_submit.h vt_worker.h | $(BUILD)
+$(BUILD)/apple-videotoolbox.so: apple-videotoolbox.c $(AW_CORE) vt_submit.c vt_worker.c $(BACKEND) vtpv_nvdec.c $(PLUGIN_LAVC_SRC) $(BRIDGE_DIR)/pvg_mapper_bridge.h $(BRIDGE_DIR)/pvg-intx.c $(BRIDGE_DIR)/pvg-intx.h vt_scatter.h vt_land.h vt_submit.h vt_worker.h | $(BUILD)
 	$(CC) $(CFLAGS) -Wno-unused-parameter -fPIC -shared $(QDP_INC) $(VFU_INC) $(VA_CFLAGS) $(PLUGIN_LAVC_CFLAGS) \
-	    -o $@ apple-videotoolbox.c $(AW_CORE) vt_submit.c vt_worker.c $(BACKEND) vtpv_nvdec.c $(PLUGIN_LAVC_SRC) $(VA_LIBS) $(if $(PLUGIN_LAVC_SRC),$(LAVC_LIBS)) -ldl
+	    -o $@ apple-videotoolbox.c $(AW_CORE) vt_submit.c vt_worker.c $(BACKEND) vtpv_nvdec.c $(BRIDGE_DIR)/pvg-intx.c $(PLUGIN_LAVC_SRC) $(VA_LIBS) $(if $(PLUGIN_LAVC_SRC),$(LAVC_LIBS)) -ldl
+
+# PCI identity + interrupt modes as a vfio-user client sees them (the real .so on a real libvfio-user context; no
+# VM, no GPU: render_node points nowhere).  Needs the top-level vendored libvfio-user (make vfu).
+VFU_LIBDIR := ../../build/vfu/lib
+$(BUILD)/test-vt-identity: test_vt_identity.c ../uniq-vgpu/vfu_mini_client.h $(BUILD)/apple-videotoolbox.so | $(BUILD)
+	$(CC) $(CFLAGS) $(QDP_INC) $(VFU_INC) -o $@ test_vt_identity.c -L$(VFU_LIBDIR) -lvfio-user \
+	    -Wl,-rpath,$(abspath $(VFU_LIBDIR)) -lpthread -ldl
 
 $(BUILD)/test-plugin: test_plugin.c $(BUILD)/apple-videotoolbox.so | $(BUILD)
 	$(CC) $(CFLAGS) $(QDP_INC) $(VFU_INC) -o $@ test_plugin.c -ldl
@@ -210,6 +217,8 @@ ifeq ($(HAVE_VA),1)
 	 if [ $$rc = 77 ]; then echo "(milestone test skipped: no usable render node)"; \
 	 elif [ $$rc != 0 ]; then exit $$rc; fi
 	@echo "== plugin ABI smoke =="; $(BUILD)/test-plugin $(BUILD)/apple-videotoolbox.so
+	@$(MAKE) --no-print-directory $(BUILD)/test-vt-identity
+	@echo "== PCI identity + irq modes (106b:1a03 for arm64, INTx) =="; $(BUILD)/test-vt-identity $(BUILD)/apple-videotoolbox.so
 ifeq ($(HAVE_LAVC),1)
 	@$(MAKE) --no-print-directory $(BUILD)/test-lavc $(BUILD)/test-aw-replay-lavc $(BUILD)/test-lavc-land \
 	   $(BUILD)/test-lavc-payload $(BUILD)/gva-payload $(BUILD)/test-vt-land-lavc $(BUILD)/test-lavc-hevc10

@@ -81,6 +81,19 @@ test's readback of it.
 - **D-GVA-2 (capability advertisement):** see above — `vtpv_caps` in the
   QUERY_CAPS completion.
 
+## PCI identity and interrupt line (plugin args, 2026-11-28)
+
+| Arg | Default | Meaning |
+|---|---|---|
+| `vendor-id=`, `device-id=` | `0x1b36`, `0xeee2` | PCI identity (subsystem the same). The x86 eee1 guest kext matches 0xEEE21B36. The stock **arm64e** `AppleVideoToolboxParavirtualization` (25G83) binds Apple's `AppleVirtIOPCITransport` on `IOPCIPrimaryMatch 0x1a03106b`, so arm64 guests take `vendor-id=0x106b,device-id=0x1a03` |
+| `irq=` | `msix` | `msix`: MSI-X, 3 vectors (unchanged). `intx`: INTA# only, no MSI-X capability. `auto`: both; MSI-X once the guest enables it, INTx otherwise. INTx is virtio's: the ISR status bit (0x1 queue, 0x2 config) plus the level line of `../uniq-vgpu/pvg-intx.h`. The driver's ISR read (read-to-clear, BAR0 0x1000) is the acknowledgement |
+
+Test: `build/test-vt-identity` (in `make test`). The real `.so` runs on a real libvfio-user context with an
+in-process vfio-user client. The test checks identity and capabilities per mode, the eventfd types each mode accepts,
+the ISR reads and arg refusals; it needs no GPU. INTx assert/deassert itself is the shared state machine,
+`make uniq-vgpu-intx-test`. A video INTx raise end to end (through the virtqueues) is not covered yet: the E1-4 runtime
+check.
+
 ## Build & test
 
 Host dependency: `libva-dev` (VA-API headers; the runtime `libva2` +

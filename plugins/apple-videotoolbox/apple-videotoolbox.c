@@ -66,6 +66,7 @@
 #define VT_LAVC_CLOSE(d) do { (void)(d); } while (0)
 #endif
 #include "../uniq-vgpu/pvg_mapper_bridge.h" /* increment 2: resolve mapping_id -> gpa-ranges */
+#include "../uniq-vgpu/pvg-intx.h"        /* irq= intx|auto: the level INTx line shared with uniq-vgpu */
 
 /* ---- device constants ---------------------------------------------- */
 
@@ -207,6 +208,13 @@ typedef struct vt_dev {
     pthread_rwlock_t mem;
     int              quiesced;     /* host main loop only */
     int              tearing_down; /* vt_teardown: no queue-1 emission, no interrupt (d->m) */
+    /* PCI identity (vendor-id=/device-id=; arm64 guests: Apple's 106b:1a03, which the stock arm64e
+     * AppleVideoToolboxParavirtualization transport matches) and the interrupt line (irq= msix|intx|auto,
+     * analysis/20261128-ARM64-PORT-SCOPE.md §9.6 (c)).  line/isr are under d->m. */
+    uint16_t         pci_vendor, pci_device;
+    int              irq_mode;     /* PVG_IRQ_MODE_MSI = MSI-X only (default), _INTX, _AUTO */
+    PvgIrqLine       line;
+    uint8_t          isr;          /* virtio ISR status: bit 0 queue, bit 1 config (INTx only) */
     aw_session_cfg   engine_cfg;   /* setup only: the engine's configuration */
 } vt_dev;
 
@@ -287,6 +295,13 @@ static void *vt_scatter_map(void *ctx, uint64_t gpa, uint64_t len) { return vt_m
 static void vt_raise(vt_dev *d, unsigned queue)
 {
     if (d->tearing_down) return;     /* VT-DECODE-WORKER: no host service at teardown */
+    if (pvg_irq_line_is_intx(&d->line, NULL)) {
+        /* virtio over INTx: the ISR status bit, then the level line (re-asserted after the client's UNMASK while
+         * a raise is unacknowledged); the driver acknowledges by reading ISR (read-to-clear). */
+        d->isr |= queue < VT_QUEUES ? 0x1u : 0x2u;
+        (void)pvg_irq_line_raise(&d->line, 0, NULL);
+        return;
+    }
     uint16_t vec = queue < VT_QUEUES ? d->queue_msix[queue] : d->msix_config;
     if (d->host && d->host->irq_trigger && vec != VT_MSIX_NO_VECTOR)
         (void)d->host->irq_trigger(d->host->host, vec);
@@ -831,7 +846,7 @@ static void vt_common_cfg(vt_dev *d, uint64_t off, char *buf, size_t n, bool wr)
         break;
     case 0x10: if (wr) d->msix_config = (uint16_t)v; else RD(d->msix_config); break;
     case 0x12: RD(VT_QUEUES); break;                       /* num_queues (RO) */
-    case 0x14: if (wr) { d->device_status = (uint8_t)v; if (!v) d->needs_reset = 0; } else RD(d->device_status); break;
+    case 0x14: if (wr) { d->device_status = (uint8_t)v; if (!v) { d->needs_reset = 0; d->isr = 0; } } else RD(d->device_status); break;
     case 0x15: RD(d->config_generation); break;            /* config_generation (RO) */
     case 0x16: if (wr) { if (v < VT_QUEUES) d->queue_select = (uint16_t)v; } else RD(d->queue_select); break;
     case 0x18: if (wr && vq) { if (v && v <= VTPV_VQ_MAX_SIZE) vq->size = (uint16_t)v; } else RD(vq ? vq->size : 0); break;
@@ -874,7 +889,17 @@ static ssize_t vt_bar0(vfu_ctx_t *ctx, char *buf, size_t count, loff_t off,
     if (off >= VT_CFG_COMMON && off < VT_CFG_COMMON + 0x40) {
         vt_common_cfg(d, off - VT_CFG_COMMON, buf, count, is_write);
     } else if (off >= VT_CFG_ISR && off < VT_CFG_ISR + 0x100) {
-        if (!is_write) st(buf, count, 0); /* ISR status: read-to-clear, MSI-X in use */
+        if (!is_write) {
+            /* ISR status, read-to-clear.  Under MSI-X it stays 0; under INTx the read is the acknowledgement,
+             * recorded before it is served (pvg-intx.h). */
+            uint8_t v = 0;
+            if (d->irq_mode != PVG_IRQ_MODE_MSI) {
+                pvg_intx_ack(&d->line.intx, PVG_INTX_ACK_GPU);
+                v = d->isr;
+                d->isr = 0;
+            }
+            st(buf, count, v);
+        }
     } else if (off >= VT_CFG_NOTIFY && off < VT_CFG_NOTIFY + VT_QUEUES * 4) {
         if (is_write) {
             uint16_t qn = (uint16_t)((off - VT_CFG_NOTIFY) / 4);
@@ -908,10 +933,11 @@ static ssize_t vt_bar2(vfu_ctx_t *ctx, char *buf, size_t count, loff_t off,
 
 /* Add the MSI-X capability and the virtio-modern config-structure capabilities
  * so a virtio-modern guest driver can locate the config windows and MSI-X. */
-static int vt_add_caps(vfu_ctx_t *ctx)
+static int vt_add_caps(vfu_ctx_t *ctx, int with_msix)
 {
     struct msixcap msix;
     memset(&msix, 0, sizeof msix);
+    if (!with_msix) goto virtio_caps;
     msix.hdr.id = PCI_CAP_ID_MSIX;
     msix.mxc.ts = VT_MSIX_VECTORS - 1;        /* table size - 1                  */
     msix.mtab.tbir = VT_MSIX_BAR;
@@ -920,6 +946,7 @@ static int vt_add_caps(vfu_ctx_t *ctx)
     msix.mpba.pbao = VT_MSIX_PBA_OFF >> 3;
     if (vfu_pci_add_capability(ctx, 0, 0, &msix) < 0) return -1;
 
+virtio_caps:;
     struct virtio_pci_cap c;
 #define VCAP(type, boff, blen) do {                                            \
         memset(&c, 0, sizeof c);                                              \
@@ -997,6 +1024,62 @@ static int vt_copy_frame_locked(void *ctx, const vtpv_decoded_frame *f, const aw
 /* After a worker completion (under d->m): deliver what it emitted on queue 1. */
 static void vt_worker_post(void *ctx) { vt_flush_pending((vt_dev *)ctx); }
 
+/* The client's INTx MASK/UNMASK (libvfio-user IRQ-state callback, host vfio-user thread).  UNMASK = the client's
+ * EOI: the line re-asserts while a raise is unacknowledged (pvg-intx.h). */
+static void vt_intx_state_cb(vfu_ctx_t *ctx, uint32_t start, uint32_t count, bool mask)
+{
+    vt_dev *d = g_dev;
+    (void)ctx; (void)start; (void)count;
+    if (!d) return;
+    pthread_mutex_lock(&d->m);
+    (void)pvg_irq_line_mask(&d->line, mask, !d->tearing_down, NULL);
+    pthread_mutex_unlock(&d->m);
+}
+
+/* One `key=value` of the plugin args (comma separated), copied into out; false when absent. */
+static bool vt_arg(const char *args, const char *key, char *out, size_t cap)
+{
+    size_t kl = strlen(key);
+    for (const char *p = args; p && *p; ) {
+        const char *end = strchr(p, ',');
+        size_t n = end ? (size_t)(end - p) : strlen(p);
+        if (n > kl && !strncmp(p, key, kl) && p[kl] == '=') {
+            size_t vl = n - kl - 1;
+            if (vl >= cap) vl = cap - 1;
+            memcpy(out, p + kl + 1, vl);
+            out[vl] = 0;
+            return true;
+        }
+        p = end ? end + 1 : NULL;
+    }
+    return false;
+}
+
+static int vt_parse_identity_irq(vt_dev *d, const char *args)
+{
+    char v[32];
+    d->pci_vendor = VT_PCI_VENDOR;
+    d->pci_device = VT_PCI_DEVICE;
+    d->irq_mode = PVG_IRQ_MODE_MSI;
+    if (vt_arg(args, "vendor-id", v, sizeof v)) {
+        char *e; unsigned long x = strtoul(v, &e, 0);
+        if (*e || x == 0 || x > 0xfffe) return -EINVAL;
+        d->pci_vendor = (uint16_t)x;
+    }
+    if (vt_arg(args, "device-id", v, sizeof v)) {
+        char *e; unsigned long x = strtoul(v, &e, 0);
+        if (*e || x > 0xffff) return -EINVAL;
+        d->pci_device = (uint16_t)x;
+    }
+    if (vt_arg(args, "irq", v, sizeof v)) {
+        if (!strcmp(v, "msix")) d->irq_mode = PVG_IRQ_MODE_MSI;
+        else if (!strcmp(v, "intx")) d->irq_mode = PVG_IRQ_MODE_INTX;
+        else if (!strcmp(v, "auto")) d->irq_mode = PVG_IRQ_MODE_AUTO;
+        else return -EINVAL;
+    }
+    return 0;
+}
+
 static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
                     void **priv)
 {
@@ -1026,6 +1109,12 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
     d->host = env->host_ops;
     pthread_mutex_init(&d->m, NULL);
     d->device_features = VT_DEVICE_FEATURES;
+    if (vt_parse_identity_irq(d, args) < 0) {
+        vt_log(d, 1, "bad vendor-id=/device-id=/irq= in the plugin args");
+        pthread_mutex_destroy(&d->m);
+        free(d);
+        return -EINVAL;
+    }
 
     /* Pick a decode backend. With libavcodec (VTPV_HAVE_LAVC) the stream core
      * is used: CUDA/NVDEC on an NVIDIA GPU, else VA-API on the DRM render node;
@@ -1151,12 +1240,12 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
     /* PCI identity the guest kext matches (IOPCIPrimaryMatch 0xEEE21B36) */
     if (vfu_pci_init(ctx, VFU_PCI_TYPE_EXPRESS, PCI_HEADER_TYPE_NORMAL, 0) < 0)
         goto fail;
-    vfu_pci_set_id(ctx, VT_PCI_VENDOR, VT_PCI_DEVICE, VT_PCI_VENDOR, VT_PCI_DEVICE);
+    vfu_pci_set_id(ctx, d->pci_vendor, d->pci_device, d->pci_vendor, d->pci_device);
     vfu_pci_set_class(ctx, VT_PCI_CLASS, VT_PCI_SUBCLASS, 0x00);
 
     /* MSI-X + the virtio-modern PCI capability list (so the guest driver can find
      * the config windows). Must be added before the device is realized. */
-    if (vt_add_caps(ctx) < 0)
+    if (vt_add_caps(ctx, d->irq_mode != PVG_IRQ_MODE_INTX) < 0)
         goto fail;
 
     /* BAR0: virtio-modern config window (common/ISR/notify/device). */
@@ -1170,9 +1259,15 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
         goto fail;
 
     /* MSI-X: one vector per virtqueue plus one for config. */
-    if (vfu_setup_device_nr_irqs(ctx, VFU_DEV_MSIX_IRQ, VT_MSIX_VECTORS) < 0)
+    if (d->irq_mode != PVG_IRQ_MODE_INTX &&
+        vfu_setup_device_nr_irqs(ctx, VFU_DEV_MSIX_IRQ, VT_MSIX_VECTORS) < 0)
         goto fail;
     if (vfu_setup_device_nr_irqs(ctx, VFU_DEV_INTX_IRQ, 1) < 0)
+        goto fail;
+    /* irq=intx|auto: the INTx line is level (pvg-intx.h); the client's MASK/UNMASK reach vt_intx_state_cb */
+    pvg_irq_line_init(&d->line, d->irq_mode, ctx, d->host->irq_trigger, d->host->host);
+    if (d->irq_mode != PVG_IRQ_MODE_MSI &&
+        vfu_setup_irq_state_callback(ctx, VFU_DEV_INTX_IRQ, vt_intx_state_cb) < 0)
         goto fail;
 
     d->queues[0].size = VT_QUEUE_MAX; /* submission */
@@ -1198,8 +1293,9 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
 
     g_dev = d;
     *priv = d;
-    vt_log(d, 2, "apple-videotoolbox %04x:%04x up (%u virtqueues, %s)",
-           VT_PCI_VENDOR, VT_PCI_DEVICE, VT_QUEUES,
+    vt_log(d, 2, "apple-videotoolbox %04x:%04x up (%u virtqueues, irq=%s, %s)",
+           d->pci_vendor, d->pci_device, VT_QUEUES,
+           d->irq_mode == PVG_IRQ_MODE_INTX ? "intx" : d->irq_mode == PVG_IRQ_MODE_AUTO ? "auto" : "msix",
            d->lavc ? "stream decode (libavcodec)" : d->nvdec ? "NVDEC intra decode"
                     : d->va ? "VA-API intra decode" : d->be ? "stub decode" : "no backend");
     return 0;
@@ -1250,6 +1346,8 @@ static int vt_reset(void *priv, vfu_reset_type_t type)
     d->queue_select = 0;
     d->needs_reset = 0;
     d->msix_config = VT_MSIX_NO_VECTOR;
+    d->isr = 0;
+    pvg_irq_line_reset(&d->line);       /* INTx starts again from the client's enable */
     d->pend_head = d->pend_count = 0;   /* drop any undelivered host->guest backlog */
     if (d->worker_on) vt_worker_discard(&d->worker); /* quiesced: no job is running */
     for (i = 0; i < VT_QUEUES; i++) {
