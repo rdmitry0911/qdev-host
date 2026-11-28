@@ -845,9 +845,28 @@ def validate_device(dev_id: str, plugin: str, args: str, bus: str, kms: str | No
             raise QdevError(f"{plugin} has no KMS output: QEMU's display shows it")
         vug_options({"plugin": plugin, "args": args})
 
+def guest_arch(cfg: dict[str, str]) -> str:
+    """The VM's architecture: its "arch" option, else the node's own (PVE's default)."""
+    arch = cfg.get("arch", "")
+    if arch:
+        return arch
+    return "aarch64" if os.uname().machine in ("aarch64", "arm64") else "x86_64"
+
 def is_q35(cfg: dict[str, str]) -> bool:
     first = cfg.get("machine", "").split(",")[0]
     return first == "q35" or first.startswith("pc-q35")
+
+def is_arm_virt(cfg: dict[str, str]) -> bool:
+    """An aarch64 VM on QEMU's virt machine (PVE's only arm64 machine, also when unset)."""
+    first = cfg.get("machine", "").split(",")[0]
+    return guest_arch(cfg) == "aarch64" and (first in ("", "virt") or first.startswith("virt-"))
+
+def is_pcie_machine(cfg: dict[str, str]) -> bool:
+    """A machine whose root bus takes PCIe root ports with native hot-plug: q35, arm64 virt."""
+    return is_q35(cfg) or is_arm_virt(cfg)
+
+def machine_text(cfg: dict[str, str]) -> str:
+    return cfg.get("machine") or ("virt" if guest_arch(cfg) == "aarch64" else "i440fx")
 
 # -------------------------------------------------------------- cluster
 def local_node() -> str:
@@ -1123,8 +1142,9 @@ def add_device(vmid: int, dev_id: str, plugin: str, args: str = "", bus: str = "
     if find_device(conf, dev_id):
         raise QdevError(f"device {dev_id} already defined for VM {vmid}")
     cfg = vm_config(vmid)
-    if not is_q35(cfg):
-        raise QdevError(f"VM {vmid} is not a q35 machine (machine: {cfg.get('machine', 'i440fx')}); PCIe hot-plug needs q35")
+    if not is_pcie_machine(cfg):
+        raise QdevError(f"VM {vmid} is not a q35 or arm64 virt machine (machine: {machine_text(cfg)}); "
+                        "PCIe hot-plug needs one")
     dev = {"id": dev_id, "plugin": plugin, "args": args or "", "bus": bus, "display": bool(display),
            "kms": kms or None, "persistent": bool(persistent), "extra": extra or []}
     if plugin_kind(plugin) == "tb":
@@ -1363,7 +1383,7 @@ def describe_vm(vmid: int) -> dict:
                         "kind": kind, "state": state, "process_active": active, "pci": present.get(d["id"]),
                         "needs_restart": bool(running and restart),
                         "warning": mismatch if kind == "vhost-user-gpu" else None})
-    return {"vmid": vmid, "node": me, "local": True, "running": running, "q35": is_q35(cfg),
+    return {"vmid": vmid, "node": me, "local": True, "running": running, "q35": is_pcie_machine(cfg),
             "machine": cfg.get("machine", ""), "port_addr": conf.get("port_addr", "0x08"),
             "port_in_args": f"id={PORT_ID}" in cfg.get("args", ""), "port_in_vm": PORT_ID in buses,
             "hookscript": cfg.get("hookscript"), "devices": devices, "tb": tb_info,

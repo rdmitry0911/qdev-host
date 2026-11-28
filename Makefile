@@ -11,16 +11,18 @@
 VFU_SRC    := third_party/libvfio-user
 VFU_LOCAL  := $(CURDIR)/build/vfu
 VFU_PREFIX ?= $(VFU_LOCAL)
-VFU_LIBDIR := $(firstword $(wildcard $(VFU_PREFIX)/lib/x86_64-linux-gnu) $(VFU_PREFIX)/lib)
+VFU_LIBDIR := $(firstword $(wildcard $(VFU_PREFIX)/lib/*-linux-gnu) $(VFU_PREFIX)/lib)
 VFU_CFLAGS := -I$(VFU_PREFIX)/include/vfio-user
 VFU_LIBS   := -L$(VFU_LIBDIR) -lvfio-user -Wl,-rpath,$(if $(PRIVLIB),$(PRIVLIB),$(VFU_LIBDIR))
 ifeq ($(VFU_PREFIX),$(VFU_LOCAL))
 VFU_DEP    := $(VFU_LOCAL)/lib/libvfio-user.so.0
 endif
-GLIB_CFLAGS := $(shell pkg-config --cflags gio-unix-2.0 glib-2.0)
-GLIB_LIBS   := $(shell pkg-config --libs gio-unix-2.0 glib-2.0)
-DRM_CFLAGS  := $(shell pkg-config --cflags libdrm)
-DRM_LIBS    := $(shell pkg-config --libs libdrm)
+# PKG_CONFIG: the target's pkg-config when cross-building (debian/rules passes it)
+PKG_CONFIG ?= pkg-config
+GLIB_CFLAGS := $(shell $(PKG_CONFIG) --cflags gio-unix-2.0 glib-2.0)
+GLIB_LIBS   := $(shell $(PKG_CONFIG) --libs gio-unix-2.0 glib-2.0)
+DRM_CFLAGS  := $(shell $(PKG_CONFIG) --cflags libdrm)
+DRM_LIBS    := $(shell $(PKG_CONFIG) --libs libdrm)
 CFLAGS ?= -O2 -g -Wall -Wno-unused-parameter
 PLUGINS := plugins/tb-vga/tb-vga.so plugins/test-v2/test-v2.so plugins/test-v2/test-v2-reload.so
 
@@ -37,8 +39,8 @@ UNIQ_VGPU_SRC := $(addprefix plugins/uniq-vgpu/,uniq-vgpu.c pvg-memory.c pvg-pro
 UNIQ_VGPU_HDR := plugins/uniq-vgpu/pvg.h plugins/uniq-vgpu/pvg-process-vm.h \
                  plugins/uniq-vgpu/pvg_backing.h plugins/uniq-vgpu/pvg_mapper_bridge.h \
                  $(wildcard plugins/uniq-vgpu/qmu-private/*.h)
-GLIB_ONLY_CFLAGS = $(shell pkg-config --cflags glib-2.0)
-GLIB_ONLY_LIBS   = $(shell pkg-config --libs glib-2.0)
+GLIB_ONLY_CFLAGS = $(shell $(PKG_CONFIG) --cflags glib-2.0)
+GLIB_ONLY_LIBS   = $(shell $(PKG_CONFIG) --libs glib-2.0)
 ifneq ($(QMETAL_INCLUDE),)
 PLUGINS += plugins/uniq-vgpu/uniq-vgpu.so
 endif
@@ -55,16 +57,16 @@ VT_SRC := $(addprefix $(VT_DIR)/,apple-videotoolbox.c vtpv_vaapi.c vtpv_nvdec.c 
 VT_HDR := $(addprefix $(VT_DIR)/,vtpv_proto.h vtpv_vaapi.h vtpv_nvdec.h vtpv_h264.h vtpv_virtq.h \
           aw_wire.h aw_sbuf.h aw_bplist.h aw_session.h vt_scatter.h vt_land.h vt_submit.h vt_worker.h) \
           plugins/uniq-vgpu/pvg_mapper_bridge.h
-VT_VA_CFLAGS := $(shell pkg-config --cflags libva libva-drm 2>/dev/null)
-VT_VA_LIBS   := $(shell pkg-config --libs libva libva-drm 2>/dev/null)
+VT_VA_CFLAGS := $(shell $(PKG_CONFIG) --cflags libva libva-drm 2>/dev/null)
+VT_VA_LIBS   := $(shell $(PKG_CONFIG) --libs libva libva-drm 2>/dev/null)
 # The stream decode core (vtpv_lavc: libavcodec + VA-API/CUDA hwaccel, keeps the
 # DPB across frames) is built in when libavcodec is found; without it the device
 # falls back to the legacy intra-only backends. VT_LAVC=0 forces it off.
-VT_LAVC_LIBS := $(if $(filter 0,$(VT_LAVC)),,$(shell pkg-config --libs libavcodec libavutil 2>/dev/null))
+VT_LAVC_LIBS := $(if $(filter 0,$(VT_LAVC)),,$(shell $(PKG_CONFIG) --libs libavcodec libavutil 2>/dev/null))
 ifneq ($(VT_LAVC_LIBS),)
 VT_SRC += $(VT_DIR)/vtpv_lavc.c
 VT_HDR += $(VT_DIR)/vtpv_lavc.h
-VT_VA_CFLAGS += -DVTPV_HAVE_LAVC $(shell pkg-config --cflags libavcodec libavutil 2>/dev/null)
+VT_VA_CFLAGS += -DVTPV_HAVE_LAVC $(shell $(PKG_CONFIG) --cflags libavcodec libavutil 2>/dev/null)
 VT_VA_LIBS += $(VT_LAVC_LIBS)
 endif
 ifneq ($(VIDEOTOOLBOX),)
@@ -78,7 +80,7 @@ vfu: $(VFU_LOCAL)/lib/libvfio-user.so.0
 # LD_PRELOAD library for QEMU's vhost-user-gpu (the virgl-gpu plugin's process):
 # works around two faults of it (pve/vugpu-guard.c); needs the virglrenderer header.
 pve/libqdev-vugpu-guard.so: pve/vugpu-guard.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -shared $(GLIB_ONLY_CFLAGS) $(shell pkg-config --cflags virglrenderer) -o $@ $< $(LDFLAGS) $(GLIB_ONLY_LIBS) -ldl
+	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -shared $(GLIB_ONLY_CFLAGS) $(shell $(PKG_CONFIG) --cflags virglrenderer) -o $@ $< $(LDFLAGS) $(GLIB_ONLY_LIBS) -ldl
 $(VFU_LOCAL)/lib/libvfio-user.so.0: $(wildcard $(VFU_SRC)/lib/*.[ch] $(VFU_SRC)/include/*.h $(VFU_SRC)/include/*/*.h)
 	[ -f build/vfu-build/build.ninja ] || meson setup build/vfu-build $(VFU_SRC) --prefix=$(VFU_LOCAL) --libdir=lib -Dbuildtype=release
 	ninja -C build/vfu-build install >/dev/null

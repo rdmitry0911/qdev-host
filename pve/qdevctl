@@ -114,8 +114,8 @@ def cmd_set(a):
 
 def cmd_tb(a):
     conf = Q.load_conf(a.vmid)
-    if not Q.is_q35(Q.vm_config(a.vmid)):
-        raise Q.QdevError(f"VM {a.vmid} is not a q35 machine")
+    if not Q.is_pcie_machine(Q.vm_config(a.vmid)):
+        raise Q.QdevError(f"VM {a.vmid} is not a q35 or arm64 virt machine")
     for key in ("io_reserve", "mem_reserve", "pref64_reserve"):
         value = getattr(a, key)
         if value is not None:
@@ -287,7 +287,7 @@ def main():
     s.add_argument("--acpi", choices=["auto"] + sorted(TB.ACPI_MODES),
                    help="ACPI properties of the ports (auto: none on macOS ports with slot power, else thunderbolt)")
     s.add_argument("--hotplug", choices=TB.HOTPLUG_MODES,
-                   help="PCIe hot-plug: native (needed by macOS), acpi (QEMU's q35 default) or auto (native for macOS guests)")
+                   help="PCIe hot-plug: native (needed by macOS), acpi (QEMU's q35 default) or auto (native for macOS guests; arm64 virt is always native)")
     s.add_argument("--power-controller", choices=("on", "off", "default"),
                    help="slot power controller of the ports (QEMU default on; macOS: on = hot-plug and "
                         "hot-unplug through the slot power handshake, off = hot-plug only)")

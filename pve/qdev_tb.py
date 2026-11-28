@@ -345,8 +345,15 @@ def xhci_check(args: str) -> int:
 def _opts(d: dict) -> str:
     return ",".join(f"{k}={v}" for k, v in d.items())
 
+MACOS_TAG = "macos"
+
 def macos_guest(vmcfg: dict) -> bool:
-    return "isa-applesmc" in (vmcfg or {}).get("args", "")
+    """A macOS guest: isa-applesmc in args (x86), or the VM's PVE tag "macos" (any
+    architecture; arm64 macOS guests have no SMC device)."""
+    cfg = vmcfg or {}
+    if "isa-applesmc" in cfg.get("args", ""):
+        return True
+    return MACOS_TAG in re.split(r"[;,\s]+", str(cfg.get("tags", "")).lower())
 
 def power_controller(conf: dict, vmcfg: dict | None) -> str | None:
     """on/off for the ports' slot power controller, None for QEMU's default (on).
@@ -511,17 +518,25 @@ NATIVE_HOTPLUG_PATTERN = r"-global\s+ICH9-LPC\.acpi-pci-hotplug-with-bridge-supp
 HOTPLUG_MODES = ("auto", "native", "acpi")
 
 def hotplug_mode(conf: dict, vmcfg: dict) -> str:
-    """native or acpi; auto = native for a macOS guest (isa-applesmc in args) or
-    when the VM's args already switch ACPI PCI hot-plug off."""
+    """native or acpi; auto = native for a macOS guest (isa-applesmc in args or tag
+    macos) or when the VM's args already switch ACPI PCI hot-plug off.  arm64 virt
+    is always native: its ACPI PCI hot-plug (acpi-ged) is off by default."""
+    if Q.is_arm_virt(vmcfg):
+        return "native"
     mode = conf.get("tb", {}).get("hotplug", "auto")
     if mode in ("native", "acpi"):
         return mode
     args = vmcfg.get("args", "")
     return "native" if (macos_guest(vmcfg) or Q._find(args, NATIVE_HOTPLUG_PATTERN)) else "acpi"
 
+def needs_native_global(conf: dict, vmcfg: dict) -> bool:
+    """q35's ACPI PCI hot-plug is switched off by a global on its ICH9-LPC; arm64 virt
+    has neither (native already), so its args carry no global."""
+    return hotplug_mode(conf, vmcfg) == "native" and not Q.is_arm_virt(vmcfg)
+
 def arg_groups(vmid: int, conf: dict | None = None, vmcfg: dict | None = None) -> str:
     groups = f"-readconfig {cfg_path(vmid)} -acpitable file={aml_path(vmid)}"
-    if conf is not None and vmcfg is not None and hotplug_mode(conf, vmcfg) == "native":
+    if conf is not None and vmcfg is not None and needs_native_global(conf, vmcfg):
         groups += " " + NATIVE_HOTPLUG_GLOBAL
     return groups
 
@@ -533,7 +548,7 @@ def in_args(vmid: int, vmcfg: dict, conf: dict | None = None) -> bool:
     if not all(Q._find(args, p) for p in arg_patterns(vmid)):
         return False
     if conf is not None:
-        return (hotplug_mode(conf, vmcfg) == "native") == bool(Q._find(args, NATIVE_HOTPLUG_PATTERN))
+        return needs_native_global(conf, vmcfg) == bool(Q._find(args, NATIVE_HOTPLUG_PATTERN))
     return True
 
 def ensure_args(vmid: int, vmcfg: dict, conf: dict | None = None) -> bool:

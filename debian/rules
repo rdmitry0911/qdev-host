@@ -1,6 +1,11 @@
 #!/usr/bin/make -f
 # SPDX-License-Identifier: GPL-2.0-or-later
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+include /usr/share/dpkg/architecture.mk
+include /usr/share/dpkg/buildtools.mk
+ifneq ($(DEB_BUILD_GNU_TYPE),$(DEB_HOST_GNU_TYPE))
+VFU_CROSS := --cross-file $(CURDIR)/debian/meson-cross.ini
+endif
 VFU_STAGE := $(CURDIR)/debian/vfu-stage
 PRIVLIB := /usr/lib/qdev-host
 
@@ -8,12 +13,15 @@ PRIVLIB := /usr/lib/qdev-host
 	dh $@
 
 override_dh_auto_configure:
-	meson setup debian/vfu-build third_party/libvfio-user --prefix=/usr --libdir=lib -Dbuildtype=release
+ifneq ($(VFU_CROSS),)
+	meson env2mfile --cross --debarch $(DEB_HOST_ARCH) -o debian/meson-cross.ini
+endif
+	meson setup debian/vfu-build third_party/libvfio-user --prefix=/usr --libdir=lib -Dbuildtype=release $(VFU_CROSS)
 
 override_dh_auto_build:
 	ninja -C debian/vfu-build
 	DESTDIR=$(VFU_STAGE) ninja -C debian/vfu-build install
-	$(MAKE) VFU_PREFIX=$(VFU_STAGE)/usr PRIVLIB=$(PRIVLIB) qdev-host plugins/tb-vga/tb-vga.so tools/display1-input-bench pve/libqdev-vugpu-guard.so
+	$(MAKE) CC=$(CC) PKG_CONFIG=$(PKG_CONFIG) VFU_PREFIX=$(VFU_STAGE)/usr PRIVLIB=$(PRIVLIB) qdev-host plugins/tb-vga/tb-vga.so tools/display1-input-bench pve/libqdev-vugpu-guard.so
 
 override_dh_auto_install:
 	install -D -m 755 qdev-host debian/qdev-host/usr/bin/qdev-host
@@ -43,7 +51,7 @@ override_dh_auto_install:
 	install -D -m 644 pve/README.md debian/qdev-host-pve/usr/share/doc/qdev-host-pve/README.md
 
 override_dh_auto_clean:
-	rm -rf debian/vfu-build debian/vfu-stage
+	rm -rf debian/vfu-build debian/vfu-stage debian/meson-cross.ini
 	$(MAKE) clean || true
 
 override_dh_auto_test:

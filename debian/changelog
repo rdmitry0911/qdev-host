@@ -1,3 +1,16 @@
+qdev-host (0.6.6) unstable; urgency=medium
+
+  * arm64: qdev-host is built for arm64 too (PVE 9 on aarch64); the build
+    cross-compiles (dpkg-buildpackage -a arm64).
+  * arm64 VMs on QEMU's virt machine take qdev-host devices and the TB bus
+    like q35 ones. Their PCIe hot-plug is always native and their args carry
+    no ICH9-LPC global (virt has no ACPI PCI hot-plug unless asked for).
+  * A macOS guest is also recognised by the VM's PVE tag "macos" (arm64
+    macOS guests have no isa-applesmc): native hot-plug, the slot power
+    handshake and QEMU's own port windows, as for x86 macOS guests.
+
+ -- Dmitry R <rdmitry0911@gmail.com>  Sat, 28 Nov 2026 12:00:00 +0200
+
 qdev-host (0.6.5) unstable; urgency=medium
 
   * Adding a plugin device (v-aux, v-airport, ...) to a VM that has a VirGL

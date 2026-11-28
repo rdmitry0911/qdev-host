@@ -12,13 +12,13 @@ Build-Depends: debhelper-compat (= 13),
  libvirglrenderer-dev,
  libjson-c-dev,
  libcmocka-dev,
- python3
+ python3:native
 Standards-Version: 4.7.0
 Rules-Requires-Root: no
 Homepage: https://github.com/rdmitry0911/qdev-host
 
 Package: qdev-host
-Architecture: amd64
+Architecture: amd64 arm64
 Depends: ${shlibs:Depends}, ${misc:Depends}
 Description: out-of-process PCI devices for stock QEMU (vfio-user) with Display1 export
  qdev-host runs a device model as a separate process and attaches it to an
