@@ -1,3 +1,16 @@
+qdev-host (0.6.7) unstable; urgency=medium
+
+  * arm64 virt VMs: the TB bus goes into args without -acpitable, an option
+    QEMU has on x86 targets only (0.6.6 VMs did not start); qdevctl takes
+    args that still carry it as out of date and rewrites them.
+  * macOS guests on arm64 virt: the TB ports have no slot power controller
+    by default (power-controller off). macOS there never enables the ports'
+    hot-plug interrupts, so the slot power handshake cannot run; devices
+    come in at VM start, and one added to a running VM is seen after the
+    guest's next restart (the add says so).
+
+ -- Dmitry R <rdmitry0911@gmail.com>  Sat, 28 Nov 2026 16:00:00 +0200
+
 qdev-host (0.6.6) unstable; urgency=medium
 
   * arm64: qdev-host is built for arm64 too (PVE 9 on aarch64); the build

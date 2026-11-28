@@ -1194,6 +1194,11 @@ def add_device(vmid: int, dev_id: str, plugin: str, args: str = "", bus: str = "
                     "share yet: stop and start the VM (the hookscript starts and attaches the device then)")
     elif vm_running(vmid):
         msgs.append(attach(vmid, dev))
+        if bus.startswith("qdev-tb") and is_arm_virt(cfg):
+            import qdev_tb
+            if qdev_tb.macos_guest(cfg):
+                msgs.append("note: macOS on arm64 does not take hot-plugged devices (it leaves its ports' hot-plug "
+                            "interrupts off): the guest sees this device after its next restart")
         if changed_port:
             msgs.append(f"note: root port {PORT_ID} was added to args; it appears at the next VM start" if bus == PORT_ID
                         else "note: the TB bus was added to the VM's args; it appears at the next VM start")

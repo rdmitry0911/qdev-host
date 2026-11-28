@@ -70,6 +70,8 @@ def acpi_mode(conf: dict, vmcfg: dict | None = None) -> str:
     """The ports' ACPI properties; auto (unset) = none on macOS ports with slot power
     (Thunderbolt ports there would need link reporting the handshake turns off),
     thunderbolt otherwise."""
+    if vmcfg is not None and Q.is_arm_virt(vmcfg):
+        return "none"   # QEMU takes -acpitable on x86 targets only
     mode = conf.get("tb", {}).get("acpi", "auto")
     if mode in ACPI_MODES:
         return mode
@@ -362,6 +364,10 @@ def power_controller(conf: dict, vmcfg: dict | None) -> str | None:
     value = conf.get("tb", {}).get("power-controller")
     if value in ("on", "off"):
         return value
+    if vmcfg is not None and macos_guest(vmcfg) and Q.is_arm_virt(vmcfg):
+        # macOS on arm64 virt (Ambrosia) never enables its ports' hot-plug interrupts
+        # (Slot Control stays 0x07C0): no handshake, devices come in at VM start
+        return "off"
     if (vmcfg is not None and macos_guest(vmcfg) and hotplug_mode(conf, vmcfg) == "native"
             and conf.get("tb", {}).get("acpi") == "thunderbolt"):
         return "off"    # Thunderbolt ports in macOS: the 0.6.1 hot-plug-only mode
@@ -535,7 +541,9 @@ def needs_native_global(conf: dict, vmcfg: dict) -> bool:
     return hotplug_mode(conf, vmcfg) == "native" and not Q.is_arm_virt(vmcfg)
 
 def arg_groups(vmid: int, conf: dict | None = None, vmcfg: dict | None = None) -> str:
-    groups = f"-readconfig {cfg_path(vmid)} -acpitable file={aml_path(vmid)}"
+    groups = f"-readconfig {cfg_path(vmid)}"
+    if not (vmcfg is not None and Q.is_arm_virt(vmcfg)):
+        groups += f" -acpitable file={aml_path(vmid)}"   # an x86-only QEMU option
     if conf is not None and vmcfg is not None and needs_native_global(conf, vmcfg):
         groups += " " + NATIVE_HOTPLUG_GLOBAL
     return groups
@@ -545,8 +553,11 @@ def arg_patterns(vmid: int) -> list[str]:
 
 def in_args(vmid: int, vmcfg: dict, conf: dict | None = None) -> bool:
     args = vmcfg.get("args", "")
-    if not all(Q._find(args, p) for p in arg_patterns(vmid)):
+    readconfig, acpitable = arg_patterns(vmid)
+    if not Q._find(args, readconfig):
         return False
+    if bool(Q._find(args, acpitable)) == Q.is_arm_virt(vmcfg):
+        return False    # x86 needs the ACPI table, arm64 virt must not have it
     if conf is not None:
         return needs_native_global(conf, vmcfg) == bool(Q._find(args, NATIVE_HOTPLUG_PATTERN))
     return True
