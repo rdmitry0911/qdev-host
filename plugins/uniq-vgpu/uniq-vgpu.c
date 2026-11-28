@@ -2909,6 +2909,23 @@ static int pvg_create_session(PvgState *s)
         pvg_log(s, "[uniq-vgpu-ml] guest pages: %u bytes (guest-page-shift=%u)\n",
                 1u << s->guest_page_shift, s->guest_page_shift);
 #endif
+#ifdef QMU_EXTENDED_CONFIG_HAS_ARM64_STOCK_FLAGS
+#if QMU_EXTENDED_ABI_VERSION < 5
+#error "arm64_stock_flags needs the version-5 qmu_extended ABI (the member sits in version 4's tail padding)"
+#endif
+    /* ARM64-PVG-CHANNEL-01: device id 0xeeee with 16 KiB guest pages is Apple's arm64e AppleParavirtGPU behind the
+     * uniqvgpu-arm-bridge kext.  Its child FIFOs are Exec 1 / Object 2 / Memory 3 and it defines its user tasks on the
+     * Memory FIFO, so QMetal dispatches child commands by opcode (the reference's one processFifo table).  x86 guests
+     * (the stock x86 driver and eee1) keep 0. */
+    if (s->pci_device_id == UNIQ_VGPU_ML_DEVICE_ID && s->guest_page_shift == 14) {
+        config.arm64_stock_flags = QMU_ARM64_STOCK_CHILD_DISPATCH_BY_OPCODE;
+        pvg_log(s, "[uniq-vgpu-ml] arm64 stock driver: child FIFO commands dispatched by opcode\n");
+    }
+#else
+    if (s->pci_device_id == UNIQ_VGPU_ML_DEVICE_ID && s->guest_page_shift == 14)
+        pvg_log(s, "[uniq-vgpu-ml] [WARN] arm64 stock driver with a QMetal header without arm64_stock_flags "
+                   "(ARM64-PVG-CHANNEL-01): user tasks on the Memory child FIFO are not served\n");
+#endif
 
     /* reference apple-gfx.m:45-49: three modes, mode 0 the primary one */
     config.mode_data[0] = (s->display_height << 16) | s->display_width;
