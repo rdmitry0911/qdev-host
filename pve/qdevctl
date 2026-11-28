@@ -189,6 +189,10 @@ def cmd_device_reload(a):
                              allow_unflushed=a.allow_unflushed):
         print(m)
 
+def cmd_migrate_args(a):
+    for line in Q.migrate_memory_args():
+        print(line)
+
 def cmd_hook(a):
     conf = Q.load_conf(a.vmid)
     rc = 0
@@ -206,15 +210,30 @@ def cmd_hook(a):
         except Q.QdevError as e:
             print(f"qdev-host: TB bus: {e}", file=sys.stderr)
             return 2
+        # qdev-host's shared memory: the memfd's size follows the VM's memory at every start
+        cfg = Q.vm_config(a.vmid)
+        if Q.has_qdev_mem(cfg.get("args", "")):
+            problem = Q.shared_memory_mismatch(cfg, a.vmid)
+            if problem:
+                shm = [d for d in conf["devices"] if Q.needs_shared_memory(d)]
+                if Q._find(cfg.get("args", ""), Q.SHARED_MEM_OBJECT) and not Q.memory_is_shared(cfg):
+                    fix = "run: qdevctl migrate-args (the size then follows the VM's memory)"
+                elif shm:
+                    fix = (f"run: qdevctl set {a.vmid} {shm[0]['id']} (or save that device in the VM's Hardware "
+                           "panel), which rewrites the args")
+                else:
+                    fix = "remove qdev-host's memory groups (qdev-mem) from the VM's args"
+                print(f"qdev-host: {problem}. To fix it, {fix}; then start the VM again.", file=sys.stderr)
+                return 2
+            if Q._find(cfg.get("args", ""), Q.SHARED_MEM_CFG):
+                try:
+                    Q.write_mem_cfg(a.vmid, cfg)
+                except (Q.QdevError, OSError) as e:
+                    print(f"qdev-host: shared memory: {e}", file=sys.stderr)
+                    return 2
         # a vhost-user GPU is on QEMU's command line: its process must listen before QEMU starts
         gpus = [d for d in conf["devices"] if Q.dev_kind(d) == "vhost-user-gpu"]
         if gpus:
-            cfg = Q.vm_config(a.vmid)
-            problem = Q.shared_memory_mismatch(cfg)
-            if problem:
-                print(f"qdev-host: {problem}. Open the GPU in the VM's Hardware panel and save it "
-                      f"(or run: qdevctl set {a.vmid} {gpus[0]['id']}), then start the VM again.", file=sys.stderr)
-                return 2
             for d in gpus:
                 if f"id={d['id']}," not in cfg.get("args", ""):
                     print(f"qdev-host: {d['id']} is missing from the VM's args (edited by hand?); "
@@ -298,6 +317,9 @@ def main():
     s.add_argument("vmid", type=int); s.add_argument("policy", nargs="?", choices=Q.REBOOT_POLICIES)
     s.set_defaults(fn=cmd_reboot_policy)
     s = sub.add_parser("tb-boot", help=argparse.SUPPRESS); s.add_argument("vmid", type=int); s.set_defaults(fn=cmd_tb_boot)
+    s = sub.add_parser("migrate-args", help="rewrite qdev-host's shared memory args of the form before 0.6.8 (size in "
+                                            "args) so the size follows the VM's memory; the package runs it on upgrade")
+    s.set_defaults(fn=cmd_migrate_args)
     # warm-swap primitives (increment 1): the product-grade command increment 3
     # (`uniq-vgpu update`) wraps. Target a device by VMID+ID (PVE) or by an
     # explicit --control PATH (raw qdev-host, e.g. a bring-up harness).

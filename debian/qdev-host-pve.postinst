@@ -9,6 +9,11 @@ case "$1" in
             systemctl enable --now qdev-host-api.service || true
             systemctl try-restart qdev-host-api.service || true
         fi
+        # VMs whose args still carry the memfd object with its size (before 0.6.8) get the form that follows
+        # the VM's memory; running VMs take it at their next start
+        if [ -n "$2" ] && dpkg --compare-versions "$2" lt 0.6.8~; then
+            /usr/sbin/qdevctl migrate-args || true
+        fi
         # the overlay descriptor is picked up by pve-ui-overlays' dpkg trigger; this only makes it immediate
         if command -v pve-ui-overlays >/dev/null 2>&1; then pve-ui-overlays reconcile || true; fi
         echo "qdev-host-pve: qdev-host devices can now be added in the VM Hardware panel (Add > qdev-host Device) or with qdevctl"

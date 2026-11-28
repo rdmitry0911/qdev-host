@@ -960,8 +960,30 @@ def vug_patterns(dev_id: str) -> list[str]:
     i = re.escape(dev_id)
     return [rf"-chardev\s+socket,id=qdev-{i},\S*", rf"-device\s+vhost-user-(?:vga|gpu-pci),id={i},\S*"]
 
-SHARED_MEM_PATTERNS = [rf"-object\s+memory-backend-memfd,id={SHARED_MEM_ID},\S*",
-                       rf"-machine\s+memory-backend={SHARED_MEM_ID}"]
+# The VM's RAM as a shared memfd: the object is in MEM_DIR/VMID.cfg (-readconfig), written again from the VM's
+# memory at every start, so a changed memory size needs nothing else.  Before 0.6.8 the object, with its size,
+# was in args (SHARED_MEM_OBJECT); such args are still recognised and rewritten.
+MEM_DIR = STATE_DIR / "mem"
+SHARED_MEM_OBJECT = rf"-object\s+memory-backend-memfd,id={SHARED_MEM_ID},\S*"
+SHARED_MEM_CFG = r"-readconfig\s+/var/lib/qdev-host/mem/[0-9]+\.cfg"
+SHARED_MEM_PATTERNS = [SHARED_MEM_OBJECT, SHARED_MEM_CFG, rf"-machine\s+memory-backend={SHARED_MEM_ID}"]
+
+def mem_cfg_path(vmid: int) -> Path:
+    return MEM_DIR / f"{vmid}.cfg"
+
+def has_qdev_mem(args: str) -> bool:
+    """qdev-host's shared memory backend is in these args (either form)."""
+    return bool(_find(args or "", SHARED_MEM_OBJECT) or _find(args or "", SHARED_MEM_CFG))
+
+def write_mem_cfg(vmid: int, cfg: dict[str, str]) -> None:
+    """The memfd object QEMU reads with -readconfig, sized from the VM's memory."""
+    MEM_DIR.mkdir(parents=True, exist_ok=True)
+    text = (f'[object "{SHARED_MEM_ID}"]\n  qom-type = "memory-backend-memfd"\n'
+            f'  size = "{vm_memory(cfg)}M"\n  share = "on"\n')
+    path = mem_cfg_path(vmid)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(text)
+    tmp.replace(path)
 QSM_GPU_PATTERN = rf"-device\s+virtio-vga-gl,id={QSM_GPU_ID}\S*"
 
 def vm_memory(cfg: dict[str, str]) -> int:
@@ -994,27 +1016,39 @@ def running_memory_shared(vmid: int) -> bool:
         cmd = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace").split("\0")
     except (OSError, ValueError):
         return False
+    if str(mem_cfg_path(vmid)) in cmd:
+        return True     # qdev-host's memfd, share=on, from its -readconfig file
     return any(re.match(r"memory-backend-(?:memfd|file),", a) and re.search(r"(?:^|,)share=(?:on|true|yes)(?:,|$)", a)
                for a in cmd)
 
-def shared_memory_groups(cfg: dict[str, str]) -> str:
-    """The args that give the VM shared memory, or '' when PVE already does."""
+def shared_memory_groups(vmid: int, cfg: dict[str, str]) -> str:
+    """The args that give the VM shared memory, or '' when PVE already does; writes the memfd's
+    -readconfig file."""
     if memory_is_shared(cfg):
         return ""
     if cfg.get("numa") == "1":
         raise QdevError("the VM uses NUMA nodes; give it hugepages or a virtiofs device, which share its memory")
     if "memory" in cfg.get("hotplug", "network,disk,usb").split(","):
         raise QdevError("the VM hot-plugs memory; give it hugepages or a virtiofs device, which share its memory")
-    return (f"-object memory-backend-memfd,id={SHARED_MEM_ID},size={vm_memory(cfg)}M,share=on "
-            f"-machine memory-backend={SHARED_MEM_ID}")
+    write_mem_cfg(vmid, cfg)
+    return f"-readconfig {mem_cfg_path(vmid)} -machine memory-backend={SHARED_MEM_ID}"
 
-def shared_memory_mismatch(cfg: dict[str, str]) -> str | None:
+def shared_memory_mismatch(cfg: dict[str, str], vmid: int | None = None) -> str | None:
     """A reason the VM would not start with its shared memory args, or None."""
-    obj = _find(cfg.get("args", ""), SHARED_MEM_PATTERNS[0])
-    if not obj:
+    args = cfg.get("args", "")
+    if not has_qdev_mem(args):
         return None
+    if vmid is not None and _find(args, SHARED_MEM_CFG) and str(mem_cfg_path(vmid)) not in args:
+        return "the VM's args read another VM's shared memory file (a clone?)"
     if memory_is_shared(cfg):
         return "the VM now has hugepages or a virtiofs device, and also qdev-host's memory backend"
+    obj = _find(args, SHARED_MEM_OBJECT)
+    if not obj:
+        try:
+            vm_memory(cfg)          # the -readconfig file gets its size at the start
+        except QdevError as e:
+            return str(e)
+        return None
     m = re.search(r"size=([0-9]+)M", obj)
     try:
         want = vm_memory(cfg)
@@ -1032,7 +1066,7 @@ def apply_vug_args(vmid: int, conf: dict, cfg: dict[str, str], gpu_notes: bool =
     gpu_notes False (another kind of device changed) none about the VM's GPUs."""
     notes = []
     args = cfg.get("args", "")
-    had_mem = bool(_find(args, SHARED_MEM_PATTERNS[0]))
+    had_mem = has_qdev_mem(args)
     for dev in conf["devices"]:
         for pat in vug_patterns(dev["id"]):
             args = _drop(args, pat)
@@ -1060,12 +1094,16 @@ def apply_vug_args(vmid: int, conf: dict, cfg: dict[str, str], gpu_notes: bool =
         else:
             args = f"{gpu} {args}".strip()
     if vugs or any(needs_shared_memory(d) for d in conf["devices"]):
-        mem = shared_memory_groups({**cfg, "args": args})
+        mem = shared_memory_groups(vmid, {**cfg, "args": args})
         groups = " ".join(vug_groups(vmid, d) for d in vugs)
         args = " ".join(x for x in (args, mem, groups) if x)
         if mem and not had_mem:
             notes.append(f"the VM's {vm_memory(cfg)} MiB of memory are shared with qdev-host's device processes "
-                         "(memory-backend-memfd in args; save the device again after changing the memory)")
+                         "(a memfd backend; its size follows the VM's memory at every start)")
+        if not mem:
+            mem_cfg_path(vmid).unlink(missing_ok=True)
+    else:
+        mem_cfg_path(vmid).unlink(missing_ok=True)
     qm_set(vmid, "args", args or None)
     # the VM's own display device would come first, so QSM would not show the GPU
     vga_now = cfg.get("vga")
@@ -1169,7 +1207,7 @@ def add_device(vmid: int, dev_id: str, plugin: str, args: str = "", bus: str = "
     clamp_to_fields(dev)
     shared = needs_shared_memory(dev)
     if shared:
-        shared_memory_groups(cfg)          # refuses NUMA/memory hot-plug without hugepages/virtiofs
+        shared_memory_groups(vmid, cfg)    # refuses NUMA/memory hot-plug without hugepages/virtiofs
     changed_port = False
     try:
         if bus == PORT_ID:
@@ -1209,7 +1247,7 @@ def add_device(vmid: int, dev_id: str, plugin: str, args: str = "", bus: str = "
 def add_vug_device(vmid: int, conf: dict, cfg: dict[str, str], dev: dict, had_tb: bool = True) -> list[str]:
     import qdev_tb
     dev.update(display=False, kms=None, persistent=False, extra=[])
-    shared_memory_groups(cfg)              # refuses NUMA/memory hot-plug without hugepages/virtiofs
+    shared_memory_groups(vmid, cfg)        # refuses NUMA/memory hot-plug without hugepages/virtiofs
     had_devices = bool(conf["devices"])
     changed_port = False
     try:
@@ -1278,6 +1316,12 @@ def update_device(vmid: int, dev_id: str, args: str | None = None, kms: str | No
         return ([f"VM {vmid}: GPU {dev_id} updated"] + [f"note: {n}" for n in notes] +
                 ["the change applies at the next VM start" + (": stop and start the VM" if vm_running(vmid) else "")])
     # a vfio-user device gets a new process; a running VM sees an unplug and a replug
+    notes = []
+    if needs_shared_memory(new):
+        # rewrites qdev-host's memory groups too (the form before 0.6.8 had the size in args)
+        check_editable(vmid)
+        conf["devices"] = [replaced(d) for d in conf["devices"]]
+        notes = apply_vug_args(vmid, conf, vm_config(vmid), gpu_notes=False)
     running = vm_running(vmid)
     was_attached = running and device_present(vmid, dev_id)
     msgs = []
@@ -1291,7 +1335,8 @@ def update_device(vmid: int, dev_id: str, args: str | None = None, kms: str | No
     elif new.get("persistent"):
         start_process(vmid, new)
         msgs.append(f"{dev_id}: process started with the new settings")
-    return [f"VM {vmid}: device {dev_id} updated" + (", unplugged and plugged again" if was_attached else "")] + msgs
+    return ([f"VM {vmid}: device {dev_id} updated" + (", unplugged and plugged again" if was_attached else "")] + msgs
+            + [f"note: {n}" for n in notes])
 
 def remove_device(vmid: int, dev_id: str, keep_process: bool = False, purge_port: bool = False) -> list[str]:
     msgs = []
@@ -1318,7 +1363,7 @@ def remove_device(vmid: int, dev_id: str, keep_process: bool = False, purge_port
     else:
         msgs.append(detach(vmid, dev, keep_process))
         conf["devices"] = [d for d in conf["devices"] if d["id"] != dev_id]
-        if needs_shared_memory(dev) and _find(vm_config(vmid).get("args", ""), SHARED_MEM_PATTERNS[0]):
+        if needs_shared_memory(dev) and has_qdev_mem(vm_config(vmid).get("args", "")):
             apply_vug_args(vmid, conf, vm_config(vmid))
     env = UNIT_DIR / f"{vmid}-{dev_id}.env"
     if env.exists() and not keep_process:
@@ -1393,3 +1438,27 @@ def describe_vm(vmid: int) -> dict:
             "port_in_args": f"id={PORT_ID}" in cfg.get("args", ""), "port_in_vm": PORT_ID in buses,
             "hookscript": cfg.get("hookscript"), "devices": devices, "tb": tb_info,
             "plugins": list_plugins(), "kms_outputs": list_kms_outputs(), "render_nodes": list_render_nodes()}
+
+
+def migrate_memory_args() -> list[str]:
+    """Args of qdev-host VMs on this node that still carry the memfd object with its size (before 0.6.8)
+    get the -readconfig form; run by the package on upgrade.  Running VMs take it at their next start."""
+    out = []
+    for path in sorted(CONF_DIR.glob("*.json")):
+        try:
+            vmid = int(path.stem)
+            cfg = vm_config(vmid)
+        except (ValueError, QdevError, OSError):
+            continue
+        args = cfg.get("args", "")
+        obj = _find(args, SHARED_MEM_OBJECT)
+        if not obj:
+            continue
+        try:
+            write_mem_cfg(vmid, cfg)
+        except QdevError as e:
+            out.append(f"VM {vmid}: shared memory args kept ({e})")
+            continue
+        qm_set(vmid, "args", args.replace(obj, f"-readconfig {mem_cfg_path(vmid)}", 1))
+        out.append(f"VM {vmid}: shared memory backend now follows the VM's memory ({vm_memory(cfg)} MiB)")
+    return out

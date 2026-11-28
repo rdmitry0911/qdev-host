@@ -1,3 +1,18 @@
+qdev-host (0.6.8) unstable; urgency=medium
+
+  * Shared memory follows the VM's memory: the memfd backend is no longer in
+    args with a fixed size but in /var/lib/qdev-host/mem/VMID.cfg
+    (-readconfig), which the hookscript writes from the VM's memory before
+    every start. Changing the memory (qm set VMID --memory N) no longer stops
+    the VM from starting ("Machine memory size does not match the size of
+    the memory backend"). Args of the older form are rewritten on upgrade,
+    by qdevctl set and by any device change; until then the hookscript
+    refuses a start whose sizes differ and says how to fix it.
+  * qdevctl set of a plugin device that works in guest RAM rewrites the
+    VM's shared memory args too.
+
+ -- Dmitry R <rdmitry0911@gmail.com>  Sat, 28 Nov 2026 21:00:00 +0200
+
 qdev-host (0.6.7) unstable; urgency=medium
 
   * arm64 virt VMs: the TB bus goes into args without -acpitable, an option
