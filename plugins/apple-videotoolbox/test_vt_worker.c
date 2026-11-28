@@ -12,8 +12,10 @@
  * travel on queue 1. Engine source: a Dbuf reply's status is AW_NOERR on every branch. So no queue-0 status may wait
  * for a decode or a landing (the guest gives up after 5 s: `sendMessageToHost driver rc=0xe00002d6`).
  * Each scenario runs in two configurations: SYNC = the engine without the worker (the behaviour before the fix,
- * `worker=0`), WORKER = the device default after the fix. W-01/W-03/W-06 hold the contract; W-02/W-08 require the
- * WORKER per-session queue-1 byte stream and decode order to equal SYNC's; W-04/W-05/W-07 the lock rules.
+ * `worker=0`), WORKER = the device default after the fix. W-01/W-03/W-06/W-12 hold the contract; W-02/W-08/W-08b/
+ * W-10/W-11 require the WORKER per-session queue-1 byte stream and decode order to equal SYNC's (messages that
+ * arrive while a session's frame lands are delivered after it, in order); W-04/W-05/W-07/W-09/W-13 the lock,
+ * reset, teardown and fallback rules (review findings R1-R5 of e22be84).
  * CLEAN-ROOM.
  */
 #include "vt_submit.h"
@@ -184,7 +186,7 @@ static int cpy(void *c, const vtpv_decoded_frame *f, const aw_out_buffer *b)
 static int cpy_locked(void *c, const vtpv_decoded_frame *f, const aw_out_buffer *b)
 {
     vt_backend_lock(); be_enter(); be_leave(); int r = cpy(c, f, b); vt_backend_unlock();
-    g_used_at_land_end = used_idx();
+    if (g_worker) g_used_at_land_end = used_idx();   /* (a synchronous fallback lands inside the drain) */
     return r;
 }
 static int landing_now(void) { pthread_mutex_lock(&g_lm); int v = g_landing; pthread_mutex_unlock(&g_lm); return v; }
@@ -324,6 +326,37 @@ static void giveup_scenario(void)
     POST(build_dbuf_reply(g_m, UA, 0xA200)); drain(); idle();            /* 41 lands           */
     POST(build_demt_reply(g_m, UA)); drain(); idle();
 }
+/* W-08b: the guest gives up twice while a sync frame lands (review R5) */
+static void giveup2_scenario(void)
+{
+    POST(msg0(g_m, AW_MSG_PDEC, AW_FLAG_GUEST_REQ, UA)); POST(build_dsta(g_m, UA));
+    POST(build_dfrm(g_m, UA, 40, 801, 40, 0)); drain(); idle();
+    POST(build_dbuf_reply(g_m, UA, 0xA100));
+    POST(build_dfrm(g_m, UA, 41, 802, 41, 0));
+    POST(build_dfrm(g_m, UA, 42, 803, 42, 0));
+    drain(); idle();
+}
+/* W-10 / W-11: a session message right behind an async frame's lend, in the same drain (review R2 / R3) */
+static void behind_lend_scenario(uint32_t type)
+{
+    open_session(UA, 1);
+    POST(build_dbuf_reply(g_m, UA, 0xA100));
+    POST(msg0(g_m, type, AW_FLAG_GUEST_REQ, UA));
+    drain(); idle();
+}
+/* W-13: the LAND job cannot be queued (review R4) */
+static int g_w13_calls, g_w13_fail_at = -1;
+static int w13_submit(void *w, aw_job *j)
+{ if (g_w13_calls++ == g_w13_fail_at) return -1; return vt_worker_submit(w, j); }
+static int g_wd_done;   /* atomic */
+static void *deadlock_watchdog(void *arg)
+{
+    for (int i = 0; i < 300; i++) { if (__atomic_load_n(&g_wd_done, __ATOMIC_ACQUIRE)) return NULL; usleep(10000); }
+    printf("  FAIL: DEADLOCK: %s did not return within 3 s\n", (const char *)arg);
+    fflush(stdout);
+    _exit(3);
+}
+
 static uint8_t s_wire[96][512]; static size_t s_wirel[96]; static int s_nwire; static uint8_t s_order[64]; static int s_norder, s_decodes;
 static void keep(void) { s_nwire = g_nwire; memcpy(s_wire, g_wire, sizeof s_wire); memcpy(s_wirel, g_wirel, sizeof s_wirel);
                          s_norder = g_norder; memcpy(s_order, g_order, sizeof s_order); s_decodes = g_decodes; }
@@ -413,15 +446,23 @@ int main(void)
     CHECK(d1 == d0 && g_decodes == d0 + 1, "W-04: B's job ran only after resume (%d -> %d -> %d)", d0, d1, g_decodes);
     finish();
 
-    printf("-- W-05: teardown with queued jobs: they finish, then the engine is destroyed --\n");
+    printf("-- W-05: teardown with queued jobs: discarded (no host service), decoders closed once --\n");
     start(1);
     g_decode_us = 20000;
     POST(msg0(g_m, AW_MSG_PDEC, AW_FLAG_GUEST_REQ, UA)); POST(build_dsta(g_m, UA));
     POST(msg0(g_m, AW_MSG_PDEC, AW_FLAG_GUEST_REQ, UB)); POST(build_dsta(g_m, UB));
     POST(build_dfrm(g_m, UA, 40, 801, 1, 1)); POST(build_dfrm(g_m, UB, 40, 901, 2, 1));
     drain();
-    finish();                                            /* stop (drains), destroy           */
-    CHECK(g_decodes == 2 && g_closes == 2, "W-05: both queued units decoded, both decoders closed once (%d, %d)", g_decodes, g_closes);
+    {   /* the device's vt_teardown: discard under the device lock, stop, destroy */
+        int posts0 = g_posts;
+        pthread_mutex_lock(&g_dm); vt_worker_discard(&g_w); pthread_mutex_unlock(&g_dm);
+        vt_worker_stop(&g_w);
+        int posts_after = g_posts - posts0;
+        aw_engine_destroy(g_e); vt_worker_destroy(&g_w); g_e = NULL;
+        CHECK(g_decodes <= 1 && g_closes == 2 && posts_after == 0,
+              "W-05: queued units discarded (%d decoded), both decoders closed once (%d), no post hook after stop (%d)",
+              g_decodes, g_closes, posts_after);
+    }
 
     printf("-- W-06: two sessions: B's chains retire while A's frame lands --\n");
     start(1);
@@ -447,6 +488,89 @@ int main(void)
     POST(msg0(g_m, AW_MSG_PDEC, AW_FLAG_GUEST_REQ, UB)); POST(build_dsta(g_m, UB)); drain(); /* open B */
     idle();
     CHECK(g_overlap == 0 && g_opens == 2, "W-07: no two backend calls overlapped (%d), both opened", g_overlap);
+    finish();
+
+    printf("-- W-08b: two sync give-ups while the frame lands: WORKER stream and decode order == SYNC --\n");
+    start(0); giveup2_scenario(); keep(); finish();
+    start(1); giveup2_scenario();
+    CHECK(same_as_kept(), "W-08b: identical stream (%d / %d) and decode order (%d units)", s_nwire, g_nwire, g_norder);
+    finish();
+
+    printf("-- W-10 / W-11: dinv / dfin behind a lend: WORKER stream == SYNC (Demt first) --\n");
+    start(0); behind_lend_scenario(AW_MSG_DINV); keep(); finish();
+    start(1); behind_lend_scenario(AW_MSG_DINV);
+    CHECK(same_as_kept() && g_closes == 1, "W-10: dinv: identical stream (%d / %d), decoder closed once", s_nwire, g_nwire);
+    finish();
+    start(0); behind_lend_scenario(AW_MSG_DFIN); keep(); finish();
+    start(1); behind_lend_scenario(AW_MSG_DFIN);
+    CHECK(same_as_kept(), "W-11: dfin: identical stream (%d / %d)", s_nwire, g_nwire);
+    finish();
+
+    printf("-- W-12: a close does not wait for the worker (another session's landing ahead of it) --\n");
+    start(1);
+    open_session(UA, 1);
+    open_session(UB, 2);
+    latch(1);
+    POST(build_dbuf_reply(g_m, UA, 0xA100)); drain();    /* A lands (held)                     */
+    (void)wait_landing(1000);
+    POST(build_dbuf_reply(g_m, UB, 0xB100));             /* 7: B's LAND queues behind A's       */
+    POST(msg0(g_m, AW_MSG_MDEC, AW_FLAG_GUEST_REQ, UB)); /* 8: close B                          */
+    POST(msg0(g_m, AW_MSG_DINV, AW_FLAG_GUEST_REQ, UA)); /* 9: invalidate A                     */
+    drain();                                             /* returns at once                     */
+    int at_once = landing_now() && used_idx() == 10 && stat_of(8) == AW_NOERR && stat_of(9) == AW_NOERR && g_closes == 0;
+    latch(0); idle();
+    int demts = count_type(AW_MSG_DEMT), dinvs = count_type(AW_MSG_DINV);
+    CHECK(at_once, "W-12: mdec(B) and dinv(A) retired with status 0 while A's frame lands, nothing closed yet");
+    CHECK(demts == 2 && dinvs == 1 && g_closes == 2, "W-12: both frames landed (Demt %d), dinv replied (%d), both closed after (%d)", demts, dinvs, g_closes);
+    finish();
+
+    printf("-- W-13: the LAND job cannot be queued: the held picture lands without a second decode (review R4) --\n");
+    {
+        reset_all(); g_worker = 1;
+        aw_session_cfg cfg; memset(&cfg, 0, sizeof cfg);
+        cfg.emit = emit; cfg.resolve_buffer = res; cfg.put_buffer = put;
+        vt_worker_init(&g_w, &g_dm, &g_mem_lk, post, NULL);
+        vt_locked_backend_init(&g_lbe, &SLOW);
+        cfg.be = &g_lbe.be; cfg.copy_frame = cpy_locked;
+        cfg.submit_job = w13_submit; cfg.wait_jobs = vt_worker_wait; cfg.job_ctx = &g_w;
+        g_e = aw_engine_create(&cfg); vt_worker_start(&g_w, g_e);
+        g_w13_calls = 0; g_w13_fail_at = -1;
+        open_session(UA, 1);                             /* the decode-ahead job: decode 1      */
+        g_w13_fail_at = g_w13_calls;                     /* the LAND job's submit fails         */
+        g_worker = 0;                                    /* (the fallback lands in the drain)   */
+        POST(build_dbuf_reply(g_m, UA, 0xA100)); drain();
+        g_worker = 1; idle();
+        CHECK(g_decodes == 1 && count_type(AW_MSG_DEMT) == 1, "W-13: one decode for the unit (%d), Demt out", g_decodes);
+        finish();
+    }
+
+    printf("-- W-09: device reset with a queued LAND and a parked dfrm (review R1) --\n");
+    start(1);
+    open_session(UA, 1);
+    open_session(UB, 2);
+    latch(1);
+    POST(build_dbuf_reply(g_m, UB, 0xB100)); drain();    /* B lands (held): the worker is busy  */
+    (void)wait_landing(1000);
+    POST(build_dbuf_reply(g_m, UA, 0xA100));             /* A's LAND queued behind B            */
+    POST(build_dfrm(g_m, UA, 41, 802, 3, 1));            /* A's next unit: held behind the lend */
+    drain();
+    {
+        pthread_t rt; pthread_create(&rt, NULL, release_after, (void *)(uintptr_t)100000);
+        pthread_rwlock_wrlock(&g_mem_lk);                /* quiesce(): waits for B's job        */
+        pthread_join(rt, NULL);
+        int wire0 = g_nwire, puts0 = g_puts, posts0 = g_posts;
+        pthread_t wd; __atomic_store_n(&g_wd_done, 0, __ATOMIC_RELEASE); pthread_create(&wd, NULL, deadlock_watchdog, "vt_worker_discard");
+        pthread_mutex_lock(&g_dm);                       /* vt_reset: d->m, then discard        */
+        vt_worker_discard(&g_w);
+        unsigned jobs = aw_engine_jobs(g_e);
+        pthread_mutex_unlock(&g_dm);
+        __atomic_store_n(&g_wd_done, 1, __ATOMIC_RELEASE); pthread_join(wd, NULL);
+        CHECK(1, "W-09: the discard returned (no self-deadlock on the queue lock)");
+        CHECK(g_nwire == wire0 && g_posts == posts0 && g_puts == puts0 + 1 && jobs == 0,
+              "W-09: nothing emitted or flushed while quiesced, A's lent buffer back (%d), no job left (%u)", g_puts - puts0, jobs);
+        pthread_rwlock_unlock(&g_mem_lk);                /* resume()                            */
+        idle();
+    }
     finish();
 
     printf("%s: VT-DECODE-WORKER\n", g_fail ? "FAIL" : "PASS");

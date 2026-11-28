@@ -45,9 +45,11 @@ int  vt_worker_start(vt_worker *w, aw_engine *e);
 /* aw_submit_job_fn / aw_wait_jobs_fn (device lock held) */
 int  vt_worker_submit(void *w, aw_job *job);
 void vt_worker_wait(void *w);
-/* Discard every queued job (device reset; device lock held, guest memory quiesced). */
+/* Discard every queued job (device reset or teardown; device lock held). The queue is taken under the
+ * queue lock and discarded without it (a discard may reach the engine, which may submit). */
 void vt_worker_discard(vt_worker *w);
-/* Finish the queued jobs, stop and join (teardown; device lock NOT held). */
+/* Stop and join (device lock NOT held): what is still queued runs first (none after vt_worker_discard);
+ * no post hook runs once stop is set. */
 void vt_worker_stop(vt_worker *w);
 void vt_worker_destroy(vt_worker *w);
 

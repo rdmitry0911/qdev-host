@@ -83,8 +83,11 @@ typedef void (*aw_put_buffer_fn)(void *ctx, const aw_out_buffer *b);
  * now returned without waiting for any decode or landing. Per job the worker calls aw_job_work WITHOUT the device lock,
  * then aw_job_complete WITH it (that applies the result and emits exactly what the synchronous path emits). Every
  * other engine call keeps the device lock as before. submit_job is called with the device lock held; it returns 0, or
- * <0 when the job could not be queued (the engine then does that work synchronously). wait_jobs is called with the
- * device lock held and returns after the worker completed a job (it may release and re-take the lock). */
+ * <0 when the job could not be queued (the engine then does that work synchronously). wait_jobs is no longer
+ * called (a close with jobs in flight is deferred to their completion, so no queue-0 status waits on the worker);
+ * the field stays for the integrators that set it. Messages for a session whose frame lands are held: their status
+ * goes at once (parse / validate), their delivery follows that frame's completion in arrival order, so the
+ * per-session queue-1 order equals the synchronous engine's. */
 typedef struct aw_job aw_job;
 typedef int  (*aw_submit_job_fn)(void *ctx, aw_job *job);
 typedef void (*aw_wait_jobs_fn)(void *ctx);

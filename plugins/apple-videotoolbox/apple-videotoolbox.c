@@ -206,6 +206,7 @@ typedef struct vt_dev {
     vt_locked_backend lbe;
     pthread_rwlock_t mem;
     int              quiesced;     /* host main loop only */
+    aw_session_cfg   engine_cfg;   /* setup only: the engine's configuration */
 } vt_dev;
 
 /* the completion vq's MSI-X vector (set by the driver; config vector fallback) */
@@ -674,6 +675,21 @@ static int vt_copy_frame(void *ctx, const vtpv_decoded_frame *f, const aw_out_bu
     if (b->landing && ((const vt_landing *)b->landing)->direct)
         return vt_land_direct(d, f, b->landing);
 #endif
+    aw_out_buffer gb;
+    if (!b->landing && b->mapping_id) {
+        /* the no-bridge GPA bring-up surface: its guest pages are found again here, since
+         * a landing on the decode worker may follow a DMA map change after the Dbuf reply
+         * (VT-DECODE-WORKER; the bridge paths resolve their pages at landing already) */
+        const size_t ys = b->y_stride * (size_t)b->height;
+        const size_t cs = b->y_stride * (((size_t)b->height + 1u) / 2u);
+        uint8_t *p = vt_map(d, b->mapping_id, ys + cs);
+        if (!p) {
+            vt_log(d, 1, "landing: Dbuf surface gpa %#llx no longer in the DMA regions; frame not delivered",
+                   (unsigned long long)b->mapping_id);
+            return -1;
+        }
+        gb = *b; gb.y = p; gb.uv = p + ys; b = &gb;
+    }
     if (!b->y) return -1;
     /* land the NV12 frame: Y plane, then the interleaved UV plane. Route to
      * whichever backend is active (the libavcodec stream core, else the legacy
@@ -1090,11 +1106,20 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
         /* VT-DECODE-WORKER: default on with a decoding backend; `worker=0` keeps the
          * synchronous engine (the pre-worker behaviour). */
         d->worker_on = d->be && d->be->decode && !(args && strstr(args, "worker=0"));
-        if (d->worker_on &&
-            (pthread_rwlock_init(&d->mem, NULL) != 0 ||
-             vt_worker_init(&d->worker, &d->m, &d->mem, vt_worker_post, d) != 0)) {
-            vt_log(d, 1, "decode worker unavailable (init); synchronous decode");
-            d->worker_on = 0;
+        if (d->worker_on) {
+            /* a quiesce (writer) is not starved by the worker's per-job read locks */
+            pthread_rwlockattr_t ra;
+            int ok = pthread_rwlockattr_init(&ra) == 0;
+            if (ok) {
+                (void)pthread_rwlockattr_setkind_np(&ra, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+                ok = pthread_rwlock_init(&d->mem, &ra) == 0;
+                pthread_rwlockattr_destroy(&ra);
+            }
+            if (!ok || vt_worker_init(&d->worker, &d->m, &d->mem, vt_worker_post, d) != 0) {
+                if (ok) pthread_rwlock_destroy(&d->mem);
+                vt_log(d, 1, "decode worker unavailable (init); synchronous decode");
+                d->worker_on = 0;
+            }
         }
         if (d->worker_on) {
             vt_locked_backend_init(&d->lbe, d->be);
@@ -1105,19 +1130,7 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
             cfg.job_ctx = &d->worker;
         }
         d->engine = aw_engine_create(&cfg);
-        if (d->engine && d->worker_on && vt_worker_start(&d->worker, d->engine) != 0) {
-            vt_log(d, 1, "decode worker unavailable (thread); synchronous decode");
-            aw_engine_destroy(d->engine);
-            vt_worker_destroy(&d->worker);
-            pthread_rwlock_destroy(&d->mem);
-            d->worker_on = 0;
-            cfg.be = d->be; cfg.copy_frame = vt_copy_frame;
-            cfg.submit_job = NULL; cfg.wait_jobs = NULL; cfg.job_ctx = NULL;
-            d->engine = aw_engine_create(&cfg);
-        }
-        if (d->engine)
-            vt_log(d, 2, "decode %s", d->worker_on ? "worker: on (queue-0 status independent of decode / landing)"
-                                                   : "synchronous");
+        d->engine_cfg = cfg;   /* the synchronous fallback if the worker thread cannot start */
     }
     if (!d->engine) {
         VT_LAVC_CLOSE(d);
@@ -1159,6 +1172,22 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
     d->queue_msix[0] = d->queue_msix[1] = VT_MSIX_NO_VECTOR;
     d->msix_config = VT_MSIX_NO_VECTOR;
 
+    /* VT-DECODE-WORKER: the worker starts last, once nothing below can fail */
+    if (d->worker_on && vt_worker_start(&d->worker, d->engine) != 0) {
+        vt_log(d, 1, "decode worker unavailable (thread); synchronous decode");
+        aw_engine_destroy(d->engine);
+        vt_worker_destroy(&d->worker);
+        pthread_rwlock_destroy(&d->mem);
+        d->worker_on = 0;
+        aw_session_cfg cfg = d->engine_cfg;
+        cfg.be = d->be; cfg.copy_frame = vt_copy_frame;
+        cfg.submit_job = NULL; cfg.wait_jobs = NULL; cfg.job_ctx = NULL;
+        d->engine = aw_engine_create(&cfg);
+        if (!d->engine) goto fail;
+    }
+    vt_log(d, 2, "decode %s", d->worker_on ? "worker: on (queue-0 status independent of decode / landing)"
+                                           : "synchronous");
+
     g_dev = d;
     *priv = d;
     vt_log(d, 2, "apple-videotoolbox %04x:%04x up (%u virtqueues, %s)",
@@ -1168,7 +1197,8 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
     return 0;
 
 fail:
-    aw_engine_destroy(d->engine);
+    aw_engine_destroy(d->engine);   /* the worker never started on this path */
+    if (d->worker_on) { vt_worker_destroy(&d->worker); pthread_rwlock_destroy(&d->mem); }
     VT_LAVC_CLOSE(d);
     if (d->nvdec) vtpv_nvdec_close(d->nvdec);
     if (d->va) vtpv_vaapi_close(d->va);
@@ -1181,7 +1211,14 @@ static void vt_teardown(void *priv)
     vt_dev *d = priv;
     if (!d) return;
     if (g_dev == d) g_dev = NULL;
-    if (d->worker_on) vt_worker_stop(&d->worker); /* finishes its queued jobs, then joins */
+    if (d->worker_on) {
+        /* the queued jobs go without running (no host service at teardown); the one in
+         * progress finishes without its post hook, then the thread joins */
+        pthread_mutex_lock(&d->m);
+        vt_worker_discard(&d->worker);
+        pthread_mutex_unlock(&d->m);
+        vt_worker_stop(&d->worker);
+    }
     aw_engine_destroy(d->engine);
     if (d->worker_on) { vt_worker_destroy(&d->worker); pthread_rwlock_destroy(&d->mem); }
     VT_LAVC_CLOSE(d);

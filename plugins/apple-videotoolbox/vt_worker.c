@@ -13,8 +13,8 @@ static void *worker_main(void *arg)
     vt_worker *w = arg;
     for (;;) {
         pthread_mutex_lock(&w->qm);
-        while (!w->q_n && !w->stop) pthread_cond_wait(&w->qcv, &w->qm);
-        if (!w->q_n && w->stop) { pthread_mutex_unlock(&w->qm); break; }
+        while (!w->q_n && !__atomic_load_n(&w->stop, __ATOMIC_ACQUIRE)) pthread_cond_wait(&w->qcv, &w->qm);
+        if (!w->q_n && __atomic_load_n(&w->stop, __ATOMIC_ACQUIRE)) { pthread_mutex_unlock(&w->qm); break; }
         pthread_mutex_unlock(&w->qm);
 
         /* guest memory first: a quiesce (write) holds the job back before it is popped,
@@ -31,7 +31,8 @@ static void *worker_main(void *arg)
                 pthread_mutex_lock(w->dev_m);
                 again = aw_job_complete(w->e, j);     /* state + emission: device lock    */
                 if (!again) {
-                    if (w->post) w->post(w->post_ctx);
+                    /* no host service after stop (teardown) */
+                    if (w->post && !__atomic_load_n(&w->stop, __ATOMIC_ACQUIRE)) w->post(w->post_ctx);
                     pthread_cond_broadcast(&w->done);
                 }
                 pthread_mutex_unlock(w->dev_m);
@@ -95,14 +96,14 @@ void vt_worker_wait(void *arg)
 void vt_worker_discard(vt_worker *w)
 {
     if (!w || !w->running) return;
+    /* take the whole queue under qm, discard it without qm: a discard reaches the engine,
+     * which may submit (qm is not recursive) */
     pthread_mutex_lock(&w->qm);
-    while (w->q_n) {
-        aw_job *j = w->q[w->q_head];
-        w->q_head = (w->q_head + 1) % w->q_cap;
-        w->q_n--;
-        aw_job_discard(w->e, j);
-    }
+    aw_job **q = w->q; size_t cap = w->q_cap, head = w->q_head, n = w->q_n;
+    w->q = NULL; w->q_cap = w->q_head = w->q_n = 0;
     pthread_mutex_unlock(&w->qm);
+    for (size_t i = 0; i < n; i++) aw_job_discard(w->e, q[(head + i) % cap]);
+    free(q);
     pthread_cond_broadcast(&w->done);
 }
 
@@ -110,10 +111,10 @@ void vt_worker_stop(vt_worker *w)
 {
     if (!w || !w->running) return;
     pthread_mutex_lock(&w->qm);
-    w->stop = 1;
+    __atomic_store_n(&w->stop, 1, __ATOMIC_RELEASE);
     pthread_cond_signal(&w->qcv);
     pthread_mutex_unlock(&w->qm);
-    pthread_join(w->th, NULL);       /* it finishes the queued jobs first */
+    pthread_join(w->th, NULL);       /* it runs what is still queued (none after a discard) */
     w->running = 0;
 }
 

@@ -114,9 +114,16 @@ typedef struct aw_dsession {
     int          land_got;      /* resolve_buffer's result for the lend                */
     uint8_t      land_bu[16];   /* the lent buffer id (,uui)                           */
     uint64_t     land_mapid;    /* the lent mapping id (subs)                          */
-    int          give_up_after; /* a sync frame's reply was owed when a dfrm came while
-                                   it lands: give it up once it lands (D-GVA-SYNC-DFRM) */
+    int          close_pending; /* mdec / muui / dinv taken: invisible to new messages;
+                                   closed once its held messages are delivered and its
+                                   jobs are done (no queue-0 status waits on the worker) */
+    /* Messages for this session that arrived while its frame LANDS: their status went
+     * at once (parse / validate), their delivery follows the frame's completion, in
+     * arrival order (the per-session queue-1 order of the synchronous engine). */
+    struct aw_held { uint8_t *msg; size_t len; } *held;
+    unsigned     held_n, held_cap;
 } aw_dsession;
+#define AW_HELD_MAX 256u
 
 enum { AW_JOB_AHEAD = 1, AW_JOB_LAND, AW_JOB_DECODE };
 struct aw_job {
@@ -426,12 +433,13 @@ aw_engine *aw_engine_create(const aw_session_cfg *cfg)
 
 static void close_session(aw_engine *e, aw_dsession *s)
 {
-    if (AW_WM(e) && s->jobs && e->cfg.wait_jobs && !e->destroying) {
-        /* VT-DECODE-WORKER: this session's jobs finish first (each completes as the
-         * synchronous path would have before this close arrived); no new frame starts */
-        s->closing = 1;
-        while (s->jobs) e->cfg.wait_jobs(e->cfg.job_ctx);
+    if (AW_WM(e) && s->jobs && !e->destroying) {
+        /* VT-DECODE-WORKER: jobs still run for it: close on their completion (never wait) */
+        s->closing = 1; s->close_pending = 1;
+        return;
     }
+    for (unsigned i = 0; i < s->held_n; i++) free(s->held[i].msg);
+    free(s->held);
     if ((s->pend_state == AW_FRM_AWAIT_DEMT || s->pend_state == AW_FRM_LANDING) && e->cfg.put_buffer)
         e->cfg.put_buffer(e->cfg.buf_ctx, &s->pend_buf); /* let a held buffer go */
     if (s->pend_au) free(s->pend_au);
@@ -440,6 +448,14 @@ static void close_session(aw_engine *e, aw_dsession *s)
     if (s->dec && e->cfg.be && e->cfg.be->close_decoder)
         e->cfg.be->close_decoder(s->dec);
     memset(s, 0, sizeof(*s));
+}
+
+/* mdec / muui / dinv: close now, or - worker mode, jobs still running for it - make
+ * the session invisible to new messages and close it when its last job completes. */
+static void close_or_defer(aw_engine *e, aw_dsession *s)
+{
+    if (AW_WM(e) && s->jobs) { s->closing = 1; s->close_pending = 1; return; }
+    close_session(e, s);
 }
 
 void aw_engine_destroy(aw_engine *e)
@@ -462,7 +478,7 @@ unsigned aw_engine_open_sessions(const aw_engine *e)
 static aw_dsession *find_session(aw_engine *e, const uint8_t uuid[16])
 {
     for (unsigned i = 0; i < AW_MAX_SESSIONS; i++)
-        if (e->sess[i].used && memcmp(e->sess[i].uuid, uuid, 16) == 0)
+        if (e->sess[i].used && !e->sess[i].close_pending && memcmp(e->sess[i].uuid, uuid, 16) == 0)
             return &e->sess[i];
     return NULL;
 }
@@ -589,7 +605,7 @@ static int32_t handle_opendec(aw_engine *e, const aw_msg_view *v)
 static int32_t handle_closedec(aw_engine *e, const aw_msg_view *v)
 {
     aw_dsession *s = find_session(e, v->uuid);
-    if (s) close_session(e, s);
+    if (s) close_or_defer(e, s);
     return AW_NOERR;                 /* unknown UUID is noErr too                */
 }
 
@@ -980,8 +996,6 @@ static int32_t handle_dfrm(aw_engine *e, aw_dsession *s, const aw_msg_view *v)
         give_up_inflight(e, s);      /* its reply is owed: the guest moved on      */
     else if (s->pend_state == AW_FRM_AWAIT_DEMT && !s->pend_replied && s->park_n == 0)
         give_up_demt(e, s);          /* sync frame, reply owed: the same           */
-    else if (s->pend_state == AW_FRM_LANDING && !s->pend_replied && s->park_n == 0)
-        s->give_up_after = 1;        /* worker mode: the same, once it has landed  */
 
     if (s->pend_state != AW_FRM_IDLE) {
         /* a frame is in flight: park this unit until it completes            */
@@ -1108,9 +1122,8 @@ static int32_t handle_guest_reply(aw_engine *e, aw_dsession *s,
             if (j) {
                 if (done) { j->f = s->pre_f; j->dr = s->pre_dr; }
                 j->got = got; memcpy(j->bu, bu, 16); j->mapid = mapid; j->ob = ob;
-                s->pre_state = AW_PRE_NONE;
-                if (submit_job(e, s, j) == 0) return AW_NOERR;
-            }
+                if (submit_job(e, s, j) == 0) { s->pre_state = AW_PRE_NONE; return AW_NOERR; }
+            }                               /* (a held picture stays held: no re-decode) */
             s->pend_state = AW_FRM_AWAIT_DBUF;      /* no job: land it here (below)   */
         }
 
@@ -1224,11 +1237,115 @@ static int32_t handle_dcop(aw_engine *e, aw_dsession *s, const aw_msg_view *v)
 static int32_t handle_dinv(aw_engine *e, aw_dsession *s, const aw_msg_view *v)
 {
     int32_t rc = reply_err(e, v, AW_NOERR);
-    close_session(e, s);             /* dinv drops the decoder                    */
+    close_or_defer(e, s);            /* dinv drops the decoder                    */
     return rc;
 }
 
 /* ---- the queue-0 switch -------------------------------------------------- */
+
+/* The per-session dispatch (a session message, or a guest reply to our request). */
+static int32_t dispatch_session(aw_engine *e, aw_dsession *s, const aw_msg_view *v,
+                                const uint8_t *msg, size_t len)
+{
+    if (s->invalidated)  return AW_ERR_INVALIDATED;  /* -19098                     */
+
+    /* a guest reply (flag 0x8) to one of our host requests (Dbuf / Demt) */
+    if (v->flags & AW_FLAG_GUEST_REPLY)
+        return handle_guest_reply(e, s, v, msg, len);
+
+    switch (v->type) {
+    case AW_MSG_DSTA: return handle_dsta(e, s, v);
+    case AW_MSG_DFRM: return handle_dfrm(e, s, v);
+    case AW_MSG_DCAN: return handle_dcan(e, s, v);
+    case AW_MSG_DINV: return handle_dinv(e, s, v);
+    case AW_MSG_DFIN: return reply_err(e, v, AW_NOERR); /* finish/flush: frames
+                                        complete synchronously on the Dbuf reply,
+                                        so a drain has nothing outstanding -> noErr */
+    case AW_MSG_DSUP: return handle_dsup(e, s, v);
+    case AW_MSG_DCOP: return handle_dcop(e, s, v);
+    case AW_MSG_DSET: return reply_err(e, v, AW_NOERR);
+    default:          return AW_ERR_UNKNOWN_UUID;
+    }
+}
+
+/* VT-DECODE-WORKER: the queue-0 status of a message held while its session's frame lands,
+ * from parse / validate only, as the synchronous engine would return it once that frame
+ * had landed (its delivery follows the landing). *hold = 0: nothing to deliver later (the
+ * synchronous engine refuses it without any effect). */
+static int32_t held_status(aw_engine *e, aw_dsession *s, const aw_msg_view *v, int *hold)
+{
+    (void)e;
+    *hold = 1;
+    if (s->invalidated) { *hold = 0; return AW_ERR_INVALIDATED; }
+    if (v->flags & AW_FLAG_GUEST_REPLY) {
+        if (v->type == AW_MSG_DEMT) return AW_NOERR;      /* landed: AWAIT_DEMT / gone  */
+        if (v->type == AW_MSG_DBUF) {
+            for (unsigned i = 0; i < s->gone_n; i++)
+                if (s->gone_dbuf[(s->gone_head + i) % AW_GONE_MAX] == v->reply_id) return AW_NOERR;
+        }
+        *hold = 0; return AW_ERR_MALFORMED;              /* a reply to no pending request */
+    }
+    switch (v->type) {
+    case AW_MSG_DSTA: *hold = 0; return AW_ERR_MALFUNCTION; /* a second dsta           */
+    case AW_MSG_DFRM: {
+        const uint8_t *sbf, *au; size_t sbf_len, au_len;
+        if (aw_get_bytes(v, AW_KEY_SBF, AW_VT_SBF, &sbf, &sbf_len) != AW_PARSE_OK ||
+            aw_sbuf_read(sbf, sbf_len, &au, &au_len, NULL, NULL) < 0) { *hold = 0; return AW_ERR_MALFORMED; }
+        return AW_NOERR;
+    }
+    case AW_MSG_DCOP: {
+        const uint8_t *kp; size_t kl; char key[128];
+        if (aw_get_bytes(v, AW_KEY_KEY, AW_VT_PLS, &kp, &kl) != AW_PARSE_OK ||
+            aw_bplist_read_string(kp, kl, key, sizeof key) < 0) { *hold = 0; return AW_ERR_MALFORMED; }
+        return AW_NOERR;
+    }
+    case AW_MSG_DCAN: case AW_MSG_DINV: case AW_MSG_DFIN: case AW_MSG_DSUP: case AW_MSG_DSET:
+    case AW_MSG_MDEC: case AW_MSG_MUUI:
+        return AW_NOERR;
+    default: *hold = 0; return AW_ERR_UNKNOWN_UUID;
+    }
+}
+
+/* Keep a copy of msg for delivery after the landing. 0, or <0 (no memory / too many). */
+static int hold_msg(aw_dsession *s, const uint8_t *msg, size_t len)
+{
+    if (s->held_n >= AW_HELD_MAX) return -1;
+    if (s->held_n == s->held_cap) {
+        unsigned cap = s->held_cap ? s->held_cap * 2 : 8;
+        struct aw_held *h = realloc(s->held, cap * sizeof(*h));
+        if (!h) return -1;
+        s->held = h; s->held_cap = cap;
+    }
+    uint8_t *c = malloc(len ? len : 1);
+    if (!c) return -1;
+    memcpy(c, msg, len);
+    s->held[s->held_n].msg = c; s->held[s->held_n].len = len;
+    s->held_n++;
+    return 0;
+}
+
+/* Deliver the held messages in arrival order, until the session lands a frame again
+ * (the rest waits for that landing) or is closed. Completion context, device lock held. */
+static void deliver_held(aw_engine *e, aw_dsession *s)
+{
+    while (s->used && s->held_n && s->pend_state != AW_FRM_LANDING) {
+        struct aw_held m = s->held[0];             /* pop the oldest: what remains is   */
+        memmove(s->held, s->held + 1, (s->held_n - 1) * sizeof(*s->held));
+        s->held_n--;                               /* only what close_session may free  */
+        aw_msg_view v;
+        if (aw_parse(m.msg, m.len, &v) == AW_PARSE_OK) {
+            const int closes = !(v.flags & AW_FLAG_GUEST_REPLY) &&
+                (v.type == AW_MSG_MDEC || v.type == AW_MSG_MUUI || v.type == AW_MSG_DINV);
+            if (closes) {                          /* nothing reaches it after a close  */
+                for (unsigned i = 0; i < s->held_n; i++) free(s->held[i].msg);
+                s->held_n = 0;
+            }
+            if (v.type == AW_MSG_MDEC || v.type == AW_MSG_MUUI) close_or_defer(e, s);
+            else (void)dispatch_session(e, s, &v, m.msg, m.len);
+        }
+        free(m.msg);
+    }
+}
 
 int32_t aw_engine_deliver(aw_engine *e, const uint8_t *msg, size_t len)
 {
@@ -1245,7 +1362,14 @@ int32_t aw_engine_deliver(aw_engine *e, const uint8_t *msg, size_t len)
     case AW_MSG_DCAP: return handle_dcap(e, &v);
     case AW_MSG_PDEC: return handle_opendec(e, &v);
     case AW_MSG_MDEC:
-    case AW_MSG_MUUI: return handle_closedec(e, &v);
+    case AW_MSG_MUUI: {
+        aw_dsession *cs = find_session(e, v.uuid);
+        if (cs && AW_WM(e) && cs->pend_state == AW_FRM_LANDING && hold_msg(cs, msg, len) == 0) {
+            cs->close_pending = 1;      /* gone for new messages, closed after the landing */
+            return AW_NOERR;
+        }
+        return handle_closedec(e, &v);
+    }
     case AW_MSG_MALL: return AW_NOERR;   /* customer build: noop                  */
     default: break;
     }
@@ -1253,25 +1377,20 @@ int32_t aw_engine_deliver(aw_engine *e, const uint8_t *msg, size_t len)
     /* session messages: route by UUID */
     aw_dsession *s = find_session(e, v.uuid);
     if (!s)              return AW_ERR_UNKNOWN_UUID; /* -19094                     */
-    if (s->invalidated)  return AW_ERR_INVALIDATED;  /* -19098                     */
 
-    /* a guest reply (flag 0x8) to one of our host requests (Dbuf / Demt) */
-    if (v.flags & AW_FLAG_GUEST_REPLY)
-        return handle_guest_reply(e, s, &v, msg, len);
-
-    switch (v.type) {
-    case AW_MSG_DSTA: return handle_dsta(e, s, &v);
-    case AW_MSG_DFRM: return handle_dfrm(e, s, &v);
-    case AW_MSG_DCAN: return handle_dcan(e, s, &v);
-    case AW_MSG_DINV: return handle_dinv(e, s, &v);
-    case AW_MSG_DFIN: return reply_err(e, &v, AW_NOERR); /* finish/flush: frames
-                                        complete synchronously on the Dbuf reply,
-                                        so a drain has nothing outstanding -> noErr */
-    case AW_MSG_DSUP: return handle_dsup(e, s, &v);
-    case AW_MSG_DCOP: return handle_dcop(e, s, &v);
-    case AW_MSG_DSET: return reply_err(e, &v, AW_NOERR);
-    default:          return AW_ERR_UNKNOWN_UUID;
+    if (AW_WM(e) && s->pend_state == AW_FRM_LANDING) {
+        /* VT-DECODE-WORKER: its frame lands on the worker. The status goes now; the
+         * delivery follows the landing, in arrival order (the synchronous engine's
+         * per-session queue-1 order). No memory to hold it: deliver it now. */
+        int hold = 0;
+        int32_t st = held_status(e, s, &v, &hold);
+        if (!hold) return st;
+        if (hold_msg(s, msg, len) == 0) {
+            if (v.type == AW_MSG_DINV) s->close_pending = 1; /* gone for new messages */
+            return st;
+        }
     }
+    return dispatch_session(e, s, &v, msg, len);
 }
 
 /* ---- VT-DECODE-WORKER: the worker side (see aw_session.h) ----------------- */
@@ -1320,13 +1439,13 @@ int aw_job_complete(aw_engine *e, aw_job *j)
         }                                 /* a given-up frame's picture is dropped  */
     } else if (s && j->kind == AW_JOB_LAND) {
         finish_lend(e, s, j->got, j->bu, j->mapid, &j->ob, j->dr, j->cr);
-        if (s->give_up_after) {
-            s->give_up_after = 0;
-            if (s->pend_state == AW_FRM_AWAIT_DEMT && !s->pend_replied) give_up_demt(e, s);
-            if (!s->closing) start_next(e, s);
-        }
     }
-    if (s && s->jobs) s->jobs--;
+    if (s) {
+        if (s->jobs) s->jobs--;
+        /* the messages that arrived while it landed, in order, now (VT-DECODE-WORKER) */
+        if (j->kind == AW_JOB_LAND && s->held_n) deliver_held(e, s);
+        if (s->used && s->close_pending && !s->jobs && !s->held_n) close_session(e, s);
+    }
     free_job(j);
     return 0;
 }
@@ -1341,8 +1460,10 @@ static void abandon_lend(aw_engine *e, aw_dsession *s)
     s->pend_state = AW_FRM_IDLE;
     s->pre_state = AW_PRE_NONE;
     s->land_waits = 0;
-    s->give_up_after = 0;
-    if (!s->closing) start_next(e, s);
+    /* no start_next, nothing emitted: the reset dropped the backlog and the device is
+     * quiesced (no queue-1 write, no interrupt); the messages held for it go too */
+    for (unsigned i = 0; i < s->held_n; i++) free(s->held[i].msg);
+    s->held_n = 0;
 }
 
 void aw_job_discard(aw_engine *e, aw_job *j)
@@ -1357,6 +1478,11 @@ void aw_job_discard(aw_engine *e, aw_job *j)
             abandon_lend(e, s);
         }
         if (s->jobs) s->jobs--;
+        if (s->close_pending && !s->jobs) {
+            for (unsigned i = 0; i < s->held_n; i++) free(s->held[i].msg);
+            s->held_n = 0;
+            close_session(e, s);          /* no emission: close puts back and frees only */
+        }
     }
     free_job(j);
 }
