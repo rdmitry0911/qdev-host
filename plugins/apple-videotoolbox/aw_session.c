@@ -123,7 +123,8 @@ typedef struct aw_dsession {
     struct aw_held { uint8_t *msg; size_t len; } *held;
     unsigned     held_n, held_cap;
 } aw_dsession;
-#define AW_HELD_MAX 256u
+#define AW_HELD_MAX 256u                  /* per session                               */
+#define AW_HELD_BYTES_MAX (64u << 20)      /* per engine, all sessions (a dfrm carries its AU) */
 
 enum { AW_JOB_AHEAD = 1, AW_JOB_LAND, AW_JOB_DECODE };
 struct aw_job {
@@ -150,6 +151,7 @@ struct aw_engine {
     uint64_t       next_reply_id; /* host reply clerk: numbers from 100          */
     uint64_t       next_epoch;    /* worker mode: session epochs                  */
     int            destroying;    /* aw_engine_destroy: close waits for no job     */
+    size_t         held_bytes;    /* worker mode: bytes of all held messages      */
 };
 
 #define AW_WM(e) ((e)->cfg.submit_job != NULL)
@@ -438,7 +440,7 @@ static void close_session(aw_engine *e, aw_dsession *s)
         s->closing = 1; s->close_pending = 1;
         return;
     }
-    for (unsigned i = 0; i < s->held_n; i++) free(s->held[i].msg);
+    for (unsigned i = 0; i < s->held_n; i++) { e->held_bytes -= s->held[i].len; free(s->held[i].msg); }
     free(s->held);
     if ((s->pend_state == AW_FRM_AWAIT_DEMT || s->pend_state == AW_FRM_LANDING) && e->cfg.put_buffer)
         e->cfg.put_buffer(e->cfg.buf_ctx, &s->pend_buf); /* let a held buffer go */
@@ -448,6 +450,13 @@ static void close_session(aw_engine *e, aw_dsession *s)
     if (s->dec && e->cfg.be && e->cfg.be->close_decoder)
         e->cfg.be->close_decoder(s->dec);
     memset(s, 0, sizeof(*s));
+}
+
+/* Free every held message of s (they will not be delivered). */
+static void drop_held(aw_engine *e, aw_dsession *s)
+{
+    for (unsigned i = 0; i < s->held_n; i++) { e->held_bytes -= s->held[i].len; free(s->held[i].msg); }
+    s->held_n = 0;
 }
 
 /* mdec / muui / dinv: close now, or - worker mode, jobs still running for it - make
@@ -1278,7 +1287,17 @@ static int32_t held_status(aw_engine *e, aw_dsession *s, const aw_msg_view *v, i
     *hold = 1;
     if (s->invalidated) { *hold = 0; return AW_ERR_INVALIDATED; }
     if (v->flags & AW_FLAG_GUEST_REPLY) {
-        if (v->type == AW_MSG_DEMT) return AW_NOERR;      /* landed: AWAIT_DEMT / gone  */
+        if (v->type == AW_MSG_DEMT) {
+            for (unsigned i = 0; i < s->gone_n; i++)      /* a given-up frame's Demt         */
+                if (s->gone_dbuf[(s->gone_head + i) % AW_GONE_MAX] == v->reply_id) return AW_NOERR;
+            /* Otherwise it is taken as the reply to the landing frame's Demt, as the synchronous
+             * engine takes it once that frame has landed. A lend that cannot land (resolve failed:
+             * known now) leaves no Demt to reply to: refused as there (-19093). A conforming guest
+             * never sends it - the Demt goes out only after the landing; the one case not known
+             * here, a decode failure of that same frame, is the same stray reply. */
+            if (s->land_got != 0) { *hold = 0; return AW_ERR_MALFORMED; }
+            return AW_NOERR;
+        }
         if (v->type == AW_MSG_DBUF) {
             for (unsigned i = 0; i < s->gone_n; i++)
                 if (s->gone_dbuf[(s->gone_head + i) % AW_GONE_MAX] == v->reply_id) return AW_NOERR;
@@ -1286,7 +1305,12 @@ static int32_t held_status(aw_engine *e, aw_dsession *s, const aw_msg_view *v, i
         *hold = 0; return AW_ERR_MALFORMED;              /* a reply to no pending request */
     }
     switch (v->type) {
-    case AW_MSG_DSTA: *hold = 0; return AW_ERR_MALFUNCTION; /* a second dsta           */
+    case AW_MSG_DSTA: {                                 /* handle_dsta's order: ,fds first */
+        const uint8_t *fds; size_t fl;
+        *hold = 0;
+        return aw_get_bytes(v, AW_KEY_FDS, AW_VT_FDS, &fds, &fl) != AW_PARSE_OK
+            ? AW_ERR_MALFORMED : AW_ERR_MALFUNCTION;        /* a second dsta                   */
+    }
     case AW_MSG_DFRM: {
         const uint8_t *sbf, *au; size_t sbf_len, au_len;
         if (aw_get_bytes(v, AW_KEY_SBF, AW_VT_SBF, &sbf, &sbf_len) != AW_PARSE_OK ||
@@ -1307,9 +1331,9 @@ static int32_t held_status(aw_engine *e, aw_dsession *s, const aw_msg_view *v, i
 }
 
 /* Keep a copy of msg for delivery after the landing. 0, or <0 (no memory / too many). */
-static int hold_msg(aw_dsession *s, const uint8_t *msg, size_t len)
+static int hold_msg(aw_engine *e, aw_dsession *s, const uint8_t *msg, size_t len)
 {
-    if (s->held_n >= AW_HELD_MAX) return -1;
+    if (s->held_n >= AW_HELD_MAX || len > AW_HELD_BYTES_MAX - e->held_bytes) return -1;
     if (s->held_n == s->held_cap) {
         unsigned cap = s->held_cap ? s->held_cap * 2 : 8;
         struct aw_held *h = realloc(s->held, cap * sizeof(*h));
@@ -1321,6 +1345,7 @@ static int hold_msg(aw_dsession *s, const uint8_t *msg, size_t len)
     memcpy(c, msg, len);
     s->held[s->held_n].msg = c; s->held[s->held_n].len = len;
     s->held_n++;
+    e->held_bytes += len;
     return 0;
 }
 
@@ -1332,14 +1357,12 @@ static void deliver_held(aw_engine *e, aw_dsession *s)
         struct aw_held m = s->held[0];             /* pop the oldest: what remains is   */
         memmove(s->held, s->held + 1, (s->held_n - 1) * sizeof(*s->held));
         s->held_n--;                               /* only what close_session may free  */
+        e->held_bytes -= m.len;
         aw_msg_view v;
         if (aw_parse(m.msg, m.len, &v) == AW_PARSE_OK) {
             const int closes = !(v.flags & AW_FLAG_GUEST_REPLY) &&
                 (v.type == AW_MSG_MDEC || v.type == AW_MSG_MUUI || v.type == AW_MSG_DINV);
-            if (closes) {                          /* nothing reaches it after a close  */
-                for (unsigned i = 0; i < s->held_n; i++) free(s->held[i].msg);
-                s->held_n = 0;
-            }
+            if (closes) drop_held(e, s);           /* nothing reaches it after a close  */
             if (v.type == AW_MSG_MDEC || v.type == AW_MSG_MUUI) close_or_defer(e, s);
             else (void)dispatch_session(e, s, &v, m.msg, m.len);
         }
@@ -1364,7 +1387,7 @@ int32_t aw_engine_deliver(aw_engine *e, const uint8_t *msg, size_t len)
     case AW_MSG_MDEC:
     case AW_MSG_MUUI: {
         aw_dsession *cs = find_session(e, v.uuid);
-        if (cs && AW_WM(e) && cs->pend_state == AW_FRM_LANDING && hold_msg(cs, msg, len) == 0) {
+        if (cs && AW_WM(e) && cs->pend_state == AW_FRM_LANDING && hold_msg(e, cs, msg, len) == 0) {
             cs->close_pending = 1;      /* gone for new messages, closed after the landing */
             return AW_NOERR;
         }
@@ -1381,14 +1404,15 @@ int32_t aw_engine_deliver(aw_engine *e, const uint8_t *msg, size_t len)
     if (AW_WM(e) && s->pend_state == AW_FRM_LANDING) {
         /* VT-DECODE-WORKER: its frame lands on the worker. The status goes now; the
          * delivery follows the landing, in arrival order (the synchronous engine's
-         * per-session queue-1 order). No memory to hold it: deliver it now. */
+         * per-session queue-1 order). Past the hold limits (messages / bytes) it is
+         * refused without any effect, as a stalled device would leave it: delivering it
+         * now would overtake the held ones (decode order, queue-1 order). */
         int hold = 0;
         int32_t st = held_status(e, s, &v, &hold);
         if (!hold) return st;
-        if (hold_msg(s, msg, len) == 0) {
-            if (v.type == AW_MSG_DINV) s->close_pending = 1; /* gone for new messages */
-            return st;
-        }
+        if (hold_msg(e, s, msg, len) != 0) return AW_ERR_MALFUNCTION;
+        if (v.type == AW_MSG_DINV) s->close_pending = 1;  /* gone for new messages */
+        return st;
     }
     return dispatch_session(e, s, &v, msg, len);
 }
@@ -1462,8 +1486,7 @@ static void abandon_lend(aw_engine *e, aw_dsession *s)
     s->land_waits = 0;
     /* no start_next, nothing emitted: the reset dropped the backlog and the device is
      * quiesced (no queue-1 write, no interrupt); the messages held for it go too */
-    for (unsigned i = 0; i < s->held_n; i++) free(s->held[i].msg);
-    s->held_n = 0;
+    drop_held(e, s);
 }
 
 void aw_job_discard(aw_engine *e, aw_job *j)
@@ -1479,8 +1502,7 @@ void aw_job_discard(aw_engine *e, aw_job *j)
         }
         if (s->jobs) s->jobs--;
         if (s->close_pending && !s->jobs) {
-            for (unsigned i = 0; i < s->held_n; i++) free(s->held[i].msg);
-            s->held_n = 0;
+            drop_held(e, s);
             close_session(e, s);          /* no emission: close puts back and frees only */
         }
     }

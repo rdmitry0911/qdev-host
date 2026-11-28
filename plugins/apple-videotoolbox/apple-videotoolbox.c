@@ -206,6 +206,7 @@ typedef struct vt_dev {
     vt_locked_backend lbe;
     pthread_rwlock_t mem;
     int              quiesced;     /* host main loop only */
+    int              tearing_down; /* vt_teardown: no queue-1 emission, no interrupt (d->m) */
     aw_session_cfg   engine_cfg;   /* setup only: the engine's configuration */
 } vt_dev;
 
@@ -285,6 +286,7 @@ static void *vt_scatter_map(void *ctx, uint64_t gpa, uint64_t len) { return vt_m
 
 static void vt_raise(vt_dev *d, unsigned queue)
 {
+    if (d->tearing_down) return;     /* VT-DECODE-WORKER: no host service at teardown */
     uint16_t vec = queue < VT_QUEUES ? d->queue_msix[queue] : d->msix_config;
     if (d->host && d->host->irq_trigger && vec != VT_MSIX_NO_VECTOR)
         (void)d->host->irq_trigger(d->host->host, vec);
@@ -345,6 +347,7 @@ static void vt_flush_pending(vt_dev *d)
 static void vt_emit(void *ctx, const uint8_t *msg, size_t len)
 {
     vt_dev *d = ctx;
+    if (d->tearing_down) return;     /* VT-DECODE-WORKER: nothing goes out at teardown */
     char fc[5]; vt_msg_fourcc(msg, len, fc);
     /* AGVA_DEBUG: ground-truth hexdump of the EXACT bytes emitted for a
      * host->guest message (what the guest framework receives, since delivery is
@@ -1212,9 +1215,10 @@ static void vt_teardown(void *priv)
     if (!d) return;
     if (g_dev == d) g_dev = NULL;
     if (d->worker_on) {
-        /* the queued jobs go without running (no host service at teardown); the one in
-         * progress finishes without its post hook, then the thread joins */
+        /* no emission or interrupt from here on; the queued jobs go without running and the
+         * one in progress is discarded when it returns (vt_worker_stop), then the thread joins */
         pthread_mutex_lock(&d->m);
+        d->tearing_down = 1;
         vt_worker_discard(&d->worker);
         pthread_mutex_unlock(&d->m);
         vt_worker_stop(&d->worker);

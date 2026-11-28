@@ -48,8 +48,8 @@ void vt_worker_wait(void *w);
 /* Discard every queued job (device reset or teardown; device lock held). The queue is taken under the
  * queue lock and discarded without it (a discard may reach the engine, which may submit). */
 void vt_worker_discard(vt_worker *w);
-/* Stop and join (device lock NOT held): what is still queued runs first (none after vt_worker_discard);
- * no post hook runs once stop is set. */
+/* Stop and join (teardown; device lock NOT held): no job starts after stop; the one in progress is discarded
+ * (no emission, no post hook, no follow-up job), then whatever is queued. */
 void vt_worker_stop(vt_worker *w);
 void vt_worker_destroy(vt_worker *w);
 

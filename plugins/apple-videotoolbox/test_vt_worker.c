@@ -15,7 +15,8 @@
  * `worker=0`), WORKER = the device default after the fix. W-01/W-03/W-06/W-12 hold the contract; W-02/W-08/W-08b/
  * W-10/W-11 require the WORKER per-session queue-1 byte stream and decode order to equal SYNC's (messages that
  * arrive while a session's frame lands are delivered after it, in order); W-04/W-05/W-07/W-09/W-13 the lock,
- * reset, teardown and fallback rules (review findings R1-R5 of e22be84).
+ * reset, teardown and fallback rules (review findings R1-R5 of e22be84); W-14..W-17 the hold limits, the held
+ * statuses and the teardown mute (review findings R6-R9 of fc547dc).
  * CLEAN-ROOM.
  */
 #include "vt_submit.h"
@@ -357,6 +358,41 @@ static void *deadlock_watchdog(void *arg)
     _exit(3);
 }
 
+/* direct delivery under the device lock (a message too large for the synthetic ring) */
+static int32_t w14_deliver(const uint8_t *m, size_t n)
+{ pthread_mutex_lock(&g_dm); int32_t st = aw_engine_deliver(g_e, m, n); pthread_mutex_unlock(&g_dm); return st; }
+static size_t w14_dfrm_big(uint8_t *m, size_t cap, const uint8_t *uuid, int64_t frm, uint64_t rid, size_t aul)
+{
+    static uint8_t au[(1u << 20) + 16], sbf[(1u << 20) + 256];
+    memset(au, 0, sizeof au); au[3] = 4; au[4] = 0x65; au[5] = 7;
+    size_t sl = aw_sbuf_write(sbf, sizeof sbf, NULL, au, aul);
+    aw_builder b; aw_builder_init(&b, m, cap);
+    aw_build_header(&b, AW_MSG_DFRM, AW_FLAG_GUEST_REQ, uuid, rid);
+    aw_put_s64(&b, AW_KEY_FRM, frm);
+    aw_put_bytes(&b, AW_KEY_SBF, AW_VT_SBF, sbf, sl);
+    aw_put_u32(&b, AW_KEY_DFL, 1);
+    return aw_build_finalize(&b);
+}
+/* W-14: many async dfrms while one frame lands; record the decode order of the first 64 */
+static uint8_t w14_ord[2][64]; static int w14_nord[2], w14_refused[2];
+static void w14_run(int w)
+{
+    start(w);
+    open_session(UA, 1);
+    if (w) latch(1);
+    uint8_t m[512];
+    (void)w14_deliver(m, build_dbuf_reply(m, UA, 0xA100));
+    if (w) (void)wait_landing(1000);
+    w14_refused[w] = 0;
+    for (int i = 0; i < 300; i++)
+        if (w14_deliver(m, build_dfrm(m, UA, 41 + i, 900 + i, (uint8_t)(2 + (i % 200)), 1)) == AW_ERR_MALFUNCTION) w14_refused[w]++;
+    if (w) latch(0);
+    idle();
+    w14_nord[w] = g_norder < 64 ? g_norder : 64; memcpy(w14_ord[w], g_order, (size_t)w14_nord[w]);
+    finish();
+}
+static void *w17_stop(void *a) { (void)a; vt_worker_stop(&g_w); return NULL; }
+
 static uint8_t s_wire[96][512]; static size_t s_wirel[96]; static int s_nwire; static uint8_t s_order[64]; static int s_norder, s_decodes;
 static void keep(void) { s_nwire = g_nwire; memcpy(s_wire, g_wire, sizeof s_wire); memcpy(s_wirel, g_wirel, sizeof s_wirel);
                          s_norder = g_norder; memcpy(s_order, g_order, sizeof s_order); s_decodes = g_decodes; }
@@ -542,6 +578,73 @@ int main(void)
         g_worker = 1; idle();
         CHECK(g_decodes == 1 && count_type(AW_MSG_DEMT) == 1, "W-13: one decode for the unit (%d), Demt out", g_decodes);
         finish();
+    }
+
+    printf("-- W-14: past the hold limit a message is refused, never delivered ahead of the held ones (review R6) --\n");
+    w14_run(0); w14_run(1);
+    CHECK(w14_nord[0] == w14_nord[1] && !memcmp(w14_ord[0], w14_ord[1], (size_t)w14_nord[0]),
+          "W-14: the first %d decodes are in the same order as SYNC", w14_nord[1]);
+    CHECK(w14_refused[0] == 0 && w14_refused[1] == 300 - 256,
+          "W-14: SYNC refuses none, WORKER refuses the %d past the 256 held (-12909)", w14_refused[1]);
+    {   /* the byte cap: 1 MiB dfrms while a frame lands, 64 MiB held at most per engine */
+        start(1);
+        open_session(UA, 1);
+        latch(1);
+        uint8_t m[512];
+        (void)w14_deliver(m, build_dbuf_reply(m, UA, 0xA100));
+        (void)wait_landing(1000);
+        static uint8_t big[(1u << 20) + 1024];
+        int ok_n = 0, refused = 0;
+        for (int i = 0; i < 70; i++) {
+            int32_t st = w14_deliver(big, w14_dfrm_big(big, sizeof big, UA, 41 + i, 900 + i, 1u << 20));
+            if (st == AW_NOERR) ok_n++; else if (st == AW_ERR_MALFUNCTION) refused++;
+        }
+        latch(0); idle();
+        CHECK(ok_n == 63 && refused == 7, "W-14: byte cap: %d held, %d refused (64 MiB, ~1 MiB each)", ok_n, refused);
+        finish();
+    }
+
+    printf("-- W-15 / W-16: statuses of held messages equal SYNC (review R7 / R8) --\n");
+    {
+        int32_t st[2][2];
+        for (int w = 0; w <= 1; w++) {
+            start(w);
+            open_session(UA, 1);
+            POST(build_dbuf_reply(g_m, UA, 0xA100));
+            unsigned c = POST(msg0(g_m, AW_MSG_DSTA, AW_FLAG_GUEST_REQ, UA)); /* no ,fds */
+            drain(); idle();
+            st[0][w] = stat_of(c);
+            finish();
+            start(w);
+            open_session(UA, 1);
+            g_resolve_fail = 1;
+            POST(build_dbuf_reply(g_m, UA, 0xA100));
+            c = POST(build_demt_reply(g_m, UA));                             /* stray    */
+            drain(); idle();
+            st[1][w] = stat_of(c);
+            finish();
+        }
+        CHECK(st[0][0] == st[0][1] && st[0][1] == AW_ERR_MALFORMED, "W-15: dsta without ,fds: %d == SYNC %d", st[0][1], st[0][0]);
+        CHECK(st[1][0] == st[1][1] && st[1][1] == AW_ERR_MALFORMED, "W-16: stray Demt reply behind a failing lend: %d == SYNC %d", st[1][1], st[1][0]);
+    }
+
+    printf("-- W-17: teardown with a landing in progress: nothing emitted, no post hook (review R9) --\n");
+    {
+        start(1);
+        open_session(UA, 1);
+        latch(1);
+        POST(build_dbuf_reply(g_m, UA, 0xA100)); drain();
+        (void)wait_landing(1000);
+        int before = g_nwire, posts = g_posts;
+        pthread_mutex_lock(&g_dm); vt_worker_discard(&g_w); pthread_mutex_unlock(&g_dm);
+        pthread_t st; pthread_create(&st, NULL, w17_stop, NULL);
+        usleep(50000);
+        latch(0);
+        pthread_join(st, NULL);
+        int emitted = g_nwire - before, posted = g_posts - posts;
+        aw_engine_destroy(g_e); vt_worker_destroy(&g_w); g_e = NULL;
+        CHECK(emitted == 0 && posted == 0 && g_puts == 1 && g_closes == 1,
+              "W-17: %d messages, %d post hooks after teardown began; buffer back (%d), decoder closed (%d)", emitted, posted, g_puts, g_closes);
     }
 
     printf("-- W-09: device reset with a queued LAND and a parked dfrm (review R1) --\n");

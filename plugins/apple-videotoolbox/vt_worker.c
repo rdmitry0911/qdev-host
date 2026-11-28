@@ -14,8 +14,9 @@ static void *worker_main(void *arg)
     for (;;) {
         pthread_mutex_lock(&w->qm);
         while (!w->q_n && !__atomic_load_n(&w->stop, __ATOMIC_ACQUIRE)) pthread_cond_wait(&w->qcv, &w->qm);
-        if (!w->q_n && __atomic_load_n(&w->stop, __ATOMIC_ACQUIRE)) { pthread_mutex_unlock(&w->qm); break; }
+        const int stopping = __atomic_load_n(&w->stop, __ATOMIC_ACQUIRE);
         pthread_mutex_unlock(&w->qm);
+        if (stopping) break;              /* teardown: no further job runs (the rest is discarded) */
 
         /* guest memory first: a quiesce (write) holds the job back before it is popped,
          * so a reset in that window can discard it */
@@ -29,17 +30,31 @@ static void *worker_main(void *arg)
             do {
                 aw_job_work(w->e, j);                 /* decode / landing: no device lock */
                 pthread_mutex_lock(w->dev_m);
-                again = aw_job_complete(w->e, j);     /* state + emission: device lock    */
-                if (!again) {
-                    /* no host service after stop (teardown) */
-                    if (w->post && !__atomic_load_n(&w->stop, __ATOMIC_ACQUIRE)) w->post(w->post_ctx);
-                    pthread_cond_broadcast(&w->done);
+                if (__atomic_load_n(&w->stop, __ATOMIC_ACQUIRE)) {
+                    /* teardown began while it ran: its result goes without any emission,
+                     * host service or follow-up job */
+                    aw_job_discard(w->e, j);
+                    again = 0;
+                } else {
+                    again = aw_job_complete(w->e, j); /* state + emission: device lock    */
+                    if (!again && w->post) w->post(w->post_ctx);
                 }
+                if (!again) pthread_cond_broadcast(&w->done);
                 pthread_mutex_unlock(w->dev_m);
             } while (again);
         }
         if (w->mem) pthread_rwlock_unlock((pthread_rwlock_t *)w->mem);
     }
+    /* what is still queued is discarded (device lock: the engine's state) */
+    pthread_mutex_lock(w->dev_m);
+    pthread_mutex_lock(&w->qm);
+    aw_job **q = w->q; size_t cap = w->q_cap, head = w->q_head, n = w->q_n;
+    w->q = NULL; w->q_cap = w->q_head = w->q_n = 0;
+    pthread_mutex_unlock(&w->qm);
+    for (size_t i = 0; i < n; i++) aw_job_discard(w->e, q[(head + i) % cap]);
+    free(q);
+    pthread_cond_broadcast(&w->done);
+    pthread_mutex_unlock(w->dev_m);
     return NULL;
 }
 
@@ -114,7 +129,7 @@ void vt_worker_stop(vt_worker *w)
     __atomic_store_n(&w->stop, 1, __ATOMIC_RELEASE);
     pthread_cond_signal(&w->qcv);
     pthread_mutex_unlock(&w->qm);
-    pthread_join(w->th, NULL);       /* it runs what is still queued (none after a discard) */
+    pthread_join(w->th, NULL);       /* the job in progress is discarded, then the queue */
     w->running = 0;
 }
 
