@@ -1169,7 +1169,7 @@ int main(int argc, char **argv)
         CHECK(ops->abi_version >= 4 && ops->reload && ops->backend_report,
               "plugin exposes qdp v4 reload + backend_report (abi %u)", ops->abi_version);
         if (ops->reload && ops->backend_report) {
-            char root[256], sib[512], rep[512];
+            char root[256], sib[512], rep[2048];
             const char *slash = strrchr(reload_golden, '/');
             unsigned long prev_instance = 0;
             int ok_cycles = 0;
@@ -1358,7 +1358,7 @@ int main(int argc, char **argv)
              * already destroyed, device down), then auto-rollback by reloading a
              * known-good instance.  Proves the vtable gate + rollback recovery. */
             {
-                char marker[64]; char badrep[512];
+                char marker[64]; char badrep[2048];
                 char *good = mint_instance(reload_golden, sib, 99, root, marker, sizeof(marker));
                 /* a non-libmlapi .so: the shipped backing_A.so has no qmu_* */
                 const char *bad = "plugins/uniq-vgpu/backing_A.so";
