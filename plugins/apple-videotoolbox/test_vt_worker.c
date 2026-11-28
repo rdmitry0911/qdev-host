@@ -676,6 +676,18 @@ int main(void)
     }
     finish();
 
+    printf("-- W-18: the device's worker default (D-VT-WORKER-NVDEC): off on CUDA/NVDEC, on on VA-API --\n");
+    CHECK(vt_worker_wanted(NULL, 1, 1) == 0 && vt_worker_wanted("backend=nvdec", 1, 1) == 0,
+          "W-18: NVIDIA backend, no worker= arg: synchronous engine (as dcaab99)");
+    CHECK(vt_worker_wanted(NULL, 1, 0) == 1 && vt_worker_wanted("backend=vaapi,hevc10=1", 1, 0) == 1,
+          "W-18: VA-API backend, no worker= arg: decode worker");
+    CHECK(vt_worker_wanted("worker=1", 1, 1) == 1 && vt_worker_wanted("backend=nvdec,worker=1", 1, 1) == 1,
+          "W-18: worker=1 runs the worker on NVIDIA too");
+    CHECK(vt_worker_wanted("worker=0", 1, 0) == 0 && vt_worker_wanted("hevc10=1 worker=0", 1, 0) == 0,
+          "W-18: worker=0 keeps the synchronous engine on VA-API");
+    CHECK(vt_worker_wanted("worker=1", 0, 0) == 0 && vt_worker_wanted("noworker=1", 1, 1) == 0,
+          "W-18: no decoding backend: no worker; a key merely ending in 'worker' is not the arg");
+
     printf("%s: VT-DECODE-WORKER\n", g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;
 }

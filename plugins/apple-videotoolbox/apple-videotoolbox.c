@@ -1106,9 +1106,15 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
         cfg.copy_frame = vt_copy_frame;
         cfg.put_buffer = vt_put_buffer;
         cfg.buf_ctx = d;
-        /* VT-DECODE-WORKER: default on with a decoding backend; `worker=0` keeps the
-         * synchronous engine (the pre-worker behaviour). */
-        d->worker_on = d->be && d->be->decode && !(args && strstr(args, "worker=0"));
+        /* VT-DECODE-WORKER: on with a decoding backend, except on CUDA/NVDEC (D-VT-WORKER-NVDEC:
+         * the synchronous engine there, as dcaab99); `worker=0` / `worker=1` decide explicitly. */
+        {
+            int nv = d->nvdec != NULL;
+#ifdef VTPV_HAVE_LAVC
+            if (d->lavc && vtpv_lavc_hw_type(d->lavc) == VTPV_LAVC_HW_CUDA) nv = 1;
+#endif
+            d->worker_on = vt_worker_wanted(args, d->be && d->be->decode, nv);
+        }
         if (d->worker_on) {
             /* a quiesce (writer) is not starved by the worker's per-job read locks */
             pthread_rwlockattr_t ra;

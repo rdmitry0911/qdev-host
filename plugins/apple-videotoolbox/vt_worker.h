@@ -53,6 +53,13 @@ void vt_worker_discard(vt_worker *w);
 void vt_worker_stop(vt_worker *w);
 void vt_worker_destroy(vt_worker *w);
 
+/* Whether the device runs its engine on the decode worker (D-VT-WORKER-NVDEC). Only with a decoding
+ * backend; `worker=0` / `worker=1` in the plugin args decide; otherwise on, except on an NVIDIA
+ * (CUDA/NVDEC) backend: there v75 (qdev-host eb5be16) stalled 4K HEVC Main 10 playback and a queue-0
+ * status timed out, while the synchronous engine (dcaab99) passed; the worker stays the default on
+ * VA-API until the NVDEC cause is closed. */
+int vt_worker_wanted(const char *args, int has_decode, int nvidia);
+
 /* A backend whose every call holds one mutex (the stream core and the legacy backends are
  * single-entry: the worker's decode / landing and the device thread's open / close / query
  * never overlap). */

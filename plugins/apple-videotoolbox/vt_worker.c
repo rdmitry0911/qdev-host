@@ -144,6 +144,16 @@ void vt_worker_destroy(vt_worker *w)
     pthread_mutex_destroy(&w->qm);
 }
 
+int vt_worker_wanted(const char *args, int has_decode, int nvidia)
+{
+    if (!has_decode) return 0;
+    for (const char *q = args; q && (q = strstr(q, "worker=")); q += 7) {
+        if (q != args && q[-1] != ',' && q[-1] != ' ') continue;   /* a key ending in "worker" */
+        if (q[7] == '0' || q[7] == '1') return q[7] == '1';
+    }
+    return !nvidia;
+}
+
 /* ---- the single-entry backend (one per process: the device is one per host process) */
 
 static pthread_mutex_t g_be_m = PTHREAD_MUTEX_INITIALIZER;
