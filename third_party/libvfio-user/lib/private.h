@@ -96,6 +96,7 @@ typedef struct {
     int         req_efd;    /* eventfd for irq req */
     uint32_t    max_ivs;    /* maximum number of ivs supported */
     pthread_mutex_t lock;   /* efds[] changes vs. vfu_irq_trigger() (qdev-host) */
+    int         trigger_index; /* (qdev-host) INTx/MSI/MSI-X index that owns efds[], -1: none; under lock */
     int         efds[0];    /* must be last */
 } vfu_irqs_t;
 

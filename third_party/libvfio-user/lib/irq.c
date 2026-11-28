@@ -125,6 +125,9 @@ irqs_disable(vfu_ctx_t *vfu_ctx, uint32_t index, uint32_t start, uint32_t count)
     for (i = start; i < count; i++) {
         close_safely(&efds[i]);
     }
+    if (efds == vfu_ctx->irqs->efds && vfu_ctx->irqs->trigger_index == (int)index) {
+        vfu_ctx->irqs->trigger_index = -1;      /* (qdev-host) see vfu_irq_trigger_index() */
+    }
     pthread_mutex_unlock(&vfu_ctx->irqs->lock);
 }
 
@@ -141,6 +144,7 @@ irqs_reset(vfu_ctx_t *vfu_ctx)
     for (i = 0; i < vfu_ctx->irqs->max_ivs; i++) {
         close_safely(&efds[i]);
     }
+    vfu_ctx->irqs->trigger_index = -1;
     pthread_mutex_unlock(&vfu_ctx->irqs->lock);
 }
 
@@ -255,6 +259,10 @@ irqs_set_data_eventfd(vfu_ctx_t *vfu_ctx, struct vfio_irq_set *irq_set,
         pthread_mutex_lock(&vfu_ctx->irqs->lock);
         close_safely(efd);
         *efd = consume_fd(data, irq_set->count, j);
+        if (irq_set->index == VFIO_PCI_INTX_IRQ_INDEX || irq_set->index == VFIO_PCI_MSI_IRQ_INDEX ||
+            irq_set->index == VFIO_PCI_MSIX_IRQ_INDEX) {
+            vfu_ctx->irqs->trigger_index = (int)irq_set->index;    /* (qdev-host) */
+        }
         pthread_mutex_unlock(&vfu_ctx->irqs->lock);
         switch (irq_set->index) {
         case VFIO_PCI_ERR_IRQ_INDEX:
@@ -357,6 +365,19 @@ device_set_irqs_validate(vfu_ctx_t *vfu_ctx, vfu_msg_t *msg)
         line = __LINE__;
         goto invalid;
     }
+    /*
+     * (qdev-host) MASK/UNMASK with an eventfd (the INTx resample fd a KVM client sends) is not implemented: the
+     * fd would never be read, so the device would not see the guest's later unmasks and level INTx would stall
+     * after its first assertion.  Refuse it: the QEMU client then keeps its userspace INTx path (EOI on BAR
+     * access followed by an UNMASK message with DATA_NONE, which reaches the IRQ state callback).  Debt
+     * D-VFU-INTX-RESAMPLEFD: real resamplefd support (keep and poll the fd, run the state callback on each
+     * signal), so a KVM client keeps its in-kernel INTx fast path.
+     */
+    if ((a_type == VFIO_IRQ_SET_ACTION_MASK || a_type == VFIO_IRQ_SET_ACTION_UNMASK) &&
+        d_type == VFIO_IRQ_SET_DATA_EVENTFD) {
+        line = __LINE__;
+        goto invalid;
+    }
     // If fd's are provided, ensure it's only for VFIO_IRQ_SET_DATA_EVENTFD
     if (msg->in.nr_fds != 0 && d_type != VFIO_IRQ_SET_DATA_EVENTFD) {
         line = __LINE__;
@@ -437,6 +458,21 @@ validate_irq_subindex(vfu_ctx_t *vfu_ctx, uint32_t subindex)
     }
 
     return true;
+}
+
+EXPORT int
+vfu_irq_trigger_index(vfu_ctx_t *vfu_ctx)
+{
+    int index;
+
+    assert(vfu_ctx != NULL);
+    if (vfu_ctx->irqs == NULL) {
+        return -1;
+    }
+    pthread_mutex_lock(&vfu_ctx->irqs->lock);
+    index = vfu_ctx->irqs->trigger_index;
+    pthread_mutex_unlock(&vfu_ctx->irqs->lock);
+    return index;
 }
 
 EXPORT int

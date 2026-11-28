@@ -524,12 +524,43 @@ static void pvg_loop_run_sync(PvgState *s, void (*fn)(void *), void *opaque)
  * changes the guest memory map (quiesce .. resume) no trigger runs: a raise
  * is latched and delivered by resume (MSI is edge-like; the guest reads the
  * read-and-clear status registers). */
+#ifndef VFU_IRQ_TRIGGER_INDEX
+#error "uniq-vgpu INTx (D-ARM64-INTX) needs the vendored libvfio-user's vfu_irq_trigger_index()"
+#endif
+static const char *pvg_irq_index_name(int idx)
+{
+    return idx == VFU_DEV_INTX_IRQ ? "INTx (level)" : idx == VFU_DEV_MSI_IRQ ? "MSI" :
+           idx == VFU_DEV_MSIX_IRQ ? "MSI-X" : "nothing (disabled)";
+}
+
+/* The client's INTx MASK/UNMASK (libvfio-user IRQ-state callback, host vfio-user thread).  An UNMASK is the
+ * client's EOI: the line is down again and re-asserts while a raise is unacknowledged (pvg-intx.h). */
+static void pvg_intx_state_cb(vfu_ctx_t *ctx, uint32_t start, uint32_t count, bool mask)
+{
+    PvgState *s = g;
+    bool deferred;
+
+    (void)ctx; (void)start; (void)count;
+    if (!s) {
+        return;
+    }
+    pthread_mutex_lock(&s->irq_lock);
+    (void)pvg_irq_line_mask(&s->irq_line, mask, s->irq_gate == PVG_IRQ_OPEN, &deferred);
+    if (deferred && s->irq_gate == PVG_IRQ_HELD) {
+        s->irq_pending = true;     /* held over a guest memory map change: the release raises it again */
+    }
+    pthread_mutex_unlock(&s->irq_lock);
+}
+
 static void pvg_raise_irq(void *ctx, uint32_t vector)
 {
     PvgState *s = ctx;
     uint64_t n;
     int rc = -EINVAL;
     int gate;
+    bool intx = false;
+    int index_now = INT_MIN;
+    PvgIntx intx_state = { 0 };
 
     if (!s) {
         return;
@@ -537,7 +568,14 @@ static void pvg_raise_irq(void *ctx, uint32_t vector)
     pthread_mutex_lock(&s->irq_lock);
     gate = s->irq_gate;
     if (gate == PVG_IRQ_OPEN) {
-        rc = s->host_ops->irq_trigger(s->host_ops->host, vector);
+        bool changed;
+
+        (void)pvg_irq_line_is_intx(&s->irq_line, &changed);
+        if (changed) {
+            index_now = s->irq_line.index;
+        }
+        rc = pvg_irq_line_raise(&s->irq_line, vector, &intx);
+        intx_state = s->irq_line.intx;
     } else if (gate == PVG_IRQ_HELD) {
         s->irq_pending = true;
     } else {
@@ -545,9 +583,16 @@ static void pvg_raise_irq(void *ctx, uint32_t vector)
     }
     pthread_mutex_unlock(&s->irq_lock);
 
+    if (index_now != INT_MIN) {
+        pvg_log(s, "[uniq-vgpu-ml] irq: the client now triggers %s\n", pvg_irq_index_name(index_now));
+    }
     n = pvg_atomic_fetch_inc(&s->irq_count) + 1;
     if (n <= AGFX_LOG_INITIAL_COUNT || (n % AGFX_LOG_INTERVAL) == 0) {
-        if (gate == PVG_IRQ_OPEN) {
+        if (gate == PVG_IRQ_OPEN && intx) {
+            pvg_log(s, "[uniq-vgpu-ml] raise_irq #%lu: intx asserts=%" PRIu64 " reasserts=%" PRIu64
+                    " held=%" PRIu64 " suppressed=%" PRIu64 "\n", (unsigned long)n, intx_state.asserts,
+                    intx_state.reasserts, intx_state.held, intx_state.suppressed);
+        } else if (gate == PVG_IRQ_OPEN) {
             pvg_log(s, "[uniq-vgpu-ml] raise_irq #%lu: msi_enabled=%d\n",
                     (unsigned long)n, rc == 0);
         } else {
@@ -573,8 +618,10 @@ static void pvg_irq_release(PvgState *s)
     if (s->irq_gate == PVG_IRQ_HELD) {
         s->irq_gate = PVG_IRQ_OPEN;
         if (s->irq_pending) {
+            bool intx;
+
             s->irq_pending = false;
-            (void)s->host_ops->irq_trigger(s->host_ops->host, 0);
+            (void)pvg_irq_line_raise(&s->irq_line, 0, &intx);
         }
     }
     pthread_mutex_unlock(&s->irq_lock);
@@ -1993,6 +2040,12 @@ static ssize_t pvg_bar0_access(vfu_ctx_t *ctx, char *buf, size_t count, loff_t o
             memcpy(&v, buf + i, 4);
             pvg_mmio_write(s, (uint32_t)off + i, v);
         } else {
+            if (s->irq_mode != PVG_IRQ_MODE_MSI && pvg_intx_ack_source((uint32_t)off + i) >= 0) {
+                /* D-ARM64-INTX: the handler's acknowledgement, recorded before the read is served */
+                pthread_mutex_lock(&s->irq_lock);
+                pvg_irq_line_bar0_read(&s->irq_line, (uint32_t)off + i);
+                pthread_mutex_unlock(&s->irq_lock);
+            }
             v = pvg_mmio_read(s, (uint32_t)off + i);
             memcpy(buf + i, &v, 4);
         }
@@ -2520,6 +2573,13 @@ static int pvg_parse_args(PvgState *s, const char *args)
                 ok = false;
             }
 #endif
+        } else if (!strcmp(tok, "irq")) {
+            /* D-ARM64-INTX: msi (default), intx, auto */
+            ok = true;
+            if (!strcmp(val, "msi")) s->irq_mode = PVG_IRQ_MODE_MSI;
+            else if (!strcmp(val, "intx")) s->irq_mode = PVG_IRQ_MODE_INTX;
+            else if (!strcmp(val, "auto")) s->irq_mode = PVG_IRQ_MODE_AUTO;
+            else ok = false;
         } else if (!strcmp(tok, "log")) {
             ok = !strcmp(val, "stderr") || !strcmp(val, "host");
             s->log_to_host = !strcmp(val, "host");
@@ -2666,11 +2726,7 @@ static inline void pvg_fw_identity_bar0(PvgState *s, loff_t off, bool is_write)
 
 static int pvg_pci_setup(PvgState *s, vfu_ctx_t *ctx)
 {
-    struct msicap msi = {
-        .hdr = { .id = PCI_CAP_ID_MSI },
-        .mc = { .c64 = 1 },      /* 1 vector (mmc 0), 64-bit, no per-vector mask */
-    };
-    ssize_t pos;
+    int r;
 
     /* PCIe config space (the fork's type is an INTERFACE_PCIE_DEVICE) with
      * no PCIe capability, header type 0, revision 0. */
@@ -2691,14 +2747,21 @@ static int pvg_pci_setup(PvgState *s, vfu_ctx_t *ctx)
     if (s->pci_device_id != UNIQ_VGPU_ML_DEVICE_ID) {
         pvg_log(s, "[uniq-vgpu-ml] PCI device id overridden to 0x%04x\n", s->pci_device_id);
     }
-    pos = vfu_pci_add_capability(ctx, 0, 0, &msi);
-    if (pos < 0 || vfu_setup_device_nr_irqs(ctx, VFU_DEV_MSI_IRQ, 1) < 0) {
-        int err = errno;
-
-        pvg_log(s, "[uniq-vgpu-ml] msi_init FAILED: %d\n", -err);
-        return -err;
+    /* MSI capability + 1 vector unless irq=intx; INTA# (level, D-ARM64-INTX) unless irq=msi */
+    pvg_irq_line_init(&s->irq_line, s->irq_mode, ctx, s->host_ops->irq_trigger, s->host_ops->host);
+    r = pvg_irq_line_setup(&s->irq_line, pvg_intx_state_cb);
+    if (r < 0) {
+        pvg_log(s, "[uniq-vgpu-ml] irq_init FAILED (irq=%s): %d\n",
+                s->irq_mode == PVG_IRQ_MODE_MSI ? "msi" : s->irq_mode == PVG_IRQ_MODE_INTX ? "intx" : "auto", r);
+        return r;
     }
-    pvg_log(s, "[uniq-vgpu-ml] msi_init OK, 1 vector\n");
+    if (s->irq_mode != PVG_IRQ_MODE_INTX) {
+        pvg_log(s, "[uniq-vgpu-ml] msi_init OK, 1 vector\n");
+    }
+    if (s->irq_mode != PVG_IRQ_MODE_MSI) {
+        pvg_log(s, "[uniq-vgpu-ml] intx_init OK, INTA# level (irq=%s)\n",
+                s->irq_mode == PVG_IRQ_MODE_AUTO ? "auto: MSI once the guest enables it" : "intx, no MSI capability");
+    }
     if (vfu_setup_region(ctx, VFU_PCI_DEV_BAR0_REGION_IDX, UNIQ_VGPU_ML_MMIO_SIZE,
                          pvg_bar0_access, VFU_REGION_FLAG_RW | VFU_REGION_FLAG_MEM,
                          NULL, 0, -1, 0) < 0) {
@@ -2940,6 +3003,7 @@ static int pvg_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env, 
     s->pci_vendor_id = UNIQ_VGPU_ML_VENDOR_ID;
     s->pci_device_id = UNIQ_VGPU_ML_DEVICE_ID;
     s->guest_page_shift = 12;
+    s->irq_mode = PVG_IRQ_MODE_MSI;
     s->vsync_enabled = true;
     s->exit_on_disconnect = true;
     s->display_modes_follow = true;
@@ -3254,6 +3318,12 @@ static void pvg_qmetal_device_reset(PvgState *s, vfu_reset_type_t type)
 static int pvg_reset(void *priv, vfu_reset_type_t type)
 {
     PvgState *s = priv;
+
+    if (s) {
+        pthread_mutex_lock(&s->irq_lock);
+        pvg_irq_line_reset(&s->irq_line);
+        pthread_mutex_unlock(&s->irq_lock);
+    }
 
     if (type == VFU_RESET_LOST_CONN) {
         pvg_log(s, "[uniq-vgpu-ml] client connection lost: stopping the device\n");

@@ -10,7 +10,7 @@ device glue. Needs a qdp v2 host.
 
 Guest view: PCI `106b:eeee` rev 0 (or `eee1`), no subsystem IDs, class 03.80,
 PCIe config space with one capability, MSI (1 vector, 64-bit, no mask), no
-INTx; BAR0 = 16 KiB MMIO, 32-bit, non-prefetchable, every access trapped (the
+INTx (`irq=intx|auto` add INTA#, level); BAR0 = 16 KiB MMIO, 32-bit, non-prefetchable, every access trapped (the
 two read-and-clear status registers must stay trapped). The option ROM is the
 client's: `-device vfio-user-pci,socket=...,romfile=ApplePVG-stock-eeee.rom`
 (the ROM's PCIR IDs must match the personality; cold-plug for the EFI GOP).
@@ -26,6 +26,7 @@ Plugin args (`--plugin-args`; the fork's property names are accepted):
 | `spirv_cache_dir=` | none | SPIR-V / VkPipelineCache directory |
 | `device-id=` (`x-pci-device-id=`), `vendor-id=` (`x-pci-vendor-id=`) | 0xeeee, 0x106b | personality, e.g. `device-id=0xeee1` |
 | `guest-page-shift=` | 12 | the guest's page unit for guest page numbers: 12 = 4 KiB (x86-64), 14 = 16 KiB (arm64 guests); 14 needs a QMetal header with `qmu_extended_config::guest_page_shift` |
+| `irq=` | `msi` | the interrupt line (D-ARM64-INTX): `msi` = the MSI capability, 1 vector, no INTx pin (unchanged); `intx` = INTA# only, level, no MSI capability; `auto` = both, MSI once the guest enables it, INTx otherwise. INTx is level: the device re-asserts after the client's UNMASK (QEMU's EOI) while a raise is unacknowledged, the acknowledgement being the guest handlers' reads of 0x1014/0x1018 (GPU) and 0x1250 RING_RD (mapper); see `pvg-intx.h`, test `make uniq-vgpu-intx-test` |
 | `log=` | `stderr` | device log sink: `stderr` writes the device's `[uniq-vgpu-ml]` lines (the fork's `[apple-gfx-ml]` tag until 2026-11-19, HOST-LOG-TAG-01); `host` routes them through `qdp_host_ops.log` |
 | `exit-on-disconnect=` | on | when the client goes away: run the quit stop phase, then exit the process (GPU state refers to the lost guest's memory) |
 

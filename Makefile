@@ -35,8 +35,8 @@ PLUGINS := plugins/tb-vga/tb-vga.so plugins/test-v2/test-v2.so plugins/test-v2/t
 QMETAL_INCLUDE ?=
 QMETAL_LIBDIR ?=
 QMETAL_RPATH ?= $(QMETAL_LIBDIR)
-UNIQ_VGPU_SRC := $(addprefix plugins/uniq-vgpu/,uniq-vgpu.c pvg-memory.c pvg-process-vm.c pvg-dmabuf.c)
-UNIQ_VGPU_HDR := plugins/uniq-vgpu/pvg.h plugins/uniq-vgpu/pvg-process-vm.h \
+UNIQ_VGPU_SRC := $(addprefix plugins/uniq-vgpu/,uniq-vgpu.c pvg-memory.c pvg-process-vm.c pvg-dmabuf.c pvg-intx.c)
+UNIQ_VGPU_HDR := plugins/uniq-vgpu/pvg.h plugins/uniq-vgpu/pvg-process-vm.h plugins/uniq-vgpu/pvg-intx.h \
                  plugins/uniq-vgpu/pvg_backing.h plugins/uniq-vgpu/pvg_mapper_bridge.h \
                  $(wildcard plugins/uniq-vgpu/qmu-private/*.h)
 GLIB_ONLY_CFLAGS = $(shell $(PKG_CONFIG) --cflags glib-2.0)
@@ -177,6 +177,16 @@ plugins/uniq-vgpu/pvg_process_vm_test: $(PVM_TEST_SRC) $(UNIQ_VGPU_HDR) qdp.h $(
 uniq-vgpu-pvm-test: plugins/uniq-vgpu/pvg_process_vm_test
 	plugins/uniq-vgpu/pvg_process_vm_test
 
+# Native test of the uniq-vgpu interrupt line (D-ARM64-INTX): production pvg-intx.c (level INTx state, irq=
+# msi|intx|auto dispatch) over the vendored libvfio-user, driven by a vfio-user client in the same process
+# (config space, SET_IRQS, assert/deassert by eventfd counts).  No VM, GPU or libmlapi.
+plugins/uniq-vgpu/pvg_intx_test: plugins/uniq-vgpu/pvg_intx_test.c plugins/uniq-vgpu/pvg-intx.c plugins/uniq-vgpu/pvg-intx.h $(VFU_DEP)
+	$(CC) $(CFLAGS) -pthread -Iplugins/uniq-vgpu $(VFU_CFLAGS) -o $@ plugins/uniq-vgpu/pvg_intx_test.c \
+	    plugins/uniq-vgpu/pvg-intx.c $(VFU_LIBS)
+
+uniq-vgpu-intx-test: plugins/uniq-vgpu/pvg_intx_test
+	plugins/uniq-vgpu/pvg_intx_test
+
 # apple-videotoolbox: the multi-source codec device + libva backend. Explicit
 # rule (overrides the generic plugins/%.so single-source rule).
 $(VT_DIR)/apple-videotoolbox.so: $(VT_SRC) $(VT_HDR) qdp.h $(VFU_DEP)
@@ -197,7 +207,7 @@ install: all
 	install -D -m 644 plugins/tb-vga/edid-1280x800.bin $(DESTDIR)$(PREFIX)/share/qdev-host/edid-1280x800.bin
 
 clean:
-	rm -f qdev-host plugins/*/*.so pve/libqdev-vugpu-guard.so plugins/uniq-vgpu/selftest plugins/uniq-vgpu/pvg_process_vm_test tools/display1-input-bench tools/display1-uiinfo-test tools/vfu-test-client dbus/dbus-display1.c dbus/dbus-display1.h
+	rm -f qdev-host plugins/*/*.so pve/libqdev-vugpu-guard.so plugins/uniq-vgpu/selftest plugins/uniq-vgpu/pvg_process_vm_test plugins/uniq-vgpu/pvg_intx_test tools/display1-input-bench tools/display1-uiinfo-test tools/vfu-test-client dbus/dbus-display1.c dbus/dbus-display1.h
 	rm -rf $(VT_DIR)/build
 
 distclean: clean
@@ -205,4 +215,4 @@ distclean: clean
 
 PREFIX ?= /usr/local
 comma := ,
-.PHONY: all clean distclean install vfu uniq-vgpu-selftest uniq-vgpu-pvm-test ui-info-reply-test qemu-audio-p2p-test
+.PHONY: all clean distclean install vfu uniq-vgpu-selftest uniq-vgpu-pvm-test uniq-vgpu-intx-test ui-info-reply-test qemu-audio-p2p-test

@@ -1792,6 +1792,7 @@ vfu_realize_ctx(vfu_ctx_t *vfu_ctx)
         vfu_ctx->irqs->err_efd = -1;
         vfu_ctx->irqs->req_efd = -1;
         vfu_ctx->irqs->max_ivs = max_ivs;
+        vfu_ctx->irqs->trigger_index = -1;
         pthread_mutex_init(&vfu_ctx->irqs->lock, NULL);
 
         // Reflect on the config space whether INTX is available.

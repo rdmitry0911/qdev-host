@@ -692,6 +692,19 @@ vfu_irq_trigger(vfu_ctx_t *vfu_ctx, uint32_t subindex);
 #define VFU_IRQ_TRIGGER_THREAD_SAFE 1
 
 /**
+ * (qdev-host patch) The IRQ type vfu_irq_trigger() signals now: VFU_DEV_INTX_IRQ, VFU_DEV_MSI_IRQ or
+ * VFU_DEV_MSIX_IRQ, whichever the client last gave trigger eventfds (it clears that by disabling the index or
+ * by a reset), or -1 when none is set.  Callable from any thread once the context is realized.
+ *
+ * Also (qdev-host patch): VFIO_USER_DEVICE_SET_IRQS with ACTION_MASK/UNMASK and DATA_EVENTFD is refused with
+ * EINVAL (eventfd-based mask/unmask is not implemented), so a KVM client keeps the userspace INTx path whose
+ * UNMASK messages reach the vfu_setup_irq_state_callback() callback.
+ */
+int
+vfu_irq_trigger_index(vfu_ctx_t *vfu_ctx);
+#define VFU_IRQ_TRIGGER_INDEX 1
+
+/**
  * Takes a guest physical address range and populates an array of scatter/gather
  * entries than can be individually mapped in the program's virtual memory.  A
  * single linear guest physical address span may need to be split into multiple

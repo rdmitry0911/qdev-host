@@ -16,6 +16,7 @@
 #define UNIQ_VGPU_H
 
 #define _GNU_SOURCE
+#include "pvg-intx.h"
 #include <errno.h>
 #include <inttypes.h>
 #include <pthread.h>
@@ -334,6 +335,10 @@ typedef struct PvgState {
     bool irq_pending;
     uint64_t irq_count;
     uint64_t irq_dropped;
+    /* D-ARM64-INTX: irq= msi (default: MSI capability only), intx (INTx pin only) or auto (both; MSI once the
+     * guest enables it).  irq_line (pvg-intx.h) is under irq_lock. */
+    int irq_mode;
+    PvgIrqLine irq_line;
 
     /* device loop: the fork's main-loop BH plane */
     pthread_t loop_thread;
