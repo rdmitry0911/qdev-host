@@ -117,6 +117,10 @@ int  aw_job_complete(aw_engine *e, aw_job *job);
 void aw_job_discard(aw_engine *e, aw_job *job);
 /* Jobs submitted and not yet completed or discarded (device lock held). */
 unsigned aw_engine_jobs(const aw_engine *e);
+/* D-VT-WORKER-NVDEC diagnostic (behaviour-neutral, read only): every open session's state as one line,
+ * and a job's identity (kind 1 AHEAD, 2 LAND, 3 DECODE). */
+size_t aw_engine_debug_state(const aw_engine *e, char *buf, size_t cap);
+void   aw_job_info(const aw_job *j, int *kind, unsigned *si, unsigned long long *frame, int *need_decode);
 
 aw_engine *aw_engine_create(const aw_session_cfg *cfg);
 /* In worker mode the worker must be stopped first (no job in flight). */

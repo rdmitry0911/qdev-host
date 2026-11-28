@@ -1517,3 +1517,30 @@ unsigned aw_engine_jobs(const aw_engine *e)
         if (e->sess[i].used) n += e->sess[i].jobs;
     return n;
 }
+
+/* ---- D-VT-WORKER-NVDEC diagnostic (read only) ------------------------------ */
+size_t aw_engine_debug_state(const aw_engine *e, char *buf, size_t cap)
+{
+    size_t o = 0;
+    if (!buf || !cap) return 0;
+    buf[0] = 0;
+    if (!e) return 0;
+    o += (size_t)snprintf(buf + o, cap - o, "heldB=%zu", e->held_bytes);
+    for (unsigned i = 0; i < AW_MAX_SESSIONS && o < cap; i++) {
+        const aw_dsession *s = &e->sess[i];
+        if (!s->used) continue;
+        o += (size_t)snprintf(buf + o, cap - o, " s%u{st=%d pre=%d jobs=%u held=%u park=%u fseq=%llu ah=%llu lw=%d rep=%d cp=%d cl=%d gone=%u gu=%u}",
+                              i, s->pend_state, s->pre_state, s->jobs, s->held_n, s->park_n,
+                              (unsigned long long)s->frame_seq, (unsigned long long)s->ahead_frame,
+                              s->land_waits, s->pend_replied, s->close_pending, s->closing, s->gone_n, (unsigned)s->gave_up);
+    }
+    return o < cap ? o : cap - 1;
+}
+
+void aw_job_info(const aw_job *j, int *kind, unsigned *si, unsigned long long *frame, int *need_decode)
+{
+    if (kind) *kind = j ? j->kind : 0;
+    if (si) *si = j ? j->si : 0;
+    if (frame) *frame = j ? (unsigned long long)j->frame : 0;
+    if (need_decode) *need_decode = j ? j->need_decode : 0;
+}

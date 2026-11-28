@@ -242,6 +242,30 @@ static void vt_log(vt_dev *d, int level, const char *fmt, ...)
         fprintf(stderr, "apple-videotoolbox: %s\n", buf);
 }
 
+/* ---- D-VT-WORKER-NVDEC diagnostic trace (behaviour-neutral: log lines only) ----
+ * Level 2 (no -v needed), each line stamped with UTC wall time to the millisecond so it
+ * aligns with the guest log. Grep "DIAG". */
+#include <time.h>
+static void vt_diag(vt_dev *d, const char *fmt, ...)
+{
+    char buf[1000];
+    struct timespec ts; struct tm tm;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    gmtime_r(&ts.tv_sec, &tm);
+    int o = snprintf(buf, sizeof buf, "DIAG %02d:%02d:%02d.%03ld ", tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec / 1000000L);
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf + o, sizeof buf - (size_t)o, fmt, ap);
+    va_end(ap);
+    if (d && d->host && d->host->log) d->host->log(d->host->host, 2, "%s", buf);
+    else fprintf(stderr, "apple-videotoolbox: %s\n", buf);
+}
+static double vt_diag_ms(void)
+{
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
 /* HEVC Main 10 admission when the plugin args do not say (`hevc10=`): off until the
  * 4K Main 10 playback rate reaches real time on every host class (D-GVA-P010:
  * warm-hzmain Raphael VA-API 19.4 fps hardware vs 29.2 fps software, 2026-11-22). */
@@ -325,6 +349,11 @@ static void vt_flush_pending(vt_dev *d)
             break;
         }
         vtpv_virtq_retire(hq, vt_map, d, head, written);
+        {
+            aw_msg_view mv; unsigned fl = 0; unsigned long long rid = 0;
+            if (aw_parse(msg, len, &mv) == AW_PARSE_OK) { fl = mv.flags; rid = (unsigned long long)mv.reply_id; }
+            vt_diag(d, "q1> '%s' fl=%#x rid=%llu %uB pend=%u", fc, fl, rid, len, d->pend_count - 1);
+        }
         if (written < len)
             vt_log(d, 1, "q1 '%s' truncated %u/%u (guest buffer too small)", fc, written, len);
         else
@@ -333,6 +362,7 @@ static void vt_flush_pending(vt_dev *d)
         d->pend_count--;
         delivered++;
     }
+    if (d->pend_count) vt_diag(d, "q1 wait: %u pending, no posted buffer", d->pend_count);
     if (delivered) vt_raise(d, 1);
 }
 
@@ -778,6 +808,14 @@ static void vt_q0_served(void *ctx, const uint8_t *msg, size_t len, int32_t stat
     if (aw_parse(msg, len, &mv) == AW_PARSE_OK) vt_fourcc(mv.type, fc);
     vt_log((vt_dev *)ctx, 3, "q0 '%s' (%zu B, flags %#x) -> status %d", fc, len,
            (aw_parse(msg, len, &mv) == AW_PARSE_OK) ? mv.flags : 0, status);
+    {
+        vt_dev *d = ctx;
+        char st[800];
+        aw_engine_debug_state(d->engine, st, sizeof st);
+        int ok = aw_parse(msg, len, &mv) == AW_PARSE_OK;
+        vt_diag(d, "q0 '%s' fl=%#x rid=%llu %zuB -> %d | %s", fc, ok ? mv.flags : 0,
+                ok ? (unsigned long long)mv.reply_id : 0ULL, len, status, st);
+    }
 }
 static void vt_process_submission(vt_dev *d)
 {
@@ -878,8 +916,8 @@ static ssize_t vt_bar0(vfu_ctx_t *ctx, char *buf, size_t count, loff_t off,
     } else if (off >= VT_CFG_NOTIFY && off < VT_CFG_NOTIFY + VT_QUEUES * 4) {
         if (is_write) {
             uint16_t qn = (uint16_t)((off - VT_CFG_NOTIFY) / 4);
-            if (qn == 0) vt_process_submission(d);  /* drain guest->host submissions */
-            else if (qn == 1) vt_flush_pending(d);  /* guest reposted q1 buffers: deliver backlog */
+            if (qn == 0) { vt_diag(d, "q0 kick"); vt_process_submission(d); }  /* drain guest->host submissions */
+            else if (qn == 1) { vt_diag(d, "q1 kick pend=%u", d->pend_count); vt_flush_pending(d); }  /* guest reposted q1 buffers: deliver backlog */
         }
     } else if (!is_write) {
         memset(buf, 0, count);
@@ -988,14 +1026,46 @@ static const vtpv_decoder_backend fake_h264_be = {
  * worker already holds `mem` shared for the whole job. */
 static int vt_copy_frame_locked(void *ctx, const vtpv_decoded_frame *f, const aw_out_buffer *b)
 {
+    double t0 = vt_diag_ms();
     vt_backend_lock();
+    double t1 = vt_diag_ms();
     int r = vt_copy_frame(ctx, f, b);
     vt_backend_unlock();
+    vt_diag((vt_dev *)ctx, "land end rc=%d surf=%u %ux%u fmt=%#x lockwait=%.1fms copy=%.1fms", r, f->surface_id,
+            f->width, f->height, f->pixfmt, t1 - t0, vt_diag_ms() - t1);
     return r;
 }
 
 /* After a worker completion (under d->m): deliver what it emitted on queue 1. */
-static void vt_worker_post(void *ctx) { vt_flush_pending((vt_dev *)ctx); }
+static void vt_worker_post(void *ctx)
+{
+    vt_dev *d = ctx;
+    char st[800];
+    aw_engine_debug_state(d->engine, st, sizeof st);
+    vt_diag(d, "job done | %s", st);
+    vt_flush_pending(d);
+}
+
+/* D-VT-WORKER-NVDEC diagnostic: job submit and the worker's decode, timed */
+static vt_dev *g_diag_dev;
+static int (*g_diag_inner_decode)(void *dec, const uint8_t *s, size_t sl, vtpv_decoded_frame *o);
+static int vt_diag_decode(void *dec, const uint8_t *smp, size_t sl, vtpv_decoded_frame *o)
+{
+    double t0 = vt_diag_ms();
+    int r = g_diag_inner_decode(dec, smp, sl, o);
+    vt_diag(g_diag_dev, "dec end rc=%d %zuB surf=%u %ux%u fmt=%#x %.1fms", r, sl, o ? o->surface_id : 0,
+            o ? o->width : 0, o ? o->height : 0, o ? o->pixfmt : 0, vt_diag_ms() - t0);
+    return r;
+}
+static int vt_diag_submit(void *w, aw_job *j)
+{
+    int kind = 0, nd = 0; unsigned si = 0; unsigned long long fr = 0;
+    aw_job_info(j, &kind, &si, &fr, &nd);
+    int r = vt_worker_submit(w, j);
+    vt_diag(g_diag_dev, "job+ %s s%u frame=%llu decode=%d -> %d",
+            kind == 1 ? "AHEAD" : kind == 2 ? "LAND" : kind == 3 ? "DECODE" : "?", si, fr, nd, r);
+    return r;
+}
 
 static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
                     void **priv)
@@ -1132,9 +1202,11 @@ static int vt_setup(vfu_ctx_t *ctx, const char *args, const qdp_host_env *env,
         }
         if (d->worker_on) {
             vt_locked_backend_init(&d->lbe, d->be);
+            g_diag_dev = d;
+            if (d->lbe.be.decode) { g_diag_inner_decode = d->lbe.be.decode; d->lbe.be.decode = vt_diag_decode; }
             cfg.be = &d->lbe.be;
             cfg.copy_frame = vt_copy_frame_locked;
-            cfg.submit_job = vt_worker_submit;
+            cfg.submit_job = vt_diag_submit;
             cfg.wait_jobs = vt_worker_wait;
             cfg.job_ctx = &d->worker;
         }
